@@ -38,8 +38,10 @@ use arrow_schema::{Schema, SchemaRef};
 
 use crate::arrow::arrow_reader::{
     ArrowReaderBuilder, ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
+    RowSelection,
 };
 
+use crate::arrow::ProjectionMask;
 use crate::basic::{BloomFilterAlgorithm, BloomFilterCompression, BloomFilterHash};
 use crate::bloom_filter::{
     SBBF_HEADER_SIZE_ESTIMATE, Sbbf, chunk_read_bloom_filter_header_and_offset,
@@ -160,6 +162,22 @@ pub use store::*;
 ///
 /// [`tokio::fs::File`]: https://docs.rs/tokio/latest/tokio/fs/struct.File.html
 pub trait AsyncFileReader: Send {
+    /// Optional advisory read-ahead plan, supplied after pruning and before data I/O.
+    ///
+    /// `row_groups` is the scan order after row-group pruning. `selection` is
+    /// relative to those groups. `projection` contains only the first row
+    /// predicate's columns when predicates exist, otherwise the output columns.
+    /// Implementations must preserve demand reads and may decline any/all work.
+    /// The default does nothing. This hook never transfers decoder ownership.
+    fn set_read_ahead_plan(
+        &mut self,
+        _metadata: &Arc<ParquetMetaData>,
+        _row_groups: Option<&[usize]>,
+        _projection: &ProjectionMask,
+        _selection: Option<&RowSelection>,
+    ) {
+    }
+
     /// Retrieve the bytes in `range`
     fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>>;
 
@@ -202,6 +220,17 @@ pub trait AsyncFileReader: Send {
 
 /// This allows Box<dyn AsyncFileReader + '_> to be used as an AsyncFileReader,
 impl AsyncFileReader for Box<dyn AsyncFileReader + '_> {
+    fn set_read_ahead_plan(
+        &mut self,
+        metadata: &Arc<ParquetMetaData>,
+        row_groups: Option<&[usize]>,
+        projection: &ProjectionMask,
+        selection: Option<&RowSelection>,
+    ) {
+        self.as_mut()
+            .set_read_ahead_plan(metadata, row_groups, projection, selection);
+    }
+
     fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>> {
         self.as_mut().get_bytes(range)
     }
@@ -649,7 +678,7 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
     /// See examples on [`ParquetRecordBatchStreamBuilder::new`]
     pub fn build(self) -> Result<ParquetRecordBatchStream<T>> {
         let Self {
-            input,
+            mut input,
             metadata,
             schema,
             fields,
@@ -672,6 +701,27 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
             .fields
             .filter_leaves(|idx, _| idx < projection_len && projection.leaf_included(idx));
         let projected_schema = Arc::new(Schema::new(projected_fields));
+
+        // The datasource has now applied statistics, bloom and page pruning.
+        // With a row filter, later predicates and payload columns can be pruned
+        // by the first predicate: advertise only that first predicate's columns.
+        // Limit/offset scans conservatively use demand only.
+        if limit.is_none() && offset.is_none() {
+            let first_projection = filter
+                .as_ref()
+                .and_then(|filter| filter.predicates().first())
+                .map_or(&projection, |predicate| predicate.projection());
+            input.0.set_read_ahead_plan(
+                &metadata,
+                row_groups.as_deref(),
+                first_projection,
+                selection.as_ref(),
+            );
+        } else {
+            input
+                .0
+                .set_read_ahead_plan(&metadata, Some(&[]), &projection, None);
+        }
 
         let decoder = ParquetPushDecoderBuilder {
             input: PushDecoderInput::default(),
@@ -698,6 +748,30 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
             decoder,
             request_state,
         })
+    }
+}
+
+/// Advisory integration for engines driving the push decoder directly.
+impl ParquetPushDecoderBuilder {
+    /// Supply this builder's post-pruning scan plan to an optional reader.
+    /// Call after setting projection, row groups, selection and row filters.
+    /// This does not fetch bytes or transfer ownership of decoder state.
+    pub fn configure_read_ahead(&self, reader: &mut dyn AsyncFileReader) {
+        if self.limit.is_none() && self.offset.is_none() {
+            let projection = self
+                .filter
+                .as_ref()
+                .and_then(|filter| filter.predicates().first())
+                .map_or(&self.projection, |predicate| predicate.projection());
+            reader.set_read_ahead_plan(
+                &self.metadata,
+                self.row_groups.as_deref(),
+                projection,
+                self.selection.as_ref(),
+            );
+        } else {
+            reader.set_read_ahead_plan(&self.metadata, Some(&[]), &self.projection, None);
+        }
     }
 }
 
