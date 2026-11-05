@@ -23,13 +23,19 @@
 //! the selection itself stays immutable.
 
 use super::boolean::boolean_mask_from_selectors;
-use super::{RowSelection, RowSelector};
+use super::{MaskRunIter, RowSelection, RowSelector};
 use crate::errors::ParquetError;
 use arrow_array::BooleanArray;
 use arrow_buffer::BooleanBuffer;
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
+
+// Longbow: deterministic discovery-work characterization, without timing.
+#[cfg(test)]
+std::thread_local! {
+    static MASK_RUN_DISCOVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Policy for picking a strategy to materialize [`RowSelection`] during execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,8 +123,18 @@ impl RowSelectionCursor {
     /// Create a [`RowSelectionCursor::Selectors`] from the provided selectors
     pub(crate) fn new_selectors(selectors: Vec<RowSelector>) -> Self {
         Self::Selectors(SelectorsCursor {
-            selectors: selectors.into(),
+            selectors: SelectorSource::Queue(selectors.into()),
             position: 0,
+            known_run_end: 0,
+        })
+    }
+
+    // Longbow: retain the shared bitmap and stream native runs without a Vec.
+    pub(crate) fn new_mask_selectors(mask: BooleanBuffer) -> Self {
+        Self::Selectors(SelectorsCursor {
+            selectors: SelectorSource::Mask(mask),
+            position: 0,
+            known_run_end: 0,
         })
     }
 
@@ -128,30 +144,81 @@ impl RowSelectionCursor {
     }
 }
 
-/// Cursor for iterating a selector-backed [`RowSelection`]
+// Longbow: mutually exclusive storage keeps the owner bounded as well as the
+// run traversal. Mask storage shares the existing bitmap; it owns no run Vec.
+#[derive(Debug)]
+enum SelectorSource {
+    Queue(VecDeque<RowSelector>),
+    Mask(BooleanBuffer),
+}
+
+#[cfg(test)]
+impl SelectorSource {
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Queue(queue) => queue.capacity(),
+            Self::Mask(_) => 0,
+        }
+    }
+}
+
+/// Cursor for iterating a [`RowSelection`] as selected and skipped runs.
 ///
-/// This is best for sparse selections where large contiguous
-/// blocks of rows are selected or skipped.
+/// Longbow: bitmap-backed selections stream native runs without materializing
+/// the complete selector queue.
 #[derive(Debug)]
 pub struct SelectorsCursor {
-    selectors: VecDeque<RowSelector>,
+    selectors: SelectorSource,
     /// Current absolute offset into the selection
     position: usize,
+    // Longbow: retain a discovered mask run boundary across partial returns.
+    // This single endpoint adds constant owner storage and no heap allocation.
+    known_run_end: usize,
 }
 
 impl SelectorsCursor {
     /// Returns `true` when no further rows remain
     pub fn is_empty(&self) -> bool {
-        self.selectors.is_empty()
+        match &self.selectors {
+            SelectorSource::Mask(mask) => self.position >= mask.len(),
+            SelectorSource::Queue(queue) => queue.is_empty(),
+        }
     }
 
     pub(crate) fn selectors_mut(&mut self) -> &mut VecDeque<RowSelector> {
-        &mut self.selectors
+        // Preserve the deprecated explicit mutable-queue API. Predicate execution
+        // never calls this API; ordinary traversal keeps bitmap runs lazy.
+        if let SelectorSource::Mask(mask) = &self.selectors {
+            self.selectors = SelectorSource::Queue(
+                MaskRunIter::new(&mask.slice(self.position, mask.len() - self.position)).collect(),
+            );
+        }
+        match &mut self.selectors {
+            SelectorSource::Queue(queue) => queue,
+            SelectorSource::Mask(_) => unreachable!("mask was materialized above"),
+        }
     }
 
     /// Return the next [`RowSelector`]
     pub(crate) fn next_selector(&mut self) -> RowSelector {
-        let selector = self.selectors.pop_front().unwrap();
+        let selector = match &mut self.selectors {
+            SelectorSource::Mask(mask) => {
+                if self.position < self.known_run_end {
+                    RowSelector {
+                        row_count: self.known_run_end - self.position,
+                        skip: !mask.value(self.position),
+                    }
+                } else {
+                    let remaining = mask.slice(self.position, mask.len() - self.position);
+                    #[cfg(test)]
+                    MASK_RUN_DISCOVERIES.with(|count| count.set(count.get() + 1));
+                    let run = MaskRunIter::new(&remaining).next().unwrap();
+                    self.known_run_end = self.position + run.row_count;
+                    run
+                }
+            }
+            SelectorSource::Queue(queue) => queue.pop_front().unwrap(),
+        };
         self.position += selector.row_count;
         selector
     }
@@ -159,7 +226,11 @@ impl SelectorsCursor {
     /// Return a selector to the front, rewinding the position
     pub(crate) fn return_selector(&mut self, selector: RowSelector) {
         self.position = self.position.saturating_sub(selector.row_count);
-        self.selectors.push_front(selector);
+        if let SelectorSource::Queue(queue) = &mut self.selectors {
+            queue.push_front(selector);
+        }
+        // A returned partial mask run rewinds within its cached boundary. The
+        // next read reuses that endpoint instead of rediscovering the suffix.
     }
 }
 
@@ -424,5 +495,117 @@ mod tests {
         assert_eq!(second.selected_rows, 1);
 
         assert!(cursor.next_mask_chunk(2).is_none());
+    }
+
+    // Longbow: bound live cursor allocation, not merely selected batch length.
+    #[test]
+    fn million_row_alternating_mask_streams_runs_without_run_vector() {
+        use crate::arrow::arrow_reader::ReadPlanBuilder;
+        let rows = 1_048_576;
+        let mask = BooleanBuffer::collect_bool(rows, |i| i % 2 == 0);
+        let mut plan = ReadPlanBuilder::new(8192)
+            .with_selection(Some(RowSelection::from_boolean_buffer(mask)))
+            .with_row_selection_policy(RowSelectionPolicy::Selectors)
+            .build();
+        let RowSelectionCursor::Selectors(cursor) = plan.row_selection_cursor_mut() else {
+            panic!("expected selector execution");
+        };
+        // The original bitmap is existing selection storage. Additional cursor
+        // owner/run storage must fit the fixed 64 KiB allowance even while that
+        // bitmap is alive, and must not grow cumulatively as runs are consumed.
+        assert_eq!(
+            cursor.selectors.capacity(),
+            0,
+            "eager whole-mask allocation"
+        );
+        let mut position = 0;
+        while !cursor.is_empty() {
+            let run = cursor.next_selector();
+            assert_eq!(run.row_count, 1);
+            assert_eq!(run.skip, position % 2 != 0);
+            position += 1;
+            assert_eq!(cursor.selectors.capacity(), 0, "run traversal allocated");
+            assert!(
+                std::mem::size_of_val(cursor)
+                    + cursor.selectors.capacity() * std::mem::size_of::<RowSelector>()
+                    <= 64 * 1024
+            );
+        }
+        assert_eq!(position, rows - 1); // native trim drops the final skipped row
+    }
+
+    #[test]
+    fn mask_selector_partial_run_rewind_does_not_allocate() {
+        use crate::arrow::arrow_reader::ReadPlanBuilder;
+        let mut plan = ReadPlanBuilder::new(8192)
+            .with_selection(Some(RowSelection::from_boolean_buffer(
+                BooleanBuffer::collect_bool(32768, |i| i >= 7),
+            )))
+            .with_row_selection_policy(RowSelectionPolicy::Selectors)
+            .build();
+        let RowSelectionCursor::Selectors(cursor) = plan.row_selection_cursor_mut() else {
+            panic!("expected selector execution");
+        };
+        assert_eq!(cursor.selectors.capacity(), 0);
+        assert_eq!(cursor.next_selector(), RowSelector::skip(7));
+        assert_eq!(cursor.next_selector(), RowSelector::select(32761));
+        cursor.return_selector(RowSelector::select(32761 - 8192));
+        assert_eq!(cursor.selectors.capacity(), 0);
+        assert_eq!(cursor.next_selector(), RowSelector::select(32761 - 8192));
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn lazy_mask_explicit_mutable_queue_preserves_remaining_rows() {
+        let bits = BooleanBuffer::from(vec![false, true, true, false, false, true, true, true]);
+        let mut cursor = RowSelectionCursor::new_mask_selectors(bits.slice(1, 7));
+        let RowSelectionCursor::Selectors(cursor) = &mut cursor else {
+            unreachable!()
+        };
+        assert_eq!(cursor.next_selector(), RowSelector::select(2));
+        assert_eq!(cursor.next_selector(), RowSelector::skip(2));
+        assert_eq!(cursor.next_selector(), RowSelector::select(3));
+        cursor.return_selector(RowSelector::select(2));
+        // The legacy mutable view must expose only the unconsumed suffix and
+        // honor edits after its explicit materialization.
+        assert_eq!(
+            cursor.selectors_mut().pop_front(),
+            Some(RowSelector::select(2))
+        );
+        cursor.selectors_mut().push_front(RowSelector::skip(2));
+        assert_eq!(cursor.next_selector(), RowSelector::skip(2));
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn long_mask_run_reuses_discovery_across_partial_batches() {
+        use crate::arrow::arrow_reader::ReadPlanBuilder;
+        const ROWS: usize = 1_048_576;
+        const BATCH: usize = 8192;
+        // Exercise a nonzero bit offset and native trimming of trailing skips.
+        let bits = BooleanBuffer::collect_bool(ROWS + 14, |i| (5..ROWS + 5).contains(&i));
+        let mut plan = ReadPlanBuilder::new(BATCH)
+            .with_selection(Some(RowSelection::from_boolean_buffer(
+                bits.slice(5, ROWS + 9),
+            )))
+            .with_row_selection_policy(RowSelectionPolicy::Selectors)
+            .build();
+        let RowSelectionCursor::Selectors(cursor) = plan.row_selection_cursor_mut() else {
+            panic!("expected selector execution");
+        };
+        MASK_RUN_DISCOVERIES.with(|count| count.set(0));
+        let mut remaining = ROWS;
+        while remaining > 0 {
+            assert_eq!(cursor.next_selector(), RowSelector::select(remaining));
+            remaining -= remaining.min(BATCH);
+            if remaining > 0 {
+                cursor.return_selector(RowSelector::select(remaining));
+            }
+            // One initial native boundary discovery, then only known remainders:
+            // N/B partial batches must not trigger N + (N-B) + ... scanning.
+            assert_eq!(MASK_RUN_DISCOVERIES.with(|count| count.get()), 1);
+            assert_eq!(cursor.selectors.capacity(), 0);
+        }
+        assert!(cursor.is_empty());
     }
 }
