@@ -356,8 +356,12 @@ impl<B: ByteViewType> InProgressByteViewArray<B> {
     }
 }
 
-impl<B: ByteViewType> InProgressArray for InProgressByteViewArray<B> {
-    fn set_source(&mut self, source: Option<ArrayRef>) {
+impl<B: ByteViewType> InProgressByteViewArray<B> {
+    fn set_source_with_range(
+        &mut self,
+        source: Option<ArrayRef>,
+        range: Option<std::ops::Range<usize>>,
+    ) {
         // If used values from source, add only the size that was used
         self.completed_buffers_size += self.size_of_completed_buffers_from_current_source;
         self.size_of_completed_buffers_from_current_source = 0;
@@ -368,7 +372,23 @@ impl<B: ByteViewType> InProgressArray for InProgressByteViewArray<B> {
             let (need_gc, ideal_buffer_size) = if s.data_buffers().is_empty() {
                 (false, 0)
             } else {
-                let ideal_buffer_size = s.total_buffer_bytes_used();
+                let ideal_buffer_size = if let Some(range) = &range {
+                    // Match total_buffer_bytes_used on source.slice(range), without
+                    // allocating that slice or scanning all unselected views.
+                    s.views()[range.clone()]
+                        .iter()
+                        .map(|view| {
+                            let len = *view as u32;
+                            if len > MAX_INLINE_VIEW_LEN {
+                                len as usize
+                            } else {
+                                0
+                            }
+                        })
+                        .sum()
+                } else {
+                    s.total_buffer_bytes_used()
+                };
                 // We don't use get_buffer_memory_size here, because gc is for the contents of the
                 // data buffers, not views and nulls.
                 let actual_buffer_size =
@@ -386,6 +406,16 @@ impl<B: ByteViewType> InProgressArray for InProgressByteViewArray<B> {
                 ideal_buffer_size,
             }
         });
+    }
+}
+
+impl<B: ByteViewType> InProgressArray for InProgressByteViewArray<B> {
+    fn set_source(&mut self, source: Option<ArrayRef>) {
+        self.set_source_with_range(source, None);
+    }
+
+    fn set_source_range(&mut self, source: ArrayRef, offset: usize, len: usize) {
+        self.set_source_with_range(Some(source), Some(offset..offset + len));
     }
 
     fn copy_rows(&mut self, offset: usize, len: usize) -> Result<(), ArrowError> {

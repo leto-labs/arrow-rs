@@ -475,7 +475,7 @@ impl BatchCoalescer {
             }
         }
 
-        let (_schema, arrays, mut num_rows) = batch.into_parts();
+        let (_schema, arrays, num_rows) = batch.into_parts();
 
         // Validate column count matches the expected schema
         if arrays.len() != self.in_progress_arrays.len() {
@@ -492,43 +492,84 @@ impl BatchCoalescer {
                 in_progress.set_source(Some(array));
             });
 
-        // If pushing this batch would exceed the target batch size,
-        // finish the current batch and start a new one
-        let mut offset = 0;
-        while num_rows > (self.target_batch_size - self.buffered_rows) {
-            let remaining_rows = self.target_batch_size - self.buffered_rows;
-            debug_assert!(remaining_rows > 0);
-
-            // Copy remaining_rows from each array
-            for in_progress in self.in_progress_arrays.iter_mut() {
-                in_progress.copy_rows(offset, remaining_rows)?;
-            }
-
-            self.buffered_rows += remaining_rows;
-            offset += remaining_rows;
-            num_rows -= remaining_rows;
-
-            self.finish_buffered_batch()?;
-        }
-
-        // Add any the remaining rows to the buffer
-        self.buffered_rows += num_rows;
-        if num_rows > 0 {
-            for in_progress in self.in_progress_arrays.iter_mut() {
-                in_progress.copy_rows(offset, num_rows)?;
-            }
-        }
-
-        // If we have reached the target batch size, finalize the buffered batch
-        if self.buffered_rows >= self.target_batch_size {
-            self.finish_buffered_batch()?;
-        }
-
-        // clear in progress sources (to allow the memory to be freed)
-        for in_progress in self.in_progress_arrays.iter_mut() {
+        let result = self.copy_source_range(0, num_rows);
+        for in_progress in &mut self.in_progress_arrays {
             in_progress.set_source(None);
         }
+        result
+    }
 
+    /// Append a contiguous range without allocating a sliced RecordBatch or arrays.
+    ///
+    /// Appends the same rows as `push_batch(batch.slice(offset, len))`, including
+    /// the configured large-batch bypass. The input is borrowed only for this call.
+    /// Invalid ranges and column counts return an error before changing state.
+    pub fn push_batch_range(
+        &mut self,
+        batch: &RecordBatch,
+        offset: usize,
+        len: usize,
+    ) -> Result<(), ArrowError> {
+        if self.target_batch_size == 0 {
+            return Err(ArrowError::InvalidArgumentError(
+                "BatchCoalescer target must be positive".into(),
+            ));
+        }
+        if offset > batch.num_rows() || len > batch.num_rows() - offset {
+            return Err(ArrowError::InvalidArgumentError(
+                "BatchCoalescer range exceeds input rows".into(),
+            ));
+        }
+        if batch.num_columns() != self.in_progress_arrays.len() {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Batch has {} columns but BatchCoalescer expects {}",
+                batch.num_columns(),
+                self.in_progress_arrays.len()
+            )));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        // Preserve the existing bypass/flush policy for large ranges.
+        if self
+            .biggest_coalesce_batch_size
+            .is_some_and(|limit| len > limit)
+        {
+            return self.push_batch(batch.slice(offset, len));
+        }
+        for (in_progress, array) in self.in_progress_arrays.iter_mut().zip(batch.columns()) {
+            in_progress.set_source_range(Arc::clone(array), offset, len);
+        }
+        let result = self.copy_source_range(offset, len);
+        // Also release sources if a generic array copy fails.
+        for in_progress in &mut self.in_progress_arrays {
+            in_progress.set_source(None);
+        }
+        result
+    }
+
+    fn copy_source_range(
+        &mut self,
+        mut offset: usize,
+        mut num_rows: usize,
+    ) -> Result<(), ArrowError> {
+        if self.target_batch_size == 0 {
+            return Err(ArrowError::InvalidArgumentError(
+                "BatchCoalescer target must be positive".into(),
+            ));
+        }
+        while num_rows > 0 {
+            let len = num_rows.min(self.target_batch_size - self.buffered_rows);
+            for in_progress in &mut self.in_progress_arrays {
+                in_progress.copy_rows(offset, len)?;
+            }
+            self.buffered_rows += len;
+            offset += len;
+            num_rows -= len;
+            if self.buffered_rows >= self.target_batch_size {
+                self.finish_buffered_batch()?;
+            }
+        }
         Ok(())
     }
 
@@ -719,6 +760,12 @@ trait InProgressArray: std::fmt::Debug + Send + Sync {
     /// Calls to [`Self::copy_rows`] will copy rows from this array into the
     /// current in-progress array
     fn set_source(&mut self, source: Option<ArrayRef>);
+
+    /// Set a borrowed-range source. View arrays use this range to retain the
+    /// same compaction policy as a sliced source; other arrays keep full sources.
+    fn set_source_range(&mut self, source: ArrayRef, _offset: usize, _len: usize) {
+        self.set_source(Some(source));
+    }
 
     /// Copy rows from the current source array into the in-progress array
     ///
@@ -2811,3 +2858,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod range_tests;
