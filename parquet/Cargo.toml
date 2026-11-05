@@ -313,3 +313,8 @@ harness = false
 
 [lib]
 bench = false
+
+# Longbow: parquet-variant-json is used only behind the upstream
+# `variant_experimental` feature; cargo-machete reports it as unused.
+[package.metadata.cargo-machete]
+ignored = ["parquet-variant-json"]
