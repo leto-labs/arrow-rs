@@ -337,6 +337,8 @@ impl RleEncoder {
     }
 }
 
+mod fused;
+
 /// Size, in number of `i32s` of buffer to use for RLE batch reading
 const RLE_DECODER_INDEX_BUFFER_SIZE: usize = 1024;
 
@@ -503,9 +505,17 @@ impl RleDecoder {
         max_values: usize,
     ) -> Result<usize>
     where
-        T: Default + Clone,
+        T: Default + Clone + 'static,
     {
-        debug_assert!(buffer.len() >= max_values);
+        assert!(buffer.len() >= max_values);
+        if fused::native::<T>() && self.bit_width <= 24 {
+            // SAFETY: MaybeUninit<T> has T's layout and permits initialized T.
+            // Only exact no-drop primitives enter here. The mutable borrow is
+            // exclusive and the decoder only overwrites slots, never reads them.
+            let out =
+                unsafe { std::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast(), max_values) };
+            return self.get_batch_with_dict_uninit(dict, out);
+        }
 
         let mut values_read = 0;
         while values_read < max_values {
@@ -613,6 +623,67 @@ impl RleDecoder {
         }
 
         Ok(values_read)
+    }
+
+    /// Decode into spare capacity. Only exact no-drop native primitives qualify.
+    /// A successful return initializes the returned prefix. On error the caller
+    /// must leave the output uninitialized and must not extend its vector length.
+    pub(crate) fn get_batch_with_dict_uninit<T: Clone + 'static>(
+        &mut self,
+        dict: &[T],
+        out: &mut [std::mem::MaybeUninit<T>],
+    ) -> Result<usize> {
+        assert!(fused::native::<T>());
+        let mut written = 0;
+        while written < out.len() {
+            if self.rle_left > 0 {
+                let n = (out.len() - written).min(self.rle_left as usize);
+                let id = self.current_value.unwrap() as usize;
+                let value = dict
+                    .get(id)
+                    .ok_or_else(|| general_err!("dictionary index out of bounds: {id}"))?;
+                for slot in &mut out[written..written + n] {
+                    slot.write(value.clone());
+                }
+                written += n;
+                self.rle_left -= n as u32;
+            } else if self.bit_packed_left > 0 {
+                let reader = self
+                    .bit_reader
+                    .as_mut()
+                    .ok_or_else(|| general_err!("bit_reader should be set"))?;
+                let n = (out.len() - written).min(self.bit_packed_left as usize);
+                if let Some(data) = reader.aligned_remaining() {
+                    if let Some(result) =
+                        fused::decode(data, self.bit_width, dict, &mut out[written..written + n])
+                    {
+                        let n = result?;
+                        reader.skip(n, self.bit_width as usize);
+                        written += n;
+                        self.bit_packed_left -= n as u32;
+                        continue;
+                    }
+                }
+                let indices = self.index_buf.get_or_insert_with(|| Box::new([0; 1024]));
+                let n = reader.get_batch(&mut indices[..n.min(1024)], self.bit_width as usize);
+                if n == 0 {
+                    self.bit_packed_left = 0;
+                    continue;
+                }
+                if indices[..n].iter().map(|&i| i as u32).max().unwrap() as usize >= dict.len() {
+                    return Err(general_err!("dictionary index out of bounds"));
+                }
+                for (slot, &id) in out[written..written + n].iter_mut().zip(&indices[..n]) {
+                    // SAFETY: every unsigned ID is bounded by the maximum checked above.
+                    slot.write(unsafe { dict.get_unchecked(id as u32 as usize) }.clone());
+                }
+                written += n;
+                self.bit_packed_left -= n as u32;
+            } else if !self.reload()? {
+                break;
+            }
+        }
+        Ok(written)
     }
 
     #[inline]
