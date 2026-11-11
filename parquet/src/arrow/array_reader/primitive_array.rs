@@ -561,7 +561,7 @@ mod tests {
                         groups.push(pages);
                     }
                     let expected = Int64Array::from(expected);
-                    for batch in [1, 7, 31, 1023, 8192] {
+                    for batch in [1, 7, 31, 1023, 1024, 1025, 8192] {
                         let mut reader = PrimitiveArrayReader::<Int64Type>::new(
                             Box::new(InMemoryPageIterator::new(groups.clone())),
                             desc.clone(),
@@ -656,7 +656,7 @@ mod tests {
                     writer.write(&expected).unwrap();
                     writer.close().unwrap();
                     let bytes = Bytes::from(bytes);
-                    for batch_size in [1, 7, 31, 1023, 8192] {
+                    for batch_size in [1, 7, 31, 1023, 1024, 1025, 8192] {
                         let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
                             .unwrap()
                             .with_batch_size(batch_size)
