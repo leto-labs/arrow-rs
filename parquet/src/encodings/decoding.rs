@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -19,6 +21,7 @@
 
 use bytes::Bytes;
 use num_traits::{FromPrimitive, WrappingAdd};
+use std::any::TypeId;
 use std::{cmp, marker::PhantomData, mem};
 
 use super::rle::RleDecoder;
@@ -339,7 +342,7 @@ impl<T: DataType> Decoder<T> for PlainDecoder<T> {
 /// See [`DictEncoder`](crate::encoding::DictEncoder) for more information.
 pub struct DictDecoder<T: DataType> {
     // The dictionary, which maps ids to the values
-    dictionary: Vec<T::T>,
+    dictionary: DictionaryBuffer<T::T>,
 
     // Whether `dictionary` has been initialized
     has_dictionary: bool,
@@ -349,6 +352,29 @@ pub struct DictDecoder<T: DataType> {
 
     // Number of values left in the data stream
     num_values: usize,
+}
+
+/// A primitive PLAIN dictionary can use its immutable page allocation directly.
+/// The borrowed variant is constructed only by `set_dict_from_page`, after
+/// checking the concrete physical type, byte order, length, and alignment.
+enum DictionaryBuffer<T> {
+    Owned(Vec<T>),
+    Borrowed(Bytes, usize, PhantomData<T>),
+}
+
+impl<T> AsRef<[T]> for DictionaryBuffer<T> {
+    fn as_ref(&self) -> &[T] {
+        match self {
+            Self::Owned(values) => values,
+            Self::Borrowed(bytes, len, _) => {
+                // SAFETY: set_dict_from_page admits only i32, i64, f32, and f64,
+                // whose bit patterns are all valid. It checks alignment and that
+                // len * size_of::<T>() fits inside bytes. The Bytes owner keeps
+                // the immutable allocation alive for this returned borrow.
+                unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<T>(), *len) }
+            }
+        }
+    }
 }
 
 impl<T: DataType> Default for DictDecoder<T> {
@@ -361,7 +387,7 @@ impl<T: DataType> DictDecoder<T> {
     /// Creates new dictionary decoder.
     pub fn new() -> Self {
         Self {
-            dictionary: vec![],
+            dictionary: DictionaryBuffer::Owned(vec![]),
             has_dictionary: false,
             rle_decoder: None,
             num_values: 0,
@@ -371,10 +397,51 @@ impl<T: DataType> DictDecoder<T> {
     /// Decodes and sets values for dictionary using `decoder` decoder.
     pub fn set_dict(&mut self, mut decoder: Box<dyn Decoder<T>>) -> Result<()> {
         let num_values = decoder.values_left();
-        self.dictionary.resize(num_values, T::T::default());
-        let _ = decoder.get(&mut self.dictionary)?;
+        let mut dictionary =
+            match mem::replace(&mut self.dictionary, DictionaryBuffer::Owned(Vec::new())) {
+                DictionaryBuffer::Owned(values) => values,
+                DictionaryBuffer::Borrowed(..) => Vec::new(),
+            };
+        dictionary.resize(num_values, T::T::default());
+        let _ = decoder.get(&mut dictionary)?;
+        self.dictionary = DictionaryBuffer::Owned(dictionary);
         self.has_dictionary = true;
         Ok(())
+    }
+
+    /// Load a PLAIN dictionary, retaining aligned native primitive pages.
+    pub(crate) fn set_dict_from_page(
+        &mut self,
+        data: Bytes,
+        num_values: usize,
+        type_length: i32,
+    ) -> Result<()> {
+        let native = cfg!(target_endian = "little")
+            && [
+                TypeId::of::<Int32Type>(),
+                TypeId::of::<Int64Type>(),
+                TypeId::of::<FloatType>(),
+                TypeId::of::<DoubleType>(),
+            ]
+            .contains(&TypeId::of::<T>());
+        if native {
+            // Division avoids overflow for a corrupt count. These four concrete
+            // physical types all have nonzero size.
+            if num_values > data.len() / mem::size_of::<T::T>() {
+                return Err(eof_err!("Not enough bytes to decode dictionary"));
+            }
+            if data.as_ptr().align_offset(mem::align_of::<T::T>()) == 0 {
+                // Retain the original Bytes pointer: slicing an empty prefix
+                // can replace it with an unaligned empty-Bytes sentinel.
+                self.dictionary = DictionaryBuffer::Borrowed(data, num_values, PhantomData);
+                self.has_dictionary = true;
+                return Ok(());
+            }
+        }
+
+        let mut decoder = PlainDecoder::<T>::new(type_length);
+        decoder.set_data(data, num_values)?;
+        self.set_dict(Box::new(decoder))
     }
 }
 
@@ -405,7 +472,7 @@ impl<T: DataType> Decoder<T> for DictDecoder<T> {
 
         let rle = self.rle_decoder.as_mut().unwrap();
         let num_values = cmp::min(buffer.len(), self.num_values);
-        rle.get_batch_with_dict(&self.dictionary[..], buffer, num_values)
+        rle.get_batch_with_dict(self.dictionary.as_ref(), buffer, num_values)
     }
 
     /// Number of values left in this decoder stream
@@ -1210,6 +1277,99 @@ mod tests {
 
     use crate::schema::types::{ColumnDescPtr, ColumnDescriptor, ColumnPath, Type as SchemaType};
     use crate::util::test_common::rand_gen::RandGen;
+
+    #[test]
+    fn test_primitive_dictionary_page_borrowing() {
+        struct NativeOwner<T>(Vec<T>);
+        impl<T: SliceAsBytes> AsRef<[u8]> for NativeOwner<T> {
+            fn as_ref(&self) -> &[u8] {
+                T::slice_as_bytes(&self.0)
+            }
+        }
+        macro_rules! check {
+            ($physical:ty, $native:ty, $values:expr) => {{
+                let values: Vec<$native> = $values;
+                let encoded: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+                for offset in 0..=mem::align_of::<$native>() {
+                    let mut bytes = vec![0u8; offset];
+                    bytes.extend_from_slice(&encoded);
+                    let page = Bytes::from(bytes).slice(offset..);
+                    let pointer = page.as_ptr();
+                    let aligned = pointer.align_offset(mem::align_of::<$native>()) == 0;
+                    let mut decoder = DictDecoder::<$physical>::new();
+                    decoder.set_dict_from_page(page, values.len(), -1).unwrap();
+                    assert_eq!(
+                        matches!(decoder.dictionary, DictionaryBuffer::Borrowed(..)),
+                        aligned && cfg!(target_endian = "little")
+                    );
+                    if aligned && cfg!(target_endian = "little") {
+                        assert_eq!(decoder.dictionary.as_ref().as_ptr().cast::<u8>(), pointer);
+                    }
+                    // Byte comparisons also cover NaNs, signed zero and infinities.
+                    let decoded: Vec<u8> = decoder
+                        .dictionary
+                        .as_ref()
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect();
+                    assert_eq!(decoded, encoded);
+                    let mut empty = DictDecoder::<$physical>::new();
+                    empty
+                        .set_dict_from_page(Bytes::from(encoded.clone()), 0, -1)
+                        .unwrap();
+                    assert!(empty.dictionary.as_ref().is_empty());
+                }
+                let mut decoder = DictDecoder::<$physical>::new();
+                if cfg!(target_endian = "little") {
+                    // A typed owner guarantees allocation alignment under Miri,
+                    // independent of the allocator's alignment for Vec<u8>.
+                    let page = Bytes::from_owner(NativeOwner(values.clone()));
+                    let pointer = page.as_ptr();
+                    decoder.set_dict_from_page(page, values.len(), -1).unwrap();
+                    assert!(matches!(decoder.dictionary, DictionaryBuffer::Borrowed(..)));
+                    assert_eq!(decoder.dictionary.as_ref().as_ptr().cast::<u8>(), pointer);
+                }
+                assert!(
+                    decoder
+                        .set_dict_from_page(
+                            Bytes::from(encoded.clone()).slice(1..),
+                            values.len(),
+                            -1
+                        )
+                        .is_err()
+                );
+                assert!(
+                    decoder
+                        .set_dict_from_page(Bytes::new(), usize::MAX, -1)
+                        .is_err()
+                );
+            }};
+        }
+        check!(Int32Type, i32, vec![i32::MIN, -1, 0, 1, i32::MAX]);
+        check!(Int64Type, i64, vec![i64::MIN, -1, 0, 1, i64::MAX]);
+        check!(
+            FloatType,
+            f32,
+            vec![
+                f32::NEG_INFINITY,
+                -0.0,
+                0.0,
+                f32::INFINITY,
+                f32::from_bits(0x7fc0_002a)
+            ]
+        );
+        check!(
+            DoubleType,
+            f64,
+            vec![
+                f64::NEG_INFINITY,
+                -0.0,
+                0.0,
+                f64::INFINITY,
+                f64::from_bits(0x7ff8_0000_0000_002a)
+            ]
+        );
+    }
 
     #[test]
     fn test_delta_byte_array_invalid_prefix_len_returns_error() {
