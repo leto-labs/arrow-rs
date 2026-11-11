@@ -44,10 +44,15 @@ fn low_mask(count: usize) -> u64 {
 fn mask_at(data: &[u8], offset: usize, count: usize) -> u64 {
     let byte = offset / 8;
     let shift = offset % 8;
-    let mut bytes = [0; 8];
-    let len = (data.len() - byte).min(8);
-    bytes[..len].copy_from_slice(&data[byte..byte + len]);
-    let mut mask = u64::from_le_bytes(bytes) >> shift;
+    let word = if data.len() - byte >= 8 {
+        u64::from_le_bytes(data[byte..byte + 8].try_into().unwrap())
+    } else {
+        let mut bytes = [0; 8];
+        let len = data.len() - byte;
+        bytes[..len].copy_from_slice(&data[byte..]);
+        u64::from_le_bytes(bytes)
+    };
+    let mut mask = word >> shift;
     if shift != 0 && byte + 8 < data.len() {
         mask |= (data[byte + 8] as u64) << (64 - shift);
     }
@@ -74,6 +79,41 @@ pub(super) fn read<T: Default + Clone + 'static>(
     logical: usize,
     validity: &[u8],
     offset: usize,
+    fill: impl FnMut(&mut Vec<T>, usize) -> Result<usize>,
+) -> Result<usize> {
+    #[cfg(target_arch = "x86_64")]
+    if !cfg!(miri) && std::is_x86_feature_detected!("popcnt") {
+        // SAFETY: POPCNT is checked here. read_impl validates all value, bitmap,
+        // and output extents independently of this CPU specialization.
+        return unsafe { read_popcnt(out, dense, physical, logical, validity, offset, fill) };
+    }
+    read_impl(out, dense, physical, logical, validity, offset, fill)
+}
+
+/// # Safety
+/// POPCNT must be available. All memory/data validation stays in read_impl.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "popcnt")]
+unsafe fn read_popcnt<T: Default + Clone + 'static>(
+    out: &mut Vec<T>,
+    dense: &mut Vec<T>,
+    physical: usize,
+    logical: usize,
+    validity: &[u8],
+    offset: usize,
+    fill: impl FnMut(&mut Vec<T>, usize) -> Result<usize>,
+) -> Result<usize> {
+    read_impl(out, dense, physical, logical, validity, offset, fill)
+}
+
+#[inline(always)]
+fn read_impl<T: Default + Clone + 'static>(
+    out: &mut Vec<T>,
+    dense: &mut Vec<T>,
+    physical: usize,
+    logical: usize,
+    validity: &[u8],
+    offset: usize,
     mut fill: impl FnMut(&mut Vec<T>, usize) -> Result<usize>,
 ) -> Result<usize> {
     if !native::<T>() {
@@ -85,12 +125,24 @@ pub(super) fn read<T: Default + Clone + 'static>(
     if end.div_ceil(8) > validity.len() {
         return Err(general_err!("short validity bitmap"));
     }
-    let mut valid_count = 0usize;
-    for pos in (0..logical).step_by(64) {
-        valid_count +=
-            mask_at(validity, offset + pos, (logical - pos).min(64)).count_ones() as usize;
-    }
-    if valid_count != physical {
+    let counts_match = if physical == logical {
+        (0..logical).step_by(64).all(|pos| {
+            let count = (logical - pos).min(64);
+            mask_at(validity, offset + pos, count) == low_mask(count)
+        })
+    } else if physical == 0 {
+        (0..logical)
+            .step_by(64)
+            .all(|pos| mask_at(validity, offset + pos, (logical - pos).min(64)) == 0)
+    } else {
+        let mut valid_count = 0usize;
+        for pos in (0..logical).step_by(64) {
+            valid_count +=
+                mask_at(validity, offset + pos, (logical - pos).min(64)).count_ones() as usize;
+        }
+        valid_count == physical
+    };
+    if !counts_match {
         return Err(general_err!("validity/value count mismatch"));
     }
     if logical == 0 {
@@ -115,6 +167,11 @@ pub(super) fn read<T: Default + Clone + 'static>(
     }
     out.reserve(logical);
     dense.clear();
+    // Fix the window capacity before appending. Amortized growth after small
+    // pages could otherwise allocate more than WINDOW on a later large page.
+    if dense.capacity() < WINDOW {
+        dense.reserve_exact(WINDOW);
+    }
     let mut remaining = physical;
     let mut cursor = 0;
     let mut written = 0;
@@ -165,6 +222,7 @@ pub(super) fn read<T: Default + Clone + 'static>(
     Ok(physical)
 }
 
+#[inline(always)]
 fn expand<T: Default + Clone + 'static>(
     dense: &[T],
     out: &mut [MaybeUninit<T>],
@@ -180,8 +238,11 @@ fn expand<T: Default + Clone + 'static>(
         return Err(general_err!("invalid primitive expansion extent"));
     }
     #[cfg(target_arch = "x86_64")]
-    if !cfg!(miri) && std::is_x86_feature_detected!("avx512f") {
-        // SAFETY: exact primitive types, AVX512F, active input lanes and the
+    if !cfg!(miri)
+        && std::is_x86_feature_detected!("avx512f")
+        && std::is_x86_feature_detected!("popcnt")
+    {
+        // SAFETY: exact primitive types, AVX512F/POPCNT, active input lanes and the
         // complete logical output extent were checked above.
         unsafe {
             expand_avx512(dense, &mut out[..count], mask);
@@ -201,11 +262,11 @@ fn expand<T: Default + Clone + 'static>(
 }
 
 /// # Safety
-/// AVX512F must be available; T is exactly i32/i64/f32/f64. The mask has no
+/// AVX512F and POPCNT must be available; T is exactly i32/i64/f32/f64. The mask has no
 /// set bits beyond out.len() <=64, and dense contains at least popcount(mask)
 /// initialized values. Input and output are disjoint exclusive Rust borrows.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
+#[target_feature(enable = "avx512f,popcnt")]
 unsafe fn expand_avx512<T>(dense: &[T], out: &mut [MaybeUninit<T>], mask: u64) {
     use std::arch::x86_64::*;
     let mut cursor = 0;
@@ -321,6 +382,8 @@ mod tests {
         for (physical, logical, bitmap, offset) in [
             (1, 1, vec![], 0),
             (3, 8, vec![255], 0),
+            (8, 8, vec![254], 0),
+            (0, 8, vec![1], 0),
             (1, 2, vec![255], usize::MAX),
         ] {
             assert!(
@@ -384,6 +447,39 @@ mod tests {
                 assert!(result.is_err() || result.unwrap().is_err());
                 assert_eq!(out, [-17, 42]);
             }
+        }
+    }
+
+    #[test]
+    fn test_spaced_reuses_bounded_window() {
+        let mut out = Vec::<i64>::new();
+        let mut cache = Vec::new();
+        for physical in [301usize, 601, 1023] {
+            let logical = physical + 1;
+            let mut bitmap = vec![255; logical.div_ceil(8)];
+            bitmap[physical / 8] &= !(1 << (physical % 8));
+            let start = out.len();
+            read(
+                &mut out,
+                &mut cache,
+                physical,
+                logical,
+                &bitmap,
+                0,
+                |dst, want| {
+                    dst.reserve(want);
+                    dst.extend(std::iter::repeat_n(7, want));
+                    Ok(want)
+                },
+            )
+            .unwrap();
+            assert!(
+                cache.capacity() <= WINDOW,
+                "physical cache capacity {}",
+                cache.capacity()
+            );
+            assert!(out[start..start + physical].iter().all(|v| *v == 7));
+            assert_eq!(out[start + physical], 0);
         }
     }
 
