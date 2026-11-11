@@ -74,7 +74,10 @@ hashbrown = { version = "0.17", default-features = false }
 twox-hash = { version = "2.0", default-features = false, features = ["xxhash64"] }
 half = { version = "2.1", default-features = false, features = ["num-traits"] }
 crc32fast = { version = "1.4.2", optional = true, default-features = false }
-simdutf8 = { workspace = true , optional = true }
+# Parquet uses std; enable CPU detection in portable x86 builds. Without this,
+# simdutf8's no-std path falls back to scalar validation unless AVX2/SSE4.2 is
+# selected for the entire binary at compile time.
+simdutf8 = { workspace = true, optional = true, features = ["std"] }
 ring = { version = "0.17", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
