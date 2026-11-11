@@ -234,7 +234,7 @@ mod tests {
     fn test_fused_dictionary_properties() {
         let mut state = 0x52a1bc109d32u64;
         for width in 1..=32 {
-            let dict: Vec<i64> = (0..(1usize << width.min(11)))
+            let dict: Vec<i64> = (0..(1usize << width.min(17)))
                 .map(|i| (i as i64).wrapping_mul(i64::MIN + 17))
                 .collect();
             for len in [0, 1, 7, 8, 15, 16, 17, 31, 32, 33, 127, 1024, 1031] {
@@ -250,6 +250,9 @@ mod tests {
                 for cut in 0..=data.len().min(35) {
                     let data = &data[..data.len() - cut];
                     let mut out = vec![MaybeUninit::<i64>::uninit(); len + 3];
+                    for slot in &mut out[len..] {
+                        slot.write(i64::MAX);
+                    }
                     if let Some(result) = decode(data, width as u8, &dict, &mut out[..len]) {
                         let n = result.unwrap();
                         assert!(n <= len && n * width <= data.len() * 8);
@@ -257,6 +260,10 @@ mod tests {
                             // SAFETY: successful decode initializes exactly this prefix.
                             assert_eq!(unsafe { out[i].assume_init() }, dict[ids[i] as usize]);
                         }
+                    }
+                    for slot in &out[len..] {
+                        // SAFETY: sentinels were initialized before decode.
+                        assert_eq!(unsafe { slot.assume_init() }, i64::MAX);
                     }
                 }
                 #[cfg(target_arch = "x86_64")]
@@ -331,15 +338,17 @@ mod tests {
             }
         }
         for width in 1..=24 {
-            for position in [0, 7, 8, 15, 16, 31, 63] {
-                let mut ids = vec![0u32; 64];
-                ids[position] = 1;
-                let data = packed(&ids, width);
-                let mut out = [MaybeUninit::uninit(); 64];
-                if let Some(result) = decode(&data, width as u8, &[42i64], &mut out) {
-                    // AVX2 can leave a short suffix for scalar decoding.
-                    if let Ok(n) = result {
-                        assert!(position >= n);
+            for invalid_id in [1u32, 1u32 << (width - 1), (1u32 << width) - 1] {
+                for position in [0, 7, 8, 15, 16, 31, 63] {
+                    let mut ids = vec![0u32; 64];
+                    ids[position] = invalid_id;
+                    let data = packed(&ids, width);
+                    let mut out = [MaybeUninit::uninit(); 64];
+                    if let Some(result) = decode(&data, width as u8, &[42i64], &mut out) {
+                        // AVX2 can leave a short suffix for scalar decoding.
+                        if let Ok(n) = result {
+                            assert!(position >= n);
+                        }
                     }
                 }
             }

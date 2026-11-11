@@ -625,6 +625,33 @@ impl RleDecoder {
         Ok(values_read)
     }
 
+    /// Append decoded values without initializing primitive output twice.
+    pub(crate) fn append_dictionary<T: Default + Clone + 'static>(
+        &mut self,
+        dict: &[T],
+        out: &mut Vec<T>,
+        count: usize,
+    ) -> Result<usize> {
+        let start = out.len();
+        if fused::native::<T>() {
+            out.reserve(count);
+            let n =
+                self.get_batch_with_dict_uninit(dict, &mut out.spare_capacity_mut()[..count])?;
+            // SAFETY: successful decode initialized n slots in reserved spare
+            // capacity. Native T has no destructor. Errors and panics leave the
+            // vector length unchanged, so partial writes cannot be observed.
+            unsafe {
+                out.set_len(start + n);
+            }
+            Ok(n)
+        } else {
+            out.resize(start + count, T::default());
+            let n = self.get_batch_with_dict(dict, &mut out[start..], count)?;
+            out.truncate(start + n);
+            Ok(n)
+        }
+    }
+
     /// Decode into spare capacity. Only exact no-drop native primitives qualify.
     /// A successful return initializes the returned prefix. On error the caller
     /// must leave the output uninitialized and must not extend its vector length.
@@ -770,6 +797,56 @@ mod tests {
     use rand::{self, Rng, SeedableRng, distr::StandardUniform, rng};
 
     const MAX_WIDTH: usize = 32;
+
+    #[test]
+    fn test_append_dictionary_initialized_prefix_and_error() {
+        for width in 1..=32 {
+            let dict: Vec<i64> = (0..(1usize << width.min(10)))
+                .map(|i| i as i64 - 513)
+                .collect();
+            let mut encoder = RleEncoder::new(width, 65536);
+            for i in 0..4099 {
+                encoder.put((i * 37 % dict.len()) as u64);
+            }
+            let data = Bytes::from(encoder.consume());
+            let mut decoder = RleDecoder::new(width);
+            decoder.set_data(data.clone()).unwrap();
+            let mut scalar = RleDecoder::new(width);
+            scalar.set_data(data).unwrap();
+            let mut actual = vec![i64::MIN];
+            for count in [1, 7, 16, 31, 1024, 2048, 2048, 16] {
+                let mut ids = vec![0i32; count];
+                let n = scalar.get_batch(&mut ids).unwrap();
+                let start = actual.len();
+                assert_eq!(
+                    decoder
+                        .append_dictionary(&dict, &mut actual, count)
+                        .unwrap(),
+                    n
+                );
+                assert_eq!(actual[0], i64::MIN);
+                assert_eq!(actual.len(), start + n);
+                for i in 0..n {
+                    assert_eq!(actual[start + i], dict[ids[i] as u32 as usize]);
+                }
+            }
+            for bad in [1, 15, 16, 31, 1023] {
+                let mut encoder = RleEncoder::new(width, 65536);
+                for i in 0..1024 {
+                    encoder.put(if i == bad { 1 } else { 0 });
+                }
+                let mut decoder = RleDecoder::new(width);
+                decoder.set_data(Bytes::from(encoder.consume())).unwrap();
+                let mut actual = vec![i64::MIN];
+                assert!(
+                    decoder
+                        .append_dictionary(&[42i64], &mut actual, 1024)
+                        .is_err()
+                );
+                assert_eq!(actual, [i64::MIN]);
+            }
+        }
+    }
 
     #[test]
     fn test_primitive_dictionary_gather_dispatch_boundaries() {

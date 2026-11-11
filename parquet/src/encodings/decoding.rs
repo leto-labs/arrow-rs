@@ -185,6 +185,16 @@ pub trait Decoder<T: DataType>: Send {
     /// `buffer.len()`.
     fn get(&mut self, buffer: &mut [T::T]) -> Result<usize>;
 
+    /// Append up to count values. Decoders with write-only primitive paths can
+    /// override this method to fill Vec spare capacity before publishing length.
+    fn get_to_vec(&mut self, out: &mut Vec<T::T>, count: usize) -> Result<usize> {
+        let start = out.len();
+        out.resize(start + count, T::T::default());
+        let n = self.get(&mut out[start..])?;
+        out.truncate(start + n);
+        Ok(n)
+    }
+
     /// Consume values from this decoder and write the results to `buffer`, leaving
     /// "spaces" for null values.
     ///
@@ -473,6 +483,14 @@ impl<T: DataType> Decoder<T> for DictDecoder<T> {
         let rle = self.rle_decoder.as_mut().unwrap();
         let num_values = cmp::min(buffer.len(), self.num_values);
         rle.get_batch_with_dict(self.dictionary.as_ref(), buffer, num_values)
+    }
+
+    fn get_to_vec(&mut self, out: &mut Vec<T::T>, count: usize) -> Result<usize> {
+        assert!(self.has_dictionary, "Must call set_dict() first!");
+        self.rle_decoder
+            .as_mut()
+            .expect("Must call set_data() first!")
+            .append_dictionary(self.dictionary.as_ref(), out, count.min(self.num_values))
     }
 
     /// Number of values left in this decoder stream

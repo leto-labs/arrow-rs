@@ -236,12 +236,7 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
             .as_mut()
             .unwrap_or_else(|| panic!("decoder for encoding {encoding} should be set"));
 
-        // TODO: Push vec into decoder (#5177)
-        let start = out.len();
-        out.resize(start + num_values, T::T::default());
-        let read = current_decoder.get(&mut out[start..])?;
-        out.truncate(start + read);
-        Ok(read)
+        current_decoder.get_to_vec(out, num_values)
     }
 
     fn skip_values(&mut self, num_values: usize) -> Result<usize> {
