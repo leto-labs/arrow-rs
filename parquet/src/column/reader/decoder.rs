@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -20,7 +22,7 @@ use bytes::Bytes;
 use crate::basic::{Encoding, EncodingMask};
 use crate::data_type::DataType;
 use crate::encodings::{
-    decoding::{Decoder, DictDecoder, PlainDecoder, get_decoder},
+    decoding::{Decoder, DictDecoder, get_decoder},
     rle::RleDecoder,
 };
 use crate::errors::{ParquetError, Result};
@@ -180,11 +182,8 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
         }
 
         if encoding == Encoding::RLE_DICTIONARY {
-            let mut dictionary = PlainDecoder::<T>::new(self.descr.type_length());
-            dictionary.set_data(buf, num_values as usize)?;
-
             let mut decoder = DictDecoder::new();
-            decoder.set_dict(Box::new(dictionary))?;
+            decoder.set_dict_from_page(buf, num_values as usize, self.descr.type_length())?;
             self.decoders[encoding as usize] = Some(Box::new(decoder));
             self.decoder_mask.insert(encoding);
             Ok(())
