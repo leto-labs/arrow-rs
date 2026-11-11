@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -550,7 +552,13 @@ impl RleDecoder {
                         self.bit_packed_left = 0;
                         break;
                     }
-                    {
+                    if !std::mem::needs_drop::<T>() && matches!(std::mem::size_of::<T>(), 4 | 8) {
+                        gather_primitive_dictionary(
+                            dict,
+                            &index_buf[..num_values],
+                            &mut buffer[values_read..values_read + num_values],
+                        )?;
+                    } else {
                         #[cold]
                         #[inline(never)]
                         fn oob(max_idx: u32, dict_len: usize) -> ParquetError {
@@ -638,6 +646,51 @@ impl RleDecoder {
     }
 }
 
+/// Validate one unpacked scratch batch before gathering its values. A complete
+/// reduction allows wider vectorization than checking each 16-value group.
+#[inline(always)]
+fn gather_primitive_dictionary_impl<T: Clone>(
+    dict: &[T],
+    indices: &[i32],
+    out: &mut [T],
+) -> Result<()> {
+    if let Some(max_index) = indices.iter().map(|&i| i as u32).max() {
+        if max_index as usize >= dict.len() {
+            return Err(general_err!(
+                "dictionary index out of bounds: the len is {} but the index is {}",
+                dict.len(),
+                max_index
+            ));
+        }
+    }
+    for (value, &index) in out.iter_mut().zip(indices) {
+        // SAFETY: the maximum unsigned index is below dict.len(). Interpret
+        // the unpacked ID as u32 in both validation and lookup.
+        value.clone_from(unsafe { dict.get_unchecked(index as u32 as usize) });
+    }
+    Ok(())
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn gather_primitive_dictionary_avx2<T: Clone>(
+    dict: &[T],
+    indices: &[i32],
+    out: &mut [T],
+) -> Result<()> {
+    gather_primitive_dictionary_impl(dict, indices, out)
+}
+
+fn gather_primitive_dictionary<T: Clone>(dict: &[T], indices: &[i32], out: &mut [T]) -> Result<()> {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if indices.len() >= 32 && std::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 is checked at runtime; the function checks all dictionary
+        // indices before reading values and uses bounded output iteration.
+        return unsafe { gather_primitive_dictionary_avx2(dict, indices, out) };
+    }
+    gather_primitive_dictionary_impl(dict, indices, out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,6 +699,123 @@ mod tests {
     use rand::{self, Rng, SeedableRng, distr::StandardUniform, rng};
 
     const MAX_WIDTH: usize = 32;
+
+    #[test]
+    fn test_primitive_dictionary_gather_dispatch_boundaries() {
+        let dict = [i64::MIN, -1, 0, i64::MAX];
+        for len in 0..=65 {
+            let indices: Vec<i32> = (0..len).map(|i| (i % dict.len()) as i32).collect();
+            let expected: Vec<i64> = indices.iter().map(|&i| dict[i as usize]).collect();
+            let mut scalar = vec![0; len];
+            let mut dispatched = vec![0; len];
+            gather_primitive_dictionary_impl(&dict, &indices, &mut scalar).unwrap();
+            gather_primitive_dictionary(&dict, &indices, &mut dispatched).unwrap();
+            assert_eq!(scalar, expected);
+            assert_eq!(dispatched, expected);
+        }
+    }
+
+    #[test]
+    fn test_primitive_dictionary_gather_random_slices() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5a31_f022);
+        for _ in 0..2048 {
+            let dict: Vec<i64> = (0..rng.random_range(0..4097))
+                .map(|_| rng.random())
+                .collect();
+            let indices: Vec<i32> = (0..rng.random_range(0..1031))
+                .map(|_| {
+                    if !dict.is_empty() && rng.random_ratio(255, 256) {
+                        rng.random_range(0..dict.len()) as i32
+                    } else {
+                        rng.random()
+                    }
+                })
+                .collect();
+            let expected = indices
+                .iter()
+                .map(|&i| dict.get(i as usize).copied())
+                .collect::<Option<Vec<_>>>();
+            let mut actual = vec![0; indices.len()];
+            let result = gather_primitive_dictionary(&dict, &indices, &mut actual);
+            match expected {
+                Some(expected) => {
+                    result.unwrap();
+                    assert_eq!(actual, expected);
+                }
+                None => assert!(result.is_err()),
+            }
+        }
+    }
+
+    // Compare dictionary materialization with independently decoded indices,
+    // including partial batches, mixed RLE/packed runs, and all index widths.
+    #[test]
+    fn test_dictionary_gather_random_batches() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5a31);
+        for width in 0..=32 {
+            let dict_len = (1usize << width.min(12)).min(3073);
+            let dict: Vec<i64> = (0..dict_len).map(|_| rng.random()).collect();
+            let mut encoder = RleEncoder::new(width, 65536);
+            for i in 0..4099 {
+                let index = if i % 257 < 64 {
+                    0
+                } else {
+                    rng.random_range(0..dict_len)
+                };
+                encoder.put(index as u64);
+            }
+            let data = Bytes::from(encoder.consume());
+            let mut gather = RleDecoder::new(width);
+            let mut indices = RleDecoder::new(width);
+            gather.set_data(data.clone()).unwrap();
+            indices.set_data(data).unwrap();
+            let mut remaining = 4099;
+            while remaining > 0 {
+                let n = rng.random_range(1..=remaining.min(1031));
+                if rng.random_ratio(1, 5) {
+                    assert_eq!(gather.skip(n).unwrap(), indices.skip(n).unwrap());
+                } else {
+                    let mut ids = vec![0i32; n];
+                    let mut actual = vec![0i64; n];
+                    let count = indices.get_batch(&mut ids).unwrap();
+                    assert_eq!(
+                        gather.get_batch_with_dict(&dict, &mut actual, n).unwrap(),
+                        count
+                    );
+                    assert_eq!(
+                        &actual[..count],
+                        ids[..count]
+                            .iter()
+                            .map(|&i| dict[i as usize])
+                            .collect::<Vec<_>>()
+                    );
+                }
+                remaining -= n;
+            }
+        }
+    }
+
+    #[test]
+    fn test_dictionary_gather_rejects_invalid_indices() {
+        for invalid in [17u64, i32::MAX as u64, u32::MAX as u64] {
+            for position in [0, 15, 16, 31, 511, 1023] {
+                let mut encoder = RleEncoder::new(32, 16384);
+                for i in 0..1024 {
+                    encoder.put(if i == position {
+                        invalid
+                    } else {
+                        (i % 17) as u64
+                    });
+                }
+                let mut decoder = RleDecoder::new(32);
+                decoder.set_data(Bytes::from(encoder.consume())).unwrap();
+                let err = decoder
+                    .get_batch_with_dict(&[0i64; 17], &mut [0i64; 1024], 1024)
+                    .unwrap_err();
+                assert!(err.to_string().contains("dictionary index out of bounds"));
+            }
+        }
+    }
 
     #[test]
     fn test_rle_decode_int32() {
