@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -19,6 +21,7 @@
 pub mod bit_util;
 mod bit_pack;
 pub(crate) mod interner;
+pub(crate) mod native;
 
 pub mod push_buffers;
 #[cfg(any(test, feature = "test_common"))]

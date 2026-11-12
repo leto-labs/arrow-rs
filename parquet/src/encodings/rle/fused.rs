@@ -18,9 +18,12 @@
 // under the License.
 
 //! Byte-aligned dictionary unpack/gather without an intermediate index buffer.
-use std::{any::TypeId, mem::MaybeUninit};
+pub(super) use crate::util::native::native;
+use std::mem::MaybeUninit;
 
-use crate::errors::{ParquetError, Result};
+#[cfg(target_arch = "x86_64")]
+use crate::errors::ParquetError;
+use crate::errors::Result;
 
 /// Returns `None` when this type, width, CPU, or batch cannot use a fused kernel.
 /// On success only the returned prefix is initialized. An error never exposes
@@ -38,7 +41,21 @@ pub(super) fn decode<T: 'static>(
     {
         // The narrow shuffle wins for small widths on the measured Zen 4.
         // Wider indices benefit from the full-register byte permutation.
-        if width >= 17
+        #[cfg(test)]
+        let tier = crate::util::native::dispatch::tier();
+        #[cfg(test)]
+        let allow_avx512 = matches!(
+            tier,
+            crate::util::native::dispatch::Tier::Auto | crate::util::native::dispatch::Tier::Avx512
+        );
+        #[cfg(not(test))]
+        let allow_avx512 = true;
+        #[cfg(test)]
+        let allow_avx2 = !matches!(tier, crate::util::native::dispatch::Tier::Scalar);
+        #[cfg(not(test))]
+        let allow_avx2 = true;
+        if allow_avx512
+            && width >= 17
             && !cfg!(miri)
             && std::is_x86_feature_detected!("avx512f")
             && std::is_x86_feature_detected!("avx512vbmi")
@@ -52,7 +69,7 @@ pub(super) fn decode<T: 'static>(
                 return Some(unsafe { avx512(data, width, dict, &mut out[..count]) });
             }
         }
-        if !cfg!(miri) && std::is_x86_feature_detected!("avx2") {
+        if allow_avx2 && !cfg!(miri) && std::is_x86_feature_detected!("avx2") {
             // Each eight-value block consumes width bytes. The two unaligned
             // 16-byte loads may extend at most 16 bytes beyond that block.
             let count = (out
@@ -67,20 +84,19 @@ pub(super) fn decode<T: 'static>(
             }
         }
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (data, out);
     None
 }
 
-pub(super) fn native<T: 'static>() -> bool {
-    let t = TypeId::of::<T>();
-    t == TypeId::of::<i32>()
-        || t == TypeId::of::<i64>()
-        || t == TypeId::of::<f32>()
-        || t == TypeId::of::<f64>()
-}
-
+#[cfg(target_arch = "x86_64")]
 #[cold]
-fn invalid() -> ParquetError {
-    general_err!("dictionary index out of bounds in fused decoder")
+fn invalid(dict_len: usize, index: u32) -> ParquetError {
+    general_err!(
+        "dictionary index out of bounds: the len is {} but the index is {}",
+        dict_len,
+        index
+    )
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -93,6 +109,7 @@ use std::arch::x86_64::*;
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn avx2<T>(data: &[u8], width: u8, dict: &[T], out: &mut [MaybeUninit<T>]) -> Result<usize> {
+    debug_assert!(matches!(size_of::<T>(), 4 | 8));
     let w = width as usize;
     let mut shuffle = [0u8; 32];
     let mut shifts = [0i32; 8];
@@ -128,7 +145,12 @@ unsafe fn avx2<T>(data: &[u8], width: u8, dict: &[T], out: &mut [MaybeUninit<T>]
         // Width <=24 makes all IDs nonnegative signed i32. Empty dicts fail too.
         let valid = _mm256_cmpgt_epi32(bound, ids);
         if _mm256_movemask_epi8(valid) != -1 {
-            return Err(invalid());
+            let mut indices = [0i32; 8];
+            // SAFETY: indices is exactly one writable 256-bit vector.
+            unsafe {
+                _mm256_storeu_si256(indices.as_mut_ptr().cast(), ids);
+            }
+            return Err(invalid(dict.len(), *indices.iter().max().unwrap() as u32));
         }
         // SAFETY: all eight IDs are below dict.len(), T is an exact primitive,
         // and dst contains eight writable slots. Loads/stores are unaligned.
@@ -163,6 +185,7 @@ unsafe fn avx512<T>(
     dict: &[T],
     out: &mut [MaybeUninit<T>],
 ) -> Result<usize> {
+    debug_assert!(matches!(size_of::<T>(), 4 | 8));
     let w = width as usize;
     let mut shuffle = [0u8; 64];
     let mut shifts = [0i32; 16];
@@ -192,7 +215,12 @@ unsafe fn avx512<T>(
             mask,
         );
         if _mm512_cmplt_epi32_mask(ids, bound) != u16::MAX {
-            return Err(invalid());
+            let mut indices = [0i32; 16];
+            // SAFETY: indices is exactly one writable 512-bit vector.
+            unsafe {
+                _mm512_storeu_si512(indices.as_mut_ptr().cast(), ids);
+            }
+            return Err(invalid(dict.len(), *indices.iter().max().unwrap() as u32));
         }
         // SAFETY: every ID is validated above, T is an exact primitive, and
         // the destination holds sixteen writable slots. No typed T is read.
@@ -232,127 +260,147 @@ mod tests {
 
     #[test]
     fn test_fused_dictionary_properties() {
-        let mut state = 0x52a1bc109d32u64;
-        for width in 1..=32 {
-            let dict: Vec<i64> = (0..(1usize << width.min(17)))
-                .map(|i| (i as i64).wrapping_mul(i64::MIN + 17))
-                .collect();
-            for len in [0, 1, 7, 8, 15, 16, 17, 31, 32, 33, 127, 1024, 1031] {
-                let ids: Vec<u32> = (0..len)
-                    .map(|_| {
-                        state ^= state << 13;
-                        state ^= state >> 7;
-                        state ^= state << 17;
-                        (state as usize % dict.len()) as u32
-                    })
+        crate::util::native::dispatch::for_each_tier(|| {
+            let mut state = 0x52a1bc109d32u64;
+            for width in 1..=32 {
+                let dict: Vec<i64> = (0..(1usize
+                    << if (18..=24).contains(&width) && !cfg!(miri) {
+                        width
+                    } else {
+                        width.min(17)
+                    }))
+                    .map(|i| (i as i64).wrapping_mul(i64::MIN + 17))
                     .collect();
-                let data = packed(&ids, width);
-                for cut in 0..=data.len().min(35) {
-                    let data = &data[..data.len() - cut];
-                    let mut out = vec![MaybeUninit::<i64>::uninit(); len + 3];
-                    for slot in &mut out[len..] {
-                        slot.write(i64::MAX);
+                for len in [0, 1, 7, 8, 15, 16, 17, 31, 32, 33, 127, 1024, 1031] {
+                    let ids: Vec<u32> = (0..len)
+                        .map(|i| {
+                            state ^= state << 13;
+                            state ^= state >> 7;
+                            state ^= state << 17;
+                            if i == 0 {
+                                (dict.len() - 1) as u32
+                            } else if i < width && dict.len() == 1usize << width {
+                                1u32 << i
+                            } else {
+                                (state as usize % dict.len()) as u32
+                            }
+                        })
+                        .collect();
+                    let data = packed(&ids, width);
+                    for cut in 0..=data.len().min(35) {
+                        let data = &data[..data.len() - cut];
+                        let mut out = vec![MaybeUninit::<i64>::uninit(); len + 3];
+                        for slot in &mut out[len..] {
+                            slot.write(i64::MAX);
+                        }
+                        if let Some(result) = decode(data, width as u8, &dict, &mut out[..len]) {
+                            let n = result.unwrap();
+                            assert!(n <= len && n * width <= data.len() * 8);
+                            for i in 0..n {
+                                // SAFETY: successful decode initializes exactly this prefix.
+                                assert_eq!(unsafe { out[i].assume_init() }, dict[ids[i] as usize]);
+                            }
+                        }
+                        for slot in &out[len..] {
+                            // SAFETY: sentinels were initialized before decode.
+                            assert_eq!(unsafe { slot.assume_init() }, i64::MAX);
+                        }
                     }
-                    if let Some(result) = decode(data, width as u8, &dict, &mut out[..len]) {
-                        let n = result.unwrap();
-                        assert!(n <= len && n * width <= data.len() * 8);
+                    #[cfg(target_arch = "x86_64")]
+                    if width <= 24
+                        && crate::util::native::dispatch::tier()
+                            != crate::util::native::dispatch::Tier::Scalar
+                        && !cfg!(miri)
+                        && std::is_x86_feature_detected!("avx2")
+                    {
+                        // Exercise the AVX2 fallback even on an AVX512 host. Include
+                        // readable padding only in this direct-kernel test.
+                        let mut padded = data.clone();
+                        padded.extend_from_slice(&[0; 16]);
+                        let n = len / 8 * 8;
+                        let mut out = vec![MaybeUninit::<i64>::uninit(); n];
+                        // SAFETY: exact primitive type, supported feature/width,
+                        // eight-value blocks, and sixteen readable trailing bytes.
+                        assert_eq!(
+                            unsafe { avx2(&padded, width as u8, &dict, &mut out) }.unwrap(),
+                            n
+                        );
                         for i in 0..n {
-                            // SAFETY: successful decode initializes exactly this prefix.
+                            // SAFETY: successful avx2 initialized every output slot.
                             assert_eq!(unsafe { out[i].assume_init() }, dict[ids[i] as usize]);
                         }
                     }
-                    for slot in &out[len..] {
-                        // SAFETY: sentinels were initialized before decode.
-                        assert_eq!(unsafe { slot.assume_init() }, i64::MAX);
-                    }
-                }
-                #[cfg(target_arch = "x86_64")]
-                if width <= 24 && !cfg!(miri) && std::is_x86_feature_detected!("avx2") {
-                    // Exercise the AVX2 fallback even on an AVX512 host. Include
-                    // readable padding only in this direct-kernel test.
-                    let mut padded = data.clone();
-                    padded.extend_from_slice(&[0; 16]);
-                    let n = len / 8 * 8;
-                    let mut out = vec![MaybeUninit::<i64>::uninit(); n];
-                    // SAFETY: exact primitive type, supported feature/width,
-                    // eight-value blocks, and sixteen readable trailing bytes.
-                    assert_eq!(
-                        unsafe { avx2(&padded, width as u8, &dict, &mut out) }.unwrap(),
-                        n
-                    );
-                    for i in 0..n {
-                        // SAFETY: successful avx2 initialized every output slot.
-                        assert_eq!(unsafe { out[i].assume_init() }, dict[ids[i] as usize]);
-                    }
                 }
             }
-        }
+        });
     }
 
     #[test]
     fn test_fused_dictionary_types_and_invalid_ids() {
-        // Floating-point gathers must preserve every bit, including NaN payloads.
-        let d32 = [f32::from_bits(0x7fc01234), f32::NEG_INFINITY, -0.0, 9.0];
-        let d64 = [
-            f64::from_bits(0x7ff8000012345678),
-            f64::NEG_INFINITY,
-            -0.0,
-            9.0,
-        ];
-        let i32s = [i32::MIN, i32::MAX, -1, 0];
-        let ids: Vec<u32> = (0..64).map(|i| i % 4).collect();
-        for width in [2, 17] {
-            let mut data = packed(&ids, width);
-            data.extend_from_slice(&[0; 16]);
-            let mut out32 = [MaybeUninit::uninit(); 64];
-            let mut out64 = [MaybeUninit::uninit(); 64];
-            let mut outi32 = [MaybeUninit::uninit(); 64];
-            if let Some(result) = decode(&data, width as u8, &d32, &mut out32) {
-                let n = result.unwrap();
-                assert_eq!(
-                    decode(&data, width as u8, &d64, &mut out64)
-                        .unwrap()
-                        .unwrap(),
-                    n
-                );
-                assert_eq!(
-                    decode(&data, width as u8, &i32s, &mut outi32)
-                        .unwrap()
-                        .unwrap(),
-                    n
-                );
-                for i in 0..n {
-                    // SAFETY: all three calls successfully initialized n slots.
-                    unsafe {
-                        assert_eq!(
-                            out32[i].assume_init().to_bits(),
-                            d32[ids[i] as usize].to_bits()
-                        );
-                        assert_eq!(
-                            out64[i].assume_init().to_bits(),
-                            d64[ids[i] as usize].to_bits()
-                        );
-                        assert_eq!(outi32[i].assume_init(), i32s[ids[i] as usize]);
-                    }
-                }
-            }
-        }
-        for width in 1..=24 {
-            for invalid_id in [1u32, 1u32 << (width - 1), (1u32 << width) - 1] {
-                for position in [0, 7, 8, 15, 16, 31, 63] {
-                    let mut ids = vec![0u32; 64];
-                    ids[position] = invalid_id;
-                    let data = packed(&ids, width);
-                    let mut out = [MaybeUninit::uninit(); 64];
-                    if let Some(result) = decode(&data, width as u8, &[42i64], &mut out) {
-                        // AVX2 can leave a short suffix for scalar decoding.
-                        if let Ok(n) = result {
-                            assert!(position >= n);
+        crate::util::native::dispatch::for_each_tier(|| {
+            // Floating-point gathers must preserve every bit, including NaN payloads.
+            let d32 = [f32::from_bits(0x7fc01234), f32::NEG_INFINITY, -0.0, 9.0];
+            let d64 = [
+                f64::from_bits(0x7ff8000012345678),
+                f64::NEG_INFINITY,
+                -0.0,
+                9.0,
+            ];
+            let i32s = [i32::MIN, i32::MAX, -1, 0];
+            let ids: Vec<u32> = (0..64).map(|i| i % 4).collect();
+            for width in [2, 17] {
+                let mut data = packed(&ids, width);
+                data.extend_from_slice(&[0; 16]);
+                let mut out32 = [MaybeUninit::uninit(); 64];
+                let mut out64 = [MaybeUninit::uninit(); 64];
+                let mut outi32 = [MaybeUninit::uninit(); 64];
+                if let Some(result) = decode(&data, width as u8, &d32, &mut out32) {
+                    let n = result.unwrap();
+                    assert_eq!(
+                        decode(&data, width as u8, &d64, &mut out64)
+                            .unwrap()
+                            .unwrap(),
+                        n
+                    );
+                    assert_eq!(
+                        decode(&data, width as u8, &i32s, &mut outi32)
+                            .unwrap()
+                            .unwrap(),
+                        n
+                    );
+                    for i in 0..n {
+                        // SAFETY: all three calls successfully initialized n slots.
+                        unsafe {
+                            assert_eq!(
+                                out32[i].assume_init().to_bits(),
+                                d32[ids[i] as usize].to_bits()
+                            );
+                            assert_eq!(
+                                out64[i].assume_init().to_bits(),
+                                d64[ids[i] as usize].to_bits()
+                            );
+                            assert_eq!(outi32[i].assume_init(), i32s[ids[i] as usize]);
                         }
                     }
                 }
             }
-        }
-        assert!(decode(&[0; 32], 2, &["abc"], &mut [MaybeUninit::uninit(); 64]).is_none());
+            for width in 1..=24 {
+                for invalid_id in [1u32, 1u32 << (width - 1), (1u32 << width) - 1] {
+                    for position in [0, 7, 8, 15, 16, 31, 63] {
+                        let mut ids = vec![0u32; 64];
+                        ids[position] = invalid_id;
+                        let data = packed(&ids, width);
+                        let mut out = [MaybeUninit::uninit(); 64];
+                        if let Some(result) = decode(&data, width as u8, &[42i64], &mut out) {
+                            // AVX2 can leave a short suffix for scalar decoding.
+                            if let Ok(n) = result {
+                                assert!(position >= n);
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(decode(&[0; 32], 2, &["abc"], &mut [MaybeUninit::uninit(); 64]).is_none());
+        });
     }
 }
