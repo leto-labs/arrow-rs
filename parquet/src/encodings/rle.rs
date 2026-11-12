@@ -665,10 +665,16 @@ impl RleDecoder {
         while written < out.len() {
             if self.rle_left > 0 {
                 let n = (out.len() - written).min(self.rle_left as usize);
-                let id = self.current_value.unwrap() as usize;
-                let value = dict
-                    .get(id)
-                    .ok_or_else(|| general_err!("dictionary index out of bounds: {id}"))?;
+                let id = self.current_value.ok_or_else(|| {
+                    general_err!("parquet_data_error: not enough data for RLE decoding")
+                })? as usize;
+                let value = dict.get(id).ok_or_else(|| {
+                    general_err!(
+                        "dictionary index out of bounds: the len is {} but the index is {}",
+                        dict.len(),
+                        id
+                    )
+                })?;
                 for slot in &mut out[written..written + n] {
                     slot.write(value.clone());
                 }
@@ -697,8 +703,13 @@ impl RleDecoder {
                     self.bit_packed_left = 0;
                     continue;
                 }
-                if indices[..n].iter().map(|&i| i as u32).max().unwrap() as usize >= dict.len() {
-                    return Err(general_err!("dictionary index out of bounds"));
+                let max_index = indices[..n].iter().map(|&i| i as u32).max().unwrap();
+                if max_index as usize >= dict.len() {
+                    return Err(general_err!(
+                        "dictionary index out of bounds: the len is {} but the index is {}",
+                        dict.len(),
+                        max_index
+                    ));
                 }
                 for (slot, &id) in out[written..written + n].iter_mut().zip(&indices[..n]) {
                     // SAFETY: every unsigned ID is bounded by the maximum checked above.
@@ -799,53 +810,92 @@ mod tests {
     const MAX_WIDTH: usize = 32;
 
     #[test]
-    fn test_append_dictionary_initialized_prefix_and_error() {
-        for width in 1..=32 {
-            let dict: Vec<i64> = (0..(1usize << width.min(10)))
-                .map(|i| i as i64 - 513)
-                .collect();
-            let mut encoder = RleEncoder::new(width, 65536);
-            for i in 0..4099 {
-                encoder.put((i * 37 % dict.len()) as u64);
-            }
-            let data = Bytes::from(encoder.consume());
-            let mut decoder = RleDecoder::new(width);
-            decoder.set_data(data.clone()).unwrap();
-            let mut scalar = RleDecoder::new(width);
-            scalar.set_data(data).unwrap();
-            let mut actual = vec![i64::MIN];
-            for count in [1, 7, 16, 31, 1024, 2048, 2048, 16] {
-                let mut ids = vec![0i32; count];
-                let n = scalar.get_batch(&mut ids).unwrap();
-                let start = actual.len();
-                assert_eq!(
-                    decoder
-                        .append_dictionary(&dict, &mut actual, count)
-                        .unwrap(),
-                    n
-                );
-                assert_eq!(actual[0], i64::MIN);
-                assert_eq!(actual.len(), start + n);
-                for i in 0..n {
-                    assert_eq!(actual[start + i], dict[ids[i] as u32 as usize]);
-                }
-            }
-            for bad in [1, 15, 16, 31, 1023] {
-                let mut encoder = RleEncoder::new(width, 65536);
-                for i in 0..1024 {
-                    encoder.put(if i == bad { 1 } else { 0 });
+    fn test_review_dictionary_errors_and_reuse() {
+        crate::util::native::dispatch::for_each_tier(|| {
+            for width in [2, 17, 24, 32] {
+                let mut encoder = RleEncoder::new(width, 4096);
+                for i in 0..64 {
+                    encoder.put(if i % 2 == 0 { 0 } else { 3 });
                 }
                 let mut decoder = RleDecoder::new(width);
                 decoder.set_data(Bytes::from(encoder.consume())).unwrap();
-                let mut actual = vec![i64::MIN];
-                assert!(
-                    decoder
-                        .append_dictionary(&[42i64], &mut actual, 1024)
-                        .is_err()
+                let error = decoder
+                    .append_dictionary(&[42i64], &mut Vec::new(), 64)
+                    .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "Parquet error: dictionary index out of bounds: the len is 1 but the index is 3"
                 );
-                assert_eq!(actual, [i64::MIN]);
             }
-        }
+            let mut decoder = RleDecoder::new(8);
+            // A repeated run header without its value leaves reload in error.
+            assert!(decoder.set_data(Bytes::from_static(&[2])).is_err());
+            let mut out = vec![-17i64];
+            assert!(decoder.append_dictionary(&[42], &mut out, 1).is_err());
+            assert!(decoder.append_dictionary(&[42], &mut out, 1).is_err());
+            assert_eq!(out, [-17]);
+        });
+    }
+
+    #[test]
+    fn test_append_dictionary_initialized_prefix_and_error() {
+        crate::util::native::dispatch::for_each_tier(|| {
+            for width in 1..=32 {
+                let dict: Vec<i64> = (0..(1usize
+                    << if (18..=24).contains(&width) && !cfg!(miri) {
+                        width
+                    } else {
+                        width.min(10)
+                    }))
+                    .map(|i| i as i64 - 513)
+                    .collect();
+                let mut encoder = RleEncoder::new(width, 65536);
+                for i in 0..4099 {
+                    encoder.put(if i == 0 {
+                        (dict.len() - 1) as u64
+                    } else {
+                        (i * 7919 % dict.len()) as u64
+                    });
+                }
+                let data = Bytes::from(encoder.consume());
+                let mut decoder = RleDecoder::new(width);
+                decoder.set_data(data.clone()).unwrap();
+                let mut scalar = RleDecoder::new(width);
+                scalar.set_data(data).unwrap();
+                let mut actual = vec![i64::MIN];
+                for count in [1, 7, 16, 31, 1024, 2048, 2048, 16] {
+                    let mut ids = vec![0i32; count];
+                    let n = scalar.get_batch(&mut ids).unwrap();
+                    let start = actual.len();
+                    assert_eq!(
+                        decoder
+                            .append_dictionary(&dict, &mut actual, count)
+                            .unwrap(),
+                        n
+                    );
+                    assert_eq!(actual[0], i64::MIN);
+                    assert_eq!(actual.len(), start + n);
+                    for i in 0..n {
+                        assert_eq!(actual[start + i], dict[ids[i] as u32 as usize]);
+                    }
+                }
+                for bad in [1, 15, 16, 31, 1023] {
+                    let mut encoder = RleEncoder::new(width, 65536);
+                    for i in 0..1024 {
+                        encoder.put(if i == bad { 1 } else { 0 });
+                    }
+                    let mut decoder = RleDecoder::new(width);
+                    decoder.set_data(Bytes::from(encoder.consume())).unwrap();
+                    let mut actual = vec![i64::MIN];
+                    assert!(
+                        decoder
+                            .append_dictionary(&[42i64], &mut actual, 1024)
+                            .is_err()
+                    );
+                    assert_eq!(actual, [i64::MIN]);
+                }
+            }
+        });
     }
 
     #[test]
