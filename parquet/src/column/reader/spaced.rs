@@ -18,19 +18,12 @@
 // under the License.
 
 //! Flat nullable primitives: dense decode windows, sequential logical output.
-use std::{any::TypeId, mem::MaybeUninit};
+pub(super) use crate::util::native::native;
+use std::mem::MaybeUninit;
 
 use crate::errors::{ParquetError, Result};
 
 const WINDOW: usize = 1024;
-
-pub(super) fn native<T: 'static>() -> bool {
-    let t = TypeId::of::<T>();
-    t == TypeId::of::<i32>()
-        || t == TypeId::of::<i64>()
-        || t == TypeId::of::<f32>()
-        || t == TypeId::of::<f64>()
-}
 
 fn low_mask(count: usize) -> u64 {
     if count == 64 {
@@ -81,8 +74,13 @@ pub(super) fn read<T: Default + Clone + 'static>(
     offset: usize,
     fill: impl FnMut(&mut Vec<T>, usize) -> Result<usize>,
 ) -> Result<usize> {
+    #[cfg(all(test, target_arch = "x86_64"))]
+    let allow_native =
+        crate::util::native::dispatch::tier() != crate::util::native::dispatch::Tier::Scalar;
+    #[cfg(all(not(test), target_arch = "x86_64"))]
+    let allow_native = true;
     #[cfg(target_arch = "x86_64")]
-    if !cfg!(miri) && std::is_x86_feature_detected!("popcnt") {
+    if allow_native && !cfg!(miri) && std::is_x86_feature_detected!("popcnt") {
         // SAFETY: POPCNT is checked here. read_impl validates all value, bitmap,
         // and output extents independently of this CPU specialization.
         return unsafe { read_popcnt(out, dense, physical, logical, validity, offset, fill) };
@@ -156,7 +154,11 @@ fn read_impl<T: Default + Clone + 'static>(
         let mut guard = RestoreLength { out, keep: start };
         let n = fill(&mut *guard.out, physical)?;
         if n != physical || guard.out.len() != out_end {
-            return Err(general_err!("short spaced value read"));
+            return Err(general_err!(
+                "insufficient values read from column - expected: {}, got: {}",
+                physical,
+                n
+            ));
         }
         guard.keep = out_end;
         return Ok(n);
@@ -181,7 +183,12 @@ fn read_impl<T: Default + Clone + 'static>(
             let want = remaining.min(WINDOW);
             let n = fill(dense, want)?;
             if n != want || dense.len() != want {
-                return Err(general_err!("short spaced value read"));
+                let got = (physical - remaining).saturating_add(n);
+                return Err(general_err!(
+                    "insufficient values read from column - expected: {}, got: {}",
+                    physical,
+                    got
+                ));
             }
             remaining -= n;
             cursor = 0;
@@ -237,8 +244,16 @@ fn expand<T: Default + Clone + 'static>(
     {
         return Err(general_err!("invalid primitive expansion extent"));
     }
+    #[cfg(all(test, target_arch = "x86_64"))]
+    let allow_avx512 = matches!(
+        crate::util::native::dispatch::tier(),
+        crate::util::native::dispatch::Tier::Auto | crate::util::native::dispatch::Tier::Avx512
+    );
+    #[cfg(all(not(test), target_arch = "x86_64"))]
+    let allow_avx512 = true;
     #[cfg(target_arch = "x86_64")]
-    if !cfg!(miri)
+    if allow_avx512
+        && !cfg!(miri)
         && std::is_x86_feature_detected!("avx512f")
         && std::is_x86_feature_detected!("popcnt")
     {
@@ -269,6 +284,7 @@ fn expand<T: Default + Clone + 'static>(
 #[target_feature(enable = "avx512f,popcnt")]
 unsafe fn expand_avx512<T>(dense: &[T], out: &mut [MaybeUninit<T>], mask: u64) {
     use std::arch::x86_64::*;
+    debug_assert!(matches!(size_of::<T>(), 4 | 8));
     let mut cursor = 0;
     let lanes = if size_of::<T>() == 8 { 8 } else { 16 };
     for (block, dst) in out.chunks_mut(lanes).enumerate() {
@@ -367,152 +383,190 @@ mod tests {
 
     #[test]
     fn test_spaced_primitive_masks_and_prefixes() {
-        check(|x| x as i64, |x| *x as u64);
-        if !cfg!(miri) {
-            check(|x| x as i32, |x| *x as u32 as u64);
-            check(|x| f64::from_bits(x), |x| x.to_bits());
-            check(|x| f32::from_bits(x as u32), |x| x.to_bits() as u64);
-        }
+        crate::util::native::dispatch::for_each_tier(|| {
+            check(|x| x as i64, |x| *x as u64);
+            if !cfg!(miri) {
+                check(|x| x as i32, |x| *x as u32 as u64);
+                check(|x| f64::from_bits(x), |x| x.to_bits());
+                check(|x| f32::from_bits(x as u32), |x| x.to_bits() as u64);
+            }
+        });
     }
 
     #[test]
     fn test_spaced_rejects_bad_extents_and_short_reads() {
-        let mut out = vec![-17i64, 42];
-        let mut cache = Vec::new();
-        for (physical, logical, bitmap, offset) in [
-            (1, 1, vec![], 0),
-            (3, 8, vec![255], 0),
-            (8, 8, vec![254], 0),
-            (0, 8, vec![1], 0),
-            (1, 2, vec![255], usize::MAX),
-        ] {
-            assert!(
-                read(
-                    &mut out,
-                    &mut cache,
-                    physical,
-                    logical,
-                    &bitmap,
-                    offset,
-                    |_, _| panic!("invalid bitmap must not reach decoder")
-                )
-                .is_err()
-            );
-            assert_eq!(out, [-17, 42]);
-        }
-        for all_valid in [false, true] {
-            let logical: usize = 3073;
-            let mut bitmap = vec![0; logical.div_ceil(8)];
-            let mut physical = 0;
-            for i in 0..logical {
-                if all_valid || i % 3 != 0 {
-                    bitmap[i / 8] |= 1 << (i % 8);
-                    physical += 1;
-                }
-            }
-            for failure in 0..4 {
-                let mut calls = 0;
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::util::native::dispatch::for_each_tier(|| {
+            let mut out = vec![-17i64, 42];
+            let mut cache = Vec::new();
+            for (physical, logical, bitmap, offset) in [
+                (1, 1, vec![], 0),
+                (3, 8, vec![255], 0),
+                (8, 8, vec![254], 0),
+                (0, 8, vec![1], 0),
+                (1, 2, vec![255], usize::MAX),
+            ] {
+                assert!(
                     read(
                         &mut out,
                         &mut cache,
                         physical,
                         logical,
                         &bitmap,
-                        0,
-                        |dst, want| {
-                            calls += 1;
-                            // For the mixed bitmap fail after some logical slots have
-                            // already been initialized in spare capacity.
-                            if all_valid || calls == 2 {
-                                if failure == 0 {
-                                    return Err(general_err!("injected read error"));
-                                }
-                                if failure == 1 {
-                                    dst.extend(std::iter::repeat_n(5, want - 1));
-                                    return Ok(want - 1);
-                                }
-                                if failure == 2 {
-                                    dst.extend(std::iter::repeat_n(5, want));
-                                    return Ok(want + 1);
-                                }
-                                dst.push(9);
-                                panic!("injected read panic");
-                            }
-                            dst.extend(std::iter::repeat_n(7, want));
-                            Ok(want)
-                        },
+                        offset,
+                        |_, _| panic!("invalid bitmap must not reach decoder")
                     )
-                }));
-                assert!(result.is_err() || result.unwrap().is_err());
+                    .is_err()
+                );
                 assert_eq!(out, [-17, 42]);
             }
-        }
+            for all_valid in [false, true] {
+                let logical: usize = 3073;
+                let mut bitmap = vec![0; logical.div_ceil(8)];
+                let mut physical = 0;
+                for i in 0..logical {
+                    if all_valid || i % 3 != 0 {
+                        bitmap[i / 8] |= 1 << (i % 8);
+                        physical += 1;
+                    }
+                }
+                for failure in 0..4 {
+                    let mut calls = 0;
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        read(
+                            &mut out,
+                            &mut cache,
+                            physical,
+                            logical,
+                            &bitmap,
+                            0,
+                            |dst, want| {
+                                calls += 1;
+                                // For the mixed bitmap fail after some logical slots have
+                                // already been initialized in spare capacity.
+                                if all_valid || calls == 2 {
+                                    if failure == 0 {
+                                        return Err(general_err!("injected read error"));
+                                    }
+                                    if failure == 1 {
+                                        dst.extend(std::iter::repeat_n(5, want - 1));
+                                        return Ok(want - 1);
+                                    }
+                                    if failure == 2 {
+                                        dst.extend(std::iter::repeat_n(5, want));
+                                        return Ok(want + 1);
+                                    }
+                                    dst.push(9);
+                                    panic!("injected read panic");
+                                }
+                                dst.extend(std::iter::repeat_n(7, want));
+                                Ok(want)
+                            },
+                        )
+                    }));
+                    assert!(result.is_err() || result.unwrap().is_err());
+                    assert_eq!(out, [-17, 42]);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_review_spaced_short_read_error_fields() {
+        crate::util::native::dispatch::for_each_tier(|| {
+            for (physical, logical, bitmap) in [(8, 8, [255]), (4, 8, [85])] {
+                let mut out = vec![-17i64];
+                let error = read(
+                    &mut out,
+                    &mut Vec::new(),
+                    physical,
+                    logical,
+                    &bitmap,
+                    0,
+                    |dst, want| {
+                        dst.extend(std::iter::repeat_n(7, want - 1));
+                        Ok(want - 1)
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "Parquet error: insufficient values read from column - expected: {physical}, got: {}",
+                        physical - 1
+                    )
+                );
+                assert_eq!(out, [-17]);
+            }
+        });
     }
 
     #[test]
     fn test_spaced_reuses_bounded_window() {
-        let mut out = Vec::<i64>::new();
-        let mut cache = Vec::new();
-        for physical in [301usize, 601, 1023] {
-            let logical = physical + 1;
-            let mut bitmap = vec![255; logical.div_ceil(8)];
-            bitmap[physical / 8] &= !(1 << (physical % 8));
-            let start = out.len();
-            read(
-                &mut out,
-                &mut cache,
-                physical,
-                logical,
-                &bitmap,
-                0,
-                |dst, want| {
-                    dst.reserve(want);
-                    dst.extend(std::iter::repeat_n(7, want));
-                    Ok(want)
-                },
-            )
-            .unwrap();
-            assert!(
-                cache.capacity() <= WINDOW,
-                "physical cache capacity {}",
-                cache.capacity()
-            );
-            assert!(out[start..start + physical].iter().all(|v| *v == 7));
-            assert_eq!(out[start + physical], 0);
-        }
+        crate::util::native::dispatch::for_each_tier(|| {
+            let mut out = Vec::<i64>::new();
+            let mut cache = Vec::new();
+            for physical in [301usize, 601, 1023] {
+                let logical = physical + 1;
+                let mut bitmap = vec![255; logical.div_ceil(8)];
+                bitmap[physical / 8] &= !(1 << (physical % 8));
+                let start = out.len();
+                read(
+                    &mut out,
+                    &mut cache,
+                    physical,
+                    logical,
+                    &bitmap,
+                    0,
+                    |dst, want| {
+                        dst.reserve(want);
+                        dst.extend(std::iter::repeat_n(7, want));
+                        Ok(want)
+                    },
+                )
+                .unwrap();
+                assert!(
+                    cache.capacity() <= WINDOW,
+                    "physical cache capacity {}",
+                    cache.capacity()
+                );
+                assert!(out[start..start + physical].iter().all(|v| *v == 7));
+                assert_eq!(out[start + physical], 0);
+            }
+        });
     }
 
     #[test]
     fn test_expand_masks_and_output_sentinels() {
-        for count in 0..=8 {
-            for mask in 0u64..=low_mask(count) {
-                let dense: Vec<i64> = (0..mask.count_ones())
-                    .map(|i| i64::MIN + i as i64)
-                    .collect();
-                let mut out = [MaybeUninit::new(i64::MAX); 11];
-                expand(&dense, &mut out[..count], mask, count).unwrap();
-                let mut cursor = 0;
-                for (i, slot) in out.iter().enumerate() {
-                    let expected = if i >= count {
-                        i64::MAX
-                    } else if mask & (1 << i) != 0 {
-                        let value = dense[cursor];
-                        cursor += 1;
-                        value
-                    } else {
-                        0
-                    };
-                    // SAFETY: all sentinels were initialized before expand,
-                    // whose successful call initialized every slot in count.
-                    assert_eq!(unsafe { slot.assume_init() }, expected);
+        crate::util::native::dispatch::for_each_tier(|| {
+            for count in 0..=8 {
+                for mask in 0u64..=low_mask(count) {
+                    let dense: Vec<i64> = (0..mask.count_ones())
+                        .map(|i| i64::MIN + i as i64)
+                        .collect();
+                    let mut out = [MaybeUninit::new(i64::MAX); 11];
+                    expand(&dense, &mut out[..count], mask, count).unwrap();
+                    let mut cursor = 0;
+                    for (i, slot) in out.iter().enumerate() {
+                        let expected = if i >= count {
+                            i64::MAX
+                        } else if mask & (1 << i) != 0 {
+                            let value = dense[cursor];
+                            cursor += 1;
+                            value
+                        } else {
+                            0
+                        };
+                        // SAFETY: all sentinels were initialized before expand,
+                        // whose successful call initialized every slot in count.
+                        assert_eq!(unsafe { slot.assume_init() }, expected);
+                    }
                 }
             }
-        }
-        assert!(expand(&[true], &mut [MaybeUninit::<bool>::uninit(); 1], 1, 1).is_err());
-        let mut out = [MaybeUninit::<i64>::uninit(); 64];
-        assert!(expand(&[], &mut out, 1, 1).is_err());
-        assert!(expand(&[7], &mut out[..1], 2, 1).is_err());
-        assert!(expand(&[7], &mut out, 0, 65).is_err());
+            assert!(expand(&[true], &mut [MaybeUninit::<bool>::uninit(); 1], 1, 1).is_err());
+            let mut out = [MaybeUninit::<i64>::uninit(); 64];
+            assert!(expand(&[], &mut out, 1, 1).is_err());
+            assert!(expand(&[7], &mut out[..1], 2, 1).is_err());
+            assert!(expand(&[7], &mut out, 0, 65).is_err());
+        });
     }
 }
