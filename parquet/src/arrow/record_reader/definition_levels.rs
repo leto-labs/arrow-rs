@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -334,7 +336,11 @@ impl PackedDecoder {
     fn next_rle_block(&mut self) -> Result<()> {
         let indicator_value = self.decode_header()?;
         if indicator_value & 1 == 1 {
-            let len = (indicator_value >> 1) as usize;
+            // A run cannot be longer than the remaining data. Some writers
+            // truncate the last run, and a corrupt header can declare any
+            // length; both then give a short read instead of a read past the end.
+            let available = self.data.len() - self.data_offset;
+            let len = ((indicator_value >> 1) as usize).min(available);
             self.packed_count = len * 8;
             self.packed_offset = 0;
         } else {
@@ -685,5 +691,48 @@ mod tests {
         // Now the valid run is exhausted, next call should parse the null run and return None
         let result = decoder.try_consume_all_valid(5).unwrap();
         assert_eq!(result, None);
+    }
+}
+
+#[cfg(test)]
+mod invalid_input_tests {
+    use super::*;
+
+    /// A bit-packed run that declares more groups than the data holds gives
+    /// the levels that exist. Before, the read and the skip went past the end
+    /// of the data and panicked.
+    #[test]
+    fn packed_run_longer_than_data() {
+        // Run header: 4 groups of 8 levels. One byte of levels follows.
+        let data = Bytes::from(vec![(4 << 1) | 1, 0b0101_0101]);
+
+        let mut decoder = PackedDecoder::new();
+        decoder.set_data(Encoding::RLE, data.clone());
+        let mut buffer = BooleanBufferBuilder::new(0);
+        assert_eq!(decoder.read(&mut buffer, 32).unwrap(), 8);
+        assert_eq!(buffer.len(), 8);
+        assert_eq!(buffer.as_slice(), &[0b0101_0101]);
+
+        let mut decoder = PackedDecoder::new();
+        decoder.set_data(Encoding::RLE, data);
+        assert_eq!(decoder.skip(32).unwrap(), (4, 8));
+    }
+
+    /// A run header without data, and a header whose group count overflows a
+    /// bit count, give no levels.
+    #[test]
+    fn packed_run_without_data() {
+        let mut too_many_groups = vec![0xFF; 9];
+        too_many_groups.push(0x01);
+        for header in [vec![(4 << 1) | 1], too_many_groups] {
+            let mut decoder = PackedDecoder::new();
+            decoder.set_data(Encoding::RLE, Bytes::from(header.clone()));
+            let mut buffer = BooleanBufferBuilder::new(0);
+            assert_eq!(decoder.read(&mut buffer, 32).unwrap(), 0);
+
+            let mut decoder = PackedDecoder::new();
+            decoder.set_data(Encoding::RLE, Bytes::from(header));
+            assert_eq!(decoder.skip(32).unwrap(), (0, 0));
+        }
     }
 }

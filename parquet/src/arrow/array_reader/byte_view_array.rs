@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -453,8 +455,13 @@ impl ByteViewArrayDecoderPlain {
             }
             let len_bytes: [u8; 4] = buf[self.offset..self.offset + 4].try_into().unwrap();
             let len = u32::from_le_bytes(len_bytes) as usize;
+            let end_offset = self.offset + 4 + len;
+            // Keep `offset` inside the buffer: `read` slices from it unchecked.
+            if end_offset > buf.len() {
+                return Err(ParquetError::EOF("eof decoding byte array".into()));
+            }
             skip += 1;
-            self.offset = self.offset + 4 + len;
+            self.offset = end_offset;
         }
         self.max_remaining_values -= skip;
         Ok(skip)
@@ -844,5 +851,32 @@ mod tests {
 
         decoder.read(&mut view_buffer, 1).unwrap();
         assert_eq!(view_buffer.buffers.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod invalid_input_tests {
+    use super::*;
+    use crate::arrow::buffer::view_buffer::ViewBuffer;
+
+    /// A skip must not move the offset past the buffer: the read slices the
+    /// buffer from that offset without a bounds check.
+    #[test]
+    fn plain_skip_past_end_fails() {
+        // One value of length 100 in a buffer that holds one byte of it.
+        let mut data = 100u32.to_le_bytes().to_vec();
+        data.push(b'a');
+
+        for validate_utf8 in [false, true] {
+            let mut decoder =
+                ByteViewArrayDecoderPlain::new(Bytes::from(data.clone()), 2, None, validate_utf8);
+            let err = decoder.skip(1).unwrap_err();
+            assert_eq!(err.to_string(), "EOF: eof decoding byte array");
+
+            let mut output = ViewBuffer::default();
+            assert_eq!(decoder.read(&mut output, 0).unwrap(), 0);
+            let err = decoder.read(&mut output, 1).unwrap_err();
+            assert_eq!(err.to_string(), "EOF: eof decoding byte array");
+        }
     }
 }

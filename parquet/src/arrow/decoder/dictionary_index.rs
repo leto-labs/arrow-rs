@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -18,7 +20,7 @@
 use bytes::Bytes;
 
 use crate::encodings::rle::RleDecoder;
-use crate::errors::Result;
+use crate::errors::{ParquetError, Result};
 
 /// Decoder for `Encoding::RLE_DICTIONARY` indices
 pub struct DictIndexDecoder {
@@ -39,12 +41,24 @@ pub struct DictIndexDecoder {
     max_remaining_values: usize,
 }
 
+/// Read the bit width, which is the first byte of a dictionary-encoded data
+/// page. The indices decode to `i32`, so a larger width is invalid.
+pub(crate) fn dictionary_index_bit_width(data: &[u8]) -> Result<u8> {
+    match data.first() {
+        None => Err(eof_err!("Not enough bytes to decode bit_width")),
+        Some(&bit_width) if bit_width > 32 => Err(general_err!(
+            "Invalid or corrupted RLE bit width {}. Max allowed is 32",
+            bit_width
+        )),
+        Some(&bit_width) => Ok(bit_width),
+    }
+}
+
 impl DictIndexDecoder {
     /// Create a new [`DictIndexDecoder`] with the provided data page, the number of levels
     /// associated with this data page, and the number of non-null values (if known)
     pub fn new(data: Bytes, num_levels: usize, num_values: Option<usize>) -> Result<Self> {
-        let bit_width = data[0];
-        let mut decoder = RleDecoder::new(bit_width);
+        let mut decoder = RleDecoder::new(dictionary_index_bit_width(&data)?);
         decoder.set_data(data.slice(1..))?;
 
         Ok(Self {
@@ -117,5 +131,37 @@ impl DictIndexDecoder {
             }
         }
         Ok(values_skip)
+    }
+}
+
+#[cfg(test)]
+mod invalid_input_tests {
+    use super::*;
+
+    /// The first byte of the page data is the index bit width.
+    #[test]
+    fn index_bit_width_is_checked() {
+        let err = DictIndexDecoder::new(Bytes::new(), 4, None).err().unwrap();
+        assert_eq!(err.to_string(), "EOF: Not enough bytes to decode bit_width");
+
+        let err = DictIndexDecoder::new(Bytes::from(vec![33, 0]), 4, None)
+            .err()
+            .unwrap();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: Invalid or corrupted RLE bit width 33. Max allowed is 32"
+        );
+
+        // Width 32, then an RLE run of two indices with the value 7.
+        let data = Bytes::from(vec![32, 2 << 1, 7, 0, 0, 0]);
+        let mut decoder = DictIndexDecoder::new(data, 2, None).unwrap();
+        let mut indices = Vec::new();
+        let read = decoder
+            .read(2, |keys| {
+                indices.extend_from_slice(keys);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!((read, indices), (2, vec![7, 7]));
     }
 }

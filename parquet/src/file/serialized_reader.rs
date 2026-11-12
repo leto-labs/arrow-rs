@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -415,10 +417,12 @@ pub(crate) fn decode_page(
     let mut can_decompress = true;
 
     if let Some(ref header_v2) = page_header.data_page_header_v2 {
+        // Sum in 64 bits: two valid 32-bit lengths can exceed `i32::MAX`.
+        let levels_byte_length = header_v2.definition_levels_byte_length as i64
+            + header_v2.repetition_levels_byte_length as i64;
         if header_v2.definition_levels_byte_length < 0
             || header_v2.repetition_levels_byte_length < 0
-            || header_v2.definition_levels_byte_length + header_v2.repetition_levels_byte_length
-                > page_header.uncompressed_page_size
+            || levels_byte_length > page_header.uncompressed_page_size as i64
         {
             return Err(general_err!(
                 "DataPage v2 header contains implausible values \
@@ -430,9 +434,7 @@ pub(crate) fn decode_page(
                 page_header.uncompressed_page_size
             ));
         }
-        offset = usize::try_from(
-            header_v2.definition_levels_byte_length + header_v2.repetition_levels_byte_length,
-        )?;
+        offset = usize::try_from(levels_byte_length)?;
         // When is_compressed flag is missing the page is considered compressed
         can_decompress = header_v2.is_compressed.unwrap_or(true);
     }
@@ -465,6 +467,16 @@ pub(crate) fn decode_page(
         }
         _ => buffer,
     };
+
+    // The header sizes are not trusted. Without a decompressor the buffer has
+    // the compressed size, so the levels can still be longer than the page.
+    if offset > buffer.len() {
+        return Err(general_err!(
+            "DataPage v2 levels need {} bytes, but the page has {} bytes",
+            offset,
+            buffer.len()
+        ));
+    }
 
     let result = match page_header.r#type {
         PageType::DICTIONARY_PAGE => {
@@ -890,6 +902,18 @@ impl<R: ChunkReader> Iterator for SerializedPageReader<R> {
     }
 }
 
+/// Metadata of a peeked page header.
+///
+/// Returns `None` for a page type that the reader skips (for example
+/// INDEX_PAGE), and an error for a data page whose header is invalid.
+fn peeked_page_metadata(header: &PageHeader) -> Result<Option<PageMetadata>> {
+    match PageMetadata::try_from(header) {
+        Ok(page_meta) => Ok(Some(page_meta)),
+        Err(e) if matches!(header.r#type, PageType::DATA_PAGE | PageType::DATA_PAGE_V2) => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
 fn verify_page_header_len(header_len: usize, remaining_bytes: u64) -> Result<()> {
     if header_len as u64 > remaining_bytes {
         return Err(eof_err!("Invalid page header"));
@@ -1032,7 +1056,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                         return Ok(None);
                     }
                     return if let Some(header) = next_page_header.as_ref() {
-                        if let Ok(page_meta) = (&**header).try_into() {
+                        if let Some(page_meta) = peeked_page_metadata(header)? {
                             Ok(Some(page_meta))
                         } else {
                             // For unknown page type (e.g., INDEX_PAGE), skip and read next.
@@ -1050,7 +1074,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                         verify_page_header_len(header_len, *remaining_bytes)?;
                         *offset += header_len as u64;
                         *remaining_bytes -= header_len as u64;
-                        let page_meta = if let Ok(page_meta) = (&header).try_into() {
+                        let page_meta = if let Some(page_meta) = peeked_page_metadata(&header)? {
                             Ok(Some(page_meta))
                         } else {
                             // For unknown page type (e.g., INDEX_PAGE), skip and read next.
@@ -2870,5 +2894,77 @@ mod tests {
             num_rows += 1;
         }
         assert_eq!(num_rows, reader.metadata().file_metadata().num_rows());
+    }
+}
+
+#[cfg(test)]
+mod invalid_input_tests {
+    use super::*;
+    use crate::basic::Encoding;
+    use crate::file::metadata::thrift::DataPageHeaderV2;
+
+    fn v2_header(
+        uncompressed_page_size: i32,
+        definition_levels_byte_length: i32,
+        repetition_levels_byte_length: i32,
+    ) -> PageHeader {
+        PageHeader {
+            r#type: PageType::DATA_PAGE_V2,
+            uncompressed_page_size,
+            compressed_page_size: 10,
+            crc: None,
+            data_page_header: None,
+            index_page_header: None,
+            dictionary_page_header: None,
+            data_page_header_v2: Some(DataPageHeaderV2 {
+                num_values: 4,
+                num_nulls: 0,
+                num_rows: 4,
+                encoding: Encoding::PLAIN,
+                definition_levels_byte_length,
+                repetition_levels_byte_length,
+                is_compressed: Some(false),
+                statistics: None,
+            }),
+        }
+    }
+
+    /// The sum of two valid 32-bit level lengths can exceed `i32::MAX`.
+    #[test]
+    fn v2_level_lengths_sum_does_not_overflow() {
+        let header = v2_header(i32::MAX, i32::MAX, i32::MAX);
+        let err = decode_page(header, Bytes::from(vec![0; 10]), Type::INT32, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("DataPage v2 header contains implausible values"),
+            "{err}"
+        );
+    }
+
+    /// An uncompressed page has the compressed size, so the uncompressed size
+    /// in the header does not bound the levels.
+    #[test]
+    fn v2_levels_longer_than_uncompressed_page_fails() {
+        let header = v2_header(100, 8, 8);
+        let err = decode_page(header, Bytes::from(vec![0; 10]), Type::INT32, None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: DataPage v2 levels need 16 bytes, but the page has 10 bytes"
+        );
+    }
+
+    #[test]
+    fn peeked_data_page_without_its_header_fails() {
+        let mut header = v2_header(10, 0, 0);
+        header.data_page_header_v2 = None;
+        let err = peeked_page_metadata(&header).err().unwrap();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: Missing V2 data page header"
+        );
+
+        // A page type that the reader skips is not an error.
+        header.r#type = PageType::INDEX_PAGE;
+        assert!(peeked_page_metadata(&header).unwrap().is_none());
     }
 }

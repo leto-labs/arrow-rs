@@ -22,3 +22,4 @@ mod dictionary_index;
 
 pub use delta_byte_array::DeltaByteArrayDecoder;
 pub use dictionary_index::DictIndexDecoder;
+pub(crate) use dictionary_index::dictionary_index_bit_width;

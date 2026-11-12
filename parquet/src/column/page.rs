@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -354,6 +356,11 @@ pub struct PageMetadata {
     pub is_dict: bool,
 }
 
+/// A page header count as `usize`; a negative count is invalid.
+fn page_count(count: i32, name: &str) -> Result<usize> {
+    usize::try_from(count).map_err(|_| general_err!("Invalid page header: negative {}", name))
+}
+
 impl TryFrom<&crate::file::metadata::thrift::PageHeader> for PageMetadata {
     type Error = ParquetError;
 
@@ -362,10 +369,13 @@ impl TryFrom<&crate::file::metadata::thrift::PageHeader> for PageMetadata {
     ) -> std::result::Result<Self, Self::Error> {
         match value.r#type {
             PageType::DATA_PAGE => {
-                let header = value.data_page_header.as_ref().unwrap();
+                let header = value
+                    .data_page_header
+                    .as_ref()
+                    .ok_or_else(|| general_err!("Missing V1 data page header"))?;
                 Ok(PageMetadata {
                     num_rows: None,
-                    num_levels: Some(header.num_values as _),
+                    num_levels: Some(page_count(header.num_values, "num_values")?),
                     is_dict: false,
                 })
             }
@@ -375,10 +385,13 @@ impl TryFrom<&crate::file::metadata::thrift::PageHeader> for PageMetadata {
                 is_dict: true,
             }),
             PageType::DATA_PAGE_V2 => {
-                let header = value.data_page_header_v2.as_ref().unwrap();
+                let header = value
+                    .data_page_header_v2
+                    .as_ref()
+                    .ok_or_else(|| general_err!("Missing V2 data page header"))?;
                 Ok(PageMetadata {
-                    num_rows: Some(header.num_rows as _),
-                    num_levels: Some(header.num_values as _),
+                    num_rows: Some(page_count(header.num_rows, "num_rows")?),
+                    num_levels: Some(page_count(header.num_values, "num_values")?),
                     is_dict: false,
                 })
             }
@@ -595,5 +608,76 @@ mod tests {
 
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("Page uncompressed size overflow"));
+    }
+}
+
+#[cfg(test)]
+mod invalid_input_tests {
+    use super::*;
+    use crate::file::metadata::thrift::{DataPageHeader, DataPageHeaderV2, PageHeader};
+
+    fn header(page_type: PageType) -> PageHeader {
+        PageHeader {
+            r#type: page_type,
+            uncompressed_page_size: 10,
+            compressed_page_size: 10,
+            crc: None,
+            data_page_header: None,
+            index_page_header: None,
+            dictionary_page_header: None,
+            data_page_header_v2: None,
+        }
+    }
+
+    /// The page type and the header that is present can disagree.
+    #[test]
+    fn data_page_type_without_its_header_fails() {
+        for (page_type, message) in [
+            (
+                PageType::DATA_PAGE,
+                "Parquet error: Missing V1 data page header",
+            ),
+            (
+                PageType::DATA_PAGE_V2,
+                "Parquet error: Missing V2 data page header",
+            ),
+        ] {
+            let err = PageMetadata::try_from(&header(page_type)).err().unwrap();
+            assert_eq!(err.to_string(), message);
+        }
+    }
+
+    #[test]
+    fn negative_page_counts_fail() {
+        let mut v1 = header(PageType::DATA_PAGE);
+        v1.data_page_header = Some(DataPageHeader {
+            num_values: -1,
+            encoding: Encoding::PLAIN,
+            definition_level_encoding: Encoding::RLE,
+            repetition_level_encoding: Encoding::RLE,
+            statistics: None,
+        });
+        let err = PageMetadata::try_from(&v1).err().unwrap();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: Invalid page header: negative num_values"
+        );
+
+        let mut v2 = header(PageType::DATA_PAGE_V2);
+        v2.data_page_header_v2 = Some(DataPageHeaderV2 {
+            num_values: 4,
+            num_nulls: 0,
+            num_rows: -4,
+            encoding: Encoding::PLAIN,
+            definition_levels_byte_length: 0,
+            repetition_levels_byte_length: 0,
+            is_compressed: None,
+            statistics: None,
+        });
+        let err = PageMetadata::try_from(&v2).err().unwrap();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: Invalid page header: negative num_rows"
+        );
     }
 }

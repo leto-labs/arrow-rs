@@ -233,7 +233,7 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
         let decoder = if encoding == Encoding::RLE_DICTIONARY {
             self.decoders[encoding as usize]
                 .as_mut()
-                .expect("Decoder for dict should have been set")
+                .ok_or_else(|| general_err!("missing dictionary page for column"))?
         } else {
             let slot = encoding as usize;
             if self.decoders[slot].is_none() {
@@ -322,7 +322,7 @@ impl LevelDecoder {
             }
             #[allow(deprecated)]
             Encoding::BIT_PACKED => Ok(Self::Packed(BitReader::new(data), bit_width)),
-            _ => unreachable!("invalid level encoding: {}", encoding),
+            _ => Err(general_err!("invalid level encoding: {}", encoding)),
         }
     }
 

@@ -709,7 +709,11 @@ where
                 *b = 0;
             }
             remaining = remaining.saturating_sub(self.values_per_mini_block);
-            offset += *b as usize * self.values_per_mini_block / 8;
+            // `values_per_mini_block` comes from the page and can be any size.
+            offset = (*b as usize)
+                .checked_mul(self.values_per_mini_block)
+                .and_then(|bits| offset.checked_add(bits / 8))
+                .ok_or_else(|| general_err!("mini block size overflows"))?;
         }
         self.block_end_offset = offset;
 
@@ -832,6 +836,10 @@ where
 
         let mut read = 0;
         let to_read = buffer.len().min(self.values_left);
+        if to_read == 0 {
+            // A header can declare zero values and still carry a first value.
+            return Ok(0);
+        }
 
         if let Some(value) = self.first_value.take() {
             self.last_value = value;
@@ -1062,6 +1070,15 @@ impl<T: DataType> DeltaLengthByteArrayDecoder<T> {
     }
 }
 
+/// The data after a length block. The block end offset is computed from the
+/// declared mini block widths, so it can be past the end of a corrupt page.
+fn slice_from(data: &Bytes, offset: usize) -> Result<Bytes> {
+    if offset > data.len() {
+        return Err(eof_err!("Not enough data after the encoded lengths"));
+    }
+    Ok(data.slice(offset..))
+}
+
 impl<T: DataType> Decoder<T> for DeltaLengthByteArrayDecoder<T> {
     fn set_data(&mut self, data: Bytes, num_values: usize) -> Result<()> {
         match T::get_physical_type() {
@@ -1072,7 +1089,7 @@ impl<T: DataType> Decoder<T> for DeltaLengthByteArrayDecoder<T> {
                 self.lengths.resize(num_lengths, 0);
                 len_decoder.get(&mut self.lengths[..])?;
 
-                self.data = Some(data.slice(len_decoder.get_offset()..));
+                self.data = Some(slice_from(&data, len_decoder.get_offset())?);
                 self.offset = 0;
                 self.current_idx = 0;
                 self.num_values = num_lengths;
@@ -1204,8 +1221,10 @@ impl<T: DataType> Decoder<T> for DeltaByteArrayDecoder<T> {
                 prefix_len_decoder.get(&mut self.prefix_lengths[..])?;
 
                 let mut suffix_decoder = DeltaLengthByteArrayDecoder::new();
-                suffix_decoder
-                    .set_data(data.slice(prefix_len_decoder.get_offset()..), num_values)?;
+                suffix_decoder.set_data(
+                    slice_from(&data, prefix_len_decoder.get_offset())?,
+                    num_values,
+                )?;
                 self.suffix_decoder = Some(suffix_decoder);
                 self.num_values = num_prefixes;
                 self.current_idx = 0;
@@ -2668,6 +2687,67 @@ mod tests {
                 .contains("Invalid delta bit width 33 which is larger than expected 32"),
             "{}",
             err
+        );
+    }
+}
+
+#[cfg(test)]
+mod invalid_input_tests {
+    use super::*;
+
+    /// A DELTA_BINARY_PACKED header: block size 128, four mini blocks, the
+    /// value count, and the first value 0.
+    fn delta_header(num_values: u8) -> Vec<u8> {
+        vec![0x80, 0x01, 4, num_values, 0]
+    }
+
+    /// The header always holds a first value, also when it declares no
+    /// values. A read must then give nothing; before, the count underflowed.
+    #[test]
+    fn delta_bit_pack_without_values_reads_nothing() {
+        let mut decoder = DeltaBitPackDecoder::<Int32Type>::new();
+        decoder.set_data(Bytes::from(delta_header(0)), 0).unwrap();
+        let mut out = [0; 4];
+        assert_eq!(decoder.get(&mut out).unwrap(), 0);
+        assert_eq!(decoder.skip(4).unwrap(), 0);
+    }
+
+    /// The block size is not bounded, so the end offset of a block can
+    /// overflow.
+    #[test]
+    fn delta_bit_pack_block_size_overflow_fails() {
+        // Block size 2^62 in one mini block, two values, first value 0.
+        let mut data = vec![0x80; 8];
+        data.extend_from_slice(&[0x40, 1, 2, 0]);
+        // Block: minimum delta 0, bit width 32.
+        data.extend_from_slice(&[0, 32]);
+        let mut decoder = DeltaBitPackDecoder::<Int32Type>::new();
+        decoder.set_data(Bytes::from(data), 0).unwrap();
+        let mut out = [0; 2];
+        let err = decoder.get(&mut out).unwrap_err();
+        assert_eq!(err.to_string(), "Parquet error: mini block size overflows");
+    }
+
+    /// The end of a length block is computed from the declared mini block
+    /// widths. It can be after the end of the page.
+    #[test]
+    fn delta_lengths_block_end_past_data_fails() {
+        // Two lengths. The mini block declares 32 values of 8 bits and holds one.
+        let mut data = delta_header(2);
+        data.extend_from_slice(&[0, 8, 0, 0, 0, 5]);
+
+        let mut decoder = DeltaLengthByteArrayDecoder::<ByteArrayType>::new();
+        let err = decoder.set_data(Bytes::from(data.clone()), 2).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "EOF: Not enough data after the encoded lengths"
+        );
+
+        let mut decoder = DeltaByteArrayDecoder::<ByteArrayType>::new();
+        let err = decoder.set_data(Bytes::from(data), 2).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "EOF: Not enough data after the encoded lengths"
         );
     }
 }

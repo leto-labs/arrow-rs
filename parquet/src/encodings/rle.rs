@@ -738,10 +738,13 @@ impl RleDecoder {
             if indicator_value == 0 {
                 return Ok(false);
             }
+            // A run header is an unsigned varint. The counters keep its low 32
+            // bits, so compute them without signed overflow.
+            let run_length = (indicator_value as u64) >> 1;
             if indicator_value & 1 == 1 {
-                self.bit_packed_left = ((indicator_value >> 1) * BIT_PACK_GROUP_SIZE as i64) as u32;
+                self.bit_packed_left = run_length.wrapping_mul(BIT_PACK_GROUP_SIZE as u64) as u32;
             } else {
-                self.rle_left = (indicator_value >> 1) as u32;
+                self.rle_left = run_length as u32;
                 let value_width = bit_util::ceil(self.bit_width as usize, u8::BITS as usize);
                 self.current_value = bit_reader.get_aligned::<u64>(value_width);
                 self.current_value.ok_or_else(|| {
@@ -1569,5 +1572,44 @@ mod tests {
             assert!(bit_width < 64);
             test_round_trip(&values[..], bit_width);
         }
+    }
+}
+
+#[cfg(test)]
+mod invalid_input_tests {
+    use super::*;
+
+    fn vlq(mut value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        while value >= 0x80 {
+            out.push(value as u8 | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+        out
+    }
+
+    /// A run header can declare any length. The decoder keeps the low 32 bits
+    /// of the value count; computing them must not overflow.
+    #[test]
+    fn run_length_larger_than_the_counters() {
+        // Bit-packed run of 2^61 groups: the value count is 2^64.
+        let mut decoder = RleDecoder::new(1);
+        decoder.set_data(Bytes::from(vlq((1 << 62) | 1))).unwrap();
+        let mut out = [0i32; 8];
+        assert_eq!(decoder.get_batch(&mut out).unwrap(), 0);
+
+        // RLE run of 2^32 + 2 values of 1: the counter keeps 2.
+        let mut data = vlq(((1 << 32) + 2) << 1);
+        data.push(1);
+        let mut decoder = RleDecoder::new(1);
+        decoder.set_data(Bytes::from(data)).unwrap();
+        assert_eq!(decoder.get_batch(&mut out).unwrap(), 2);
+        assert_eq!(&out[..2], &[1, 1]);
+
+        // A header with the top bit set.
+        let mut decoder = RleDecoder::new(1);
+        decoder.set_data(Bytes::from(vlq(u64::MAX))).unwrap();
+        assert_eq!(decoder.skip(8).unwrap(), 0);
     }
 }

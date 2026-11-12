@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -497,6 +499,18 @@ pub(crate) trait ThriftCompactInputProtocol<'a> {
         }
     }
 
+    /// Skip one list, set or map element.
+    ///
+    /// A boolean struct field has no data, but a boolean collection element
+    /// is one byte. Every element therefore consumes input, so a corrupt
+    /// element count ends with an EOF error instead of a long empty loop.
+    fn skip_element(&mut self, element_type: FieldType, depth: i8) -> ThriftProtocolResult<()> {
+        match element_type {
+            FieldType::BooleanFalse | FieldType::BooleanTrue => self.skip_bytes(1),
+            _ => self.skip_till_depth(element_type, depth),
+        }
+    }
+
     /// Skip a field with type `field_type` recursively up to `depth` levels.
     fn skip_till_depth(&mut self, field_type: FieldType, depth: i8) -> ThriftProtocolResult<()> {
         if depth == 0 {
@@ -530,7 +544,7 @@ pub(crate) trait ThriftCompactInputProtocol<'a> {
                 let list_ident = self.read_list_begin()?;
                 let element_type = FieldType::from(list_ident.element_type);
                 for _ in 0..list_ident.size {
-                    self.skip_till_depth(element_type, depth - 1)?;
+                    self.skip_element(element_type, depth - 1)?;
                 }
                 Ok(())
             }
@@ -542,8 +556,8 @@ pub(crate) trait ThriftCompactInputProtocol<'a> {
                     let key_type = FieldType::from(ElementType::try_from(kv >> 4)?);
                     let val_type = FieldType::from(ElementType::try_from(kv & 0xf)?);
                     for _ in 0..size {
-                        self.skip_till_depth(key_type, depth - 1)?;
-                        self.skip_till_depth(val_type, depth - 1)?;
+                        self.skip_element(key_type, depth - 1)?;
+                        self.skip_element(val_type, depth - 1)?;
                     }
                 }
                 Ok(())
@@ -638,18 +652,31 @@ impl<'a, R: Read> ThriftCompactInputProtocol<'a> for ThriftReadInputProtocol<R> 
         unimplemented!()
     }
 
+    // Out of line: a page header without statistics has no binary field, and
+    // inlining this function changed how the compiler inlines that parser
+    // (3% more instructions for files with many small pages).
+    #[inline(never)]
     fn read_bytes_owned(&mut self) -> ThriftProtocolResult<Vec<u8>> {
         let len = self.read_vlq()? as usize;
-        let mut v = Vec::with_capacity(len);
-        std::io::copy(&mut self.reader.by_ref().take(len as u64), &mut v)?;
+        // The length is not trusted: reserve a bounded amount, grow with the
+        // bytes that exist, and fail if the input ends first.
+        let mut v = Vec::with_capacity(len.min(1024));
+        let copied = std::io::copy(&mut self.reader.by_ref().take(len as u64), &mut v)?;
+        if copied != len as u64 {
+            return Err(ThriftProtocolError::Eof);
+        }
         Ok(v)
     }
 
     fn skip_bytes(&mut self, n: usize) -> ThriftProtocolResult<()> {
-        std::io::copy(
+        let skipped = std::io::copy(
             &mut self.reader.by_ref().take(n as u64),
             &mut std::io::sink(),
         )?;
+        // `copy` stops at the end of the input without an error.
+        if skipped != n as u64 {
+            return Err(ThriftProtocolError::Eof);
+        }
         Ok(())
     }
 
@@ -1264,5 +1291,81 @@ pub(crate) mod tests {
             err.contains("Thrift list size 109002364 exceeds remaining input length 2"),
             "{err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod invalid_input_tests {
+    use super::*;
+
+    /// A collection that declares more elements than the input holds ends
+    /// with an EOF error. Before, a skipped double or UUID at the end of a
+    /// `Read` input consumed nothing, so the loop ran once for each declared
+    /// element.
+    #[test]
+    fn skip_collection_past_end_fails() {
+        // `i32::MAX` as a varint.
+        let max: [u8; 5] = [0xFF, 0xFF, 0xFF, 0xFF, 0x07];
+        let with_count = |prefix: &[u8], suffix: &[u8]| [prefix, &max, suffix].concat();
+        let cases = [
+            // Map: element count, then the key and value types (double).
+            (FieldType::Map, with_count(&[], &[0x77])),
+            // List and set: the count follows (0xF) the element type, which
+            // is double (7), UUID (13) or boolean (2).
+            (FieldType::List, with_count(&[0xF7], &[])),
+            (FieldType::List, with_count(&[0xFD], &[])),
+            (FieldType::Set, with_count(&[0xF2], &[])),
+        ];
+        for (field_type, data) in cases {
+            let mut read = ThriftReadInputProtocol::new(data.as_slice());
+            assert!(matches!(
+                read.skip(field_type),
+                Err(ThriftProtocolError::Eof)
+            ));
+            let mut slice = ThriftSliceInputProtocol::new(&data);
+            assert!(matches!(
+                slice.skip(field_type),
+                Err(ThriftProtocolError::Eof)
+            ));
+        }
+    }
+
+    /// A boolean collection element is one byte, so the skip ends at the
+    /// byte after the list.
+    #[test]
+    fn skip_boolean_list_consumes_elements() {
+        // Three booleans, then one marker byte.
+        let data: [u8; 5] = [0x32, 1, 2, 1, 0x5A];
+        let mut read = ThriftReadInputProtocol::new(&data[..]);
+        read.skip(FieldType::List).unwrap();
+        assert_eq!(read.read_byte().unwrap(), 0x5A);
+        let mut slice = ThriftSliceInputProtocol::new(&data);
+        slice.skip(FieldType::List).unwrap();
+        assert_eq!(slice.read_byte().unwrap(), 0x5A);
+    }
+
+    /// A binary length is not trusted. A length past the end of the input is
+    /// an EOF error, and no memory is reserved for it.
+    #[test]
+    fn binary_past_end_fails() {
+        // Length 2^40, then three bytes.
+        let data: [u8; 9] = [0x80, 0x80, 0x80, 0x80, 0x80, 0x20, b'a', b'b', b'c'];
+        let mut read = ThriftReadInputProtocol::new(&data[..]);
+        assert!(matches!(
+            read.read_bytes_owned(),
+            Err(ThriftProtocolError::Eof)
+        ));
+        let mut read = ThriftReadInputProtocol::new(&data[..]);
+        assert!(matches!(
+            read.skip(FieldType::Binary),
+            Err(ThriftProtocolError::Eof)
+        ));
+
+        let data: [u8; 4] = [3, b'a', b'b', b'c'];
+        let mut read = ThriftReadInputProtocol::new(&data[..]);
+        assert_eq!(read.read_bytes_owned().unwrap(), b"abc");
+        let mut read = ThriftReadInputProtocol::new(&data[..]);
+        read.skip(FieldType::Binary).unwrap();
+        assert!(matches!(read.read_byte(), Err(ThriftProtocolError::IO(_))));
     }
 }
