@@ -100,3 +100,22 @@ A file can declare the same large count in its footer, its page header and
 its encoded block. Such a file is consistent, and the reader allocates for
 its count: a length block of 2^31 - 1 lengths needs 8 GiB. PAB does not limit
 that.
+
+## PCV: page checksum verification
+
+PCV is a KEEP patch family for PARQUET-INVALID-INPUT. The `crc` feature is in
+the default features, so the reader verifies the CRC-32 of each page that
+carries one, before the page is decompressed or decoded. A mismatch gives
+`Page CRC checksum mismatch`, with the page type, the page length and both
+checksums. A page without a checksum is read as before. A page that a row
+selection skips is not read and not verified.
+
+The feature also enables `crc32fast/std`, which selects the carry-less
+multiplication kernel at run time. Without it, a build that does not target
+that CPU feature used the table kernel: verification then took 4.8% of the
+decode time of TPC-H SF1 `lineitem` with checksums. With it, verification
+adds 0.2% to the instructions and no measurable time (Longbow report
+`docs/research/parquet-decode-bounds-20261113.md`).
+
+The regression files are in `parquet/tests/crafted_files/checksums/`;
+`parquet/tests/arrow_reader/checksum.rs` reads them.

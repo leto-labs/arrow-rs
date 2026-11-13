@@ -102,7 +102,7 @@ sysinfo = { version = "0.39.6", default-features = false, features = ["system"] 
 all-features = true
 
 [features]
-default = ["arrow", "snap", "brotli", "flate2-zlib-rs", "lz4", "zstd", "base64", "simdutf8"]
+default = ["arrow", "snap", "brotli", "flate2-zlib-rs", "lz4", "zstd", "base64", "simdutf8", "crc"]
 # Enable lz4
 lz4 = ["lz4_flex"]
 # Enable arrow reader/writer APIs
@@ -125,8 +125,10 @@ async = ["futures", "tokio"]
 object_store = ["dep:object_store", "async"]
 # Group Zstd dependencies
 zstd = ["dep:zstd"]
-# Verify 32-bit CRC checksum when decoding parquet pages
-crc = ["dep:crc32fast"]
+# Verify 32-bit CRC checksum when decoding parquet pages. `crc32fast/std`
+# selects the carry-less multiplication kernel at run time; without it a build
+# that does not target that CPU feature uses the table kernel.
+crc = ["dep:crc32fast", "crc32fast/std"]
 # Enable SIMD UTF-8 validation
 simdutf8 = ["dep:simdutf8"]
 # Enable Parquet modular encryption support

@@ -2,8 +2,8 @@
 
 Small files that a script writes byte by byte. A Parquet writer does not
 produce them: each invalid file has one page header field or one encoded count
-that its page contradicts. The Longbow patch family PAB (allocation bounds)
-uses them as regression files.
+that its page contradicts. The Longbow patch families PAB (allocation bounds)
+and PCV (page checksum verification) use them as regression files.
 
 ## Scripts
 
@@ -13,12 +13,13 @@ write the same bytes each time:
 ```sh
 cd parquet/tests/crafted_files
 python3 make_allocation_bounds_files.py   # allocation_bounds/, type_length/
+python3 make_checksum_files.py            # checksums/
 ```
 
 `parquet_file.py` encodes the Thrift compact protocol, the page headers, the
 value encodings and the footer. Every file has one row group. The files of
-`allocation_bounds/` have four rows and a valid first column `e` (`INT64`,
-required, PLAIN, the values 0 to 3).
+`allocation_bounds/` and `checksums/` have four rows and a valid first column
+`e` (`INT64`, required, PLAIN, the values 0 to 3).
 
 ## `allocation_bounds/`: a count that the page cannot hold
 
@@ -57,3 +58,19 @@ reserved the type length for each row of a batch before it read a page (2 TiB
 for a batch of 1024 rows), and the failed allocation ended the process. With
 PAB the capacity hint is dropped when it cannot be allocated, and the slots of
 the NULL values are an error when the host cannot provide them.
+
+## `checksums/`: a page that differs from its checksum
+
+Read by `tests/arrow_reader/checksum.rs`. The columns are `e`, `v` (strings,
+one dictionary page and one data page) and `s` (`INT64`, Snappy). The checksum
+of a page is the CRC-32 of the page as stored; for column `s`, of the
+compressed bytes.
+
+| File | Content | Without verification |
+|---|---|---|
+| `valid_with_checksums` | A correct checksum in each of the four page headers. | |
+| `valid_without_checksums` | The same pages, no checksum. | |
+| `data_page_byte_changed` | Column `e`: the third value is 258; the checksum is of the value 2. | Returns 258. |
+| `dictionary_page_byte_changed` | Column `v`: the first dictionary value is `z`; the checksum is of `x`. | Returns `z` in two rows. |
+| `compressed_page_byte_changed` | Column `s`: the compressed page holds 77 as its last value; the checksum is of 13. | Returns 77. |
+| `checksum_changed` | Column `e`: the page is unchanged; one bit of the checksum is changed. | Returns the correct rows. |
