@@ -126,3 +126,22 @@ adds 0.2% to the instructions and no measurable time (Longbow report
 
 The regression files are in `parquet/tests/crafted_files/checksums/`;
 `parquet/tests/arrow_reader/checksum.rs` reads them.
+
+## PCW: page checksum writing
+
+PCW is an UPSTREAMABLE family for PARQUET-RESULT-INTEGRITY (lane PW1).
+With the `crc` feature, `WriterPropertiesBuilder::set_write_page_checksum`
+enables CRC-32 on every data and dictionary page. It defaults to false so
+Longbow generation retains its previous bytes and file sizes. Longbow result
+writers enable it through their shared properties builder.
+
+Both the serialized page writer and the buffered Arrow page writer hash the
+compressed payload before encryption. They attach the checksum before
+serializing the page header. Header sizes and downstream page offsets include
+the additional field. The existing `crc32fast/std` feature selects the runtime
+hardware kernel. No row value, encoding or compression policy changes.
+
+`file::page_checksum_tests` checks the raw header CRC against each payload,
+DataPage V1/V2, dictionary and plain encodings, supported compression samples,
+property round trips and the checksum-free default. Longbow adds result and
+parallel append corruption tests. PCV verifies these pages on read.

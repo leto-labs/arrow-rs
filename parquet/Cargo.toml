@@ -125,7 +125,7 @@ async = ["futures", "tokio"]
 object_store = ["dep:object_store", "async"]
 # Group Zstd dependencies
 zstd = ["dep:zstd"]
-# Verify 32-bit CRC checksum when decoding parquet pages. `crc32fast/std`
+# Write and verify 32-bit CRC checksums for parquet pages. `crc32fast/std`
 # selects the carry-less multiplication kernel at run time; without it a build
 # that does not target that CPU feature uses the table kernel.
 crc = ["dep:crc32fast", "crc32fast/std"]

@@ -111,3 +111,6 @@ pub mod writer;
 pub const FOOTER_SIZE: usize = 8;
 const PARQUET_MAGIC: [u8; 4] = *b"PAR1";
 const PARQUET_MAGIC_ENCR_FOOTER: [u8; 4] = *b"PARE";
+
+#[cfg(all(test, feature = "crc"))]
+mod page_checksum_tests;

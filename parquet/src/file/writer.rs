@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Modified by Leto Labs: PCW, serialized page checksum writing.
+
 //! [`SerializedFileWriter`]: Low level Parquet writer API
 
 use crate::bloom_filter::Sbbf;
@@ -644,7 +646,8 @@ impl<'a, W: Write + Send> SerializedRowGroupWriter<'a, W> {
                 let props = self.props.clone();
                 let (buf, on_close) = self.get_on_close();
 
-                let page_writer = SerializedPageWriter::new(buf);
+                let page_writer =
+                    SerializedPageWriter::new(buf).with_page_checksum(props.write_page_checksum());
                 let page_writer =
                     Self::set_page_writer_encryptor(&column, encryptor_context, page_writer)?;
 
@@ -1010,6 +1013,7 @@ impl<'a> SerializedColumnWriter<'a> {
 /// `SerializedPageWriter` should not be used after calling `close()`.
 pub struct SerializedPageWriter<'a, W: Write> {
     sink: &'a mut TrackedWrite<W>,
+    write_page_checksum: bool,
     #[cfg(feature = "encryption")]
     page_encryptor: Option<PageEncryptor>,
 }
@@ -1019,9 +1023,16 @@ impl<'a, W: Write> SerializedPageWriter<'a, W> {
     pub fn new(sink: &'a mut TrackedWrite<W>) -> Self {
         Self {
             sink,
+            write_page_checksum: false,
             #[cfg(feature = "encryption")]
             page_encryptor: None,
         }
+    }
+
+    /// Configure checksums for pages written by this writer.
+    pub(crate) fn with_page_checksum(mut self, enabled: bool) -> Self {
+        self.write_page_checksum = enabled;
+        self
     }
 
     /// Serializes page header into Thrift.
@@ -1076,6 +1087,7 @@ impl<'a, W: Write> SerializedPageWriter<'a, W> {
 
 impl<W: Write + Send> PageWriter for SerializedPageWriter<'_, W> {
     fn write_page(&mut self, page: CompressedPage) -> Result<PageWriteSpec> {
+        let crc = page.crc(self.write_page_checksum);
         let page = match self.page_encryptor_mut() {
             Some(page_encryptor) => page_encryptor.encrypt_compressed_page(page)?,
             None => page,
@@ -1084,7 +1096,8 @@ impl<W: Write + Send> PageWriter for SerializedPageWriter<'_, W> {
         let page_type = page.page_type();
         let start_pos = self.sink.bytes_written() as u64;
 
-        let page_header = page.to_thrift_header()?;
+        let mut page_header = page.to_thrift_header()?;
+        page_header.crc = crc;
         let header_size = self.serialize_page_header(page_header)?;
 
         self.sink.write_all(page.data())?;
