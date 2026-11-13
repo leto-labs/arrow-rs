@@ -55,6 +55,13 @@ The regression files are in `parquet/tests/arrow_reader/invalid_files/`, with
 their origin in its `README.md`. Unit tests of the family are in modules named
 `invalid_input_tests`.
 
+Lane PR2 added one location, which files of other writers reach: pyarrow
+writes a dictionary for `FIXED_LEN_BYTE_ARRAY` columns. A dictionary key
+outside the dictionary indexed the dictionary page past its end and panicked.
+It gives `invalid key=N for dictionary`, as the byte array readers do. A
+dictionary-encoded page of such a column without a dictionary page gives
+`missing dictionary page for column`.
+
 ## PAB: Parquet allocation bounds
 
 PAB is an UPSTREAMABLE patch family for PARQUET-INVALID-INPUT. A count, a
