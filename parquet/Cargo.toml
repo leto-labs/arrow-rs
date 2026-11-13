@@ -169,6 +169,11 @@ required-features = ["arrow", "async"]
 path = "./examples/object_store.rs"
 
 [[test]]
+name = "allocation_bounds"
+required-features = ["arrow", "snap", "lz4", "flate2"]
+path = "./tests/allocation_bounds.rs"
+
+[[test]]
 name = "arrow_writer_layout"
 required-features = ["arrow"]
 

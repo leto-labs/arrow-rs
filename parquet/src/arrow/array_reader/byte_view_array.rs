@@ -179,6 +179,17 @@ impl ColumnValueDecoder for ByteViewArrayColumnValueDecoder {
         }
 
         let num_values = num_values as usize;
+        // The count is from the page header and sizes the dictionary. Each
+        // value has a four-byte length, so the page holds at most a quarter
+        // of its bytes in values.
+        if num_values > buf.len() / 4 {
+            return Err(general_err!(
+                "dictionary page declares {} values, but its {} bytes hold at most {}",
+                num_values,
+                buf.len(),
+                buf.len() / 4
+            ));
+        }
         let mut buffer = ViewBuffer::with_capacity(num_values);
         let mut decoder =
             ByteViewArrayDecoderPlain::new(buf, num_values, Some(num_values), self.validate_utf8);
@@ -251,12 +262,20 @@ impl ByteViewArrayDecoder {
                     data, num_levels, num_values,
                 )?)
             }
-            Encoding::DELTA_LENGTH_BYTE_ARRAY => ByteViewArrayDecoder::DeltaLength(
-                ByteViewArrayDecoderDeltaLength::new(data, validate_utf8)?,
-            ),
-            Encoding::DELTA_BYTE_ARRAY => ByteViewArrayDecoder::DeltaByteArray(
-                ByteViewArrayDecoderDelta::new(data, validate_utf8)?,
-            ),
+            Encoding::DELTA_LENGTH_BYTE_ARRAY => {
+                ByteViewArrayDecoder::DeltaLength(ByteViewArrayDecoderDeltaLength::new(
+                    data,
+                    num_values.unwrap_or(num_levels),
+                    validate_utf8,
+                )?)
+            }
+            Encoding::DELTA_BYTE_ARRAY => {
+                ByteViewArrayDecoder::DeltaByteArray(ByteViewArrayDecoderDelta::new(
+                    data,
+                    num_values.unwrap_or(num_levels),
+                    validate_utf8,
+                )?)
+            }
             _ => {
                 return Err(general_err!(
                     "unsupported encoding for byte array: {}",
@@ -359,6 +378,12 @@ impl ByteViewArrayDecoderPlain {
         let mut end_offset = self.offset;
         let mut utf8_validation_begin = end_offset;
 
+        // Each value has a four-byte length. If the remaining bytes cannot
+        // hold `to_read` values, the loop below ends with this error; return
+        // it before the reservation, which is as large as the header declares.
+        if to_read > (buf_len - end_offset) / 4 {
+            return Err(ParquetError::EOF("eof decoding byte array".into()));
+        }
         output.views.reserve(to_read);
 
         // Safety: we reserved enough space in output.views
@@ -585,13 +610,14 @@ pub struct ByteViewArrayDecoderDeltaLength {
 }
 
 impl ByteViewArrayDecoderDeltaLength {
-    fn new(data: Bytes, validate_utf8: bool) -> Result<Self> {
+    /// `max_values` is the value count of the page; a length block that
+    /// declares more lengths is an error.
+    fn new(data: Bytes, max_values: usize, validate_utf8: bool) -> Result<Self> {
         let mut len_decoder = DeltaBitPackDecoder::<Int32Type>::new();
         len_decoder.set_data(data.clone(), 0)?;
-        let values = len_decoder.values_left();
 
-        let mut lengths = vec![0; values];
-        len_decoder.get(&mut lengths)?;
+        let mut lengths = Vec::new();
+        len_decoder.read_lengths(max_values, "DELTA_LENGTH_BYTE_ARRAY", &mut lengths)?;
 
         let mut total_bytes = 0;
 
@@ -676,9 +702,9 @@ pub struct ByteViewArrayDecoderDelta {
 }
 
 impl ByteViewArrayDecoderDelta {
-    fn new(data: Bytes, validate_utf8: bool) -> Result<Self> {
+    fn new(data: Bytes, max_values: usize, validate_utf8: bool) -> Result<Self> {
         Ok(Self {
-            decoder: DeltaByteArrayDecoder::new(data)?,
+            decoder: DeltaByteArrayDecoder::new(data, max_values)?,
             validate_utf8,
         })
     }
@@ -878,5 +904,50 @@ mod invalid_input_tests {
             let err = decoder.read(&mut output, 1).unwrap_err();
             assert_eq!(err.to_string(), "EOF: eof decoding byte array");
         }
+    }
+}
+
+#[cfg(test)]
+mod allocation_bound_tests {
+    use super::*;
+    use crate::arrow::array_reader::test_util::utf8_column;
+    use crate::arrow::buffer::view_buffer::ViewBuffer;
+
+    /// Two PLAIN values: "a" and "bc".
+    fn two_values() -> Bytes {
+        Bytes::from_static(b"\x01\0\0\0a\x02\0\0\0bc")
+    }
+
+    /// The read fails when the page ends before the declared count. The views
+    /// were reserved for the declared count before the first value was read.
+    #[test]
+    fn plain_read_above_the_page_bytes_fails_without_reservation() {
+        for validate_utf8 in [false, true] {
+            let mut decoder =
+                ByteViewArrayDecoderPlain::new(two_values(), 1 << 40, None, validate_utf8);
+            let mut output = ViewBuffer::default();
+            let err = decoder.read(&mut output, usize::MAX).unwrap_err();
+            assert_eq!(err.to_string(), "EOF: eof decoding byte array");
+            assert_eq!(output.views.capacity(), 0);
+
+            // The values that the page holds are still read.
+            assert_eq!(decoder.read(&mut output, 2).unwrap(), 2);
+            assert_eq!(output.views.len(), 2);
+        }
+    }
+
+    #[test]
+    fn dictionary_count_above_the_page_bytes_fails() {
+        let mut decoder = ByteViewArrayColumnValueDecoder::new(&utf8_column());
+        decoder
+            .set_dict(two_values(), 2, Encoding::PLAIN, false)
+            .unwrap();
+        let err = decoder
+            .set_dict(two_values(), i32::MAX as u32, Encoding::PLAIN, false)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: dictionary page declares 2147483647 values, but its 11 bytes hold at most 2"
+        );
     }
 }

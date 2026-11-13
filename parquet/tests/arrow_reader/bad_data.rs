@@ -119,10 +119,13 @@ fn test_arrow_rs_gh_6229_dict_header() {
 #[test]
 #[cfg(feature = "snap")]
 fn test_arrow_rs_gh_6229_dict_levels() {
+    // The data page declares 21 values in a column chunk of one value. The
+    // page header is checked before the levels are read; before, the read
+    // failed later, when the repetition levels ended.
     let err = read_file("ARROW-RS-GH-6229-LEVELS.parquet").unwrap_err();
     assert_eq!(
         err.to_string(),
-        "External: Parquet argument error: Parquet error: Insufficient repetition levels read from column"
+        "External: Parquet argument error: Parquet error: Invalid page header: the page declares 21 values, but its column chunk has 1"
     );
 }
 

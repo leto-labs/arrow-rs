@@ -446,7 +446,10 @@ pub(crate) fn decode_page(
                 return Err(general_err!("Invalid page header"));
             }
             let decompressed_size = uncompressed_page_size - offset;
-            let mut decompressed = Vec::with_capacity(uncompressed_page_size);
+            // The size is from the page header, so nothing is reserved here.
+            // Each codec reserves its output after it has compared the size
+            // with the compressed data, and limits its output to the size.
+            let mut decompressed = Vec::new();
             decompressed.extend_from_slice(&buffer[..offset]);
             // decompressed size of zero corresponds to a page with no non-null values
             // see https://github.com/apache/parquet-format/blob/master/README.md#data-pages
@@ -584,6 +587,10 @@ pub struct SerializedPageReader<R: ChunkReader> {
     /// Column chunk type.
     physical_type: Type,
 
+    /// The value count that the column chunk metadata declares. No data page
+    /// of the chunk can hold more values.
+    num_values: i64,
+
     state: SerializedPageReaderState,
 
     context: SerializedPageReaderContext,
@@ -688,6 +695,7 @@ impl<R: ChunkReader> SerializedPageReader<R> {
             decompressor,
             state,
             physical_type: meta.column_type(),
+            num_values: meta.num_values(),
             context,
         })
     }
@@ -914,6 +922,28 @@ fn peeked_page_metadata(header: &PageHeader) -> Result<Option<PageMetadata>> {
     }
 }
 
+/// Compares the value count of a data page header with the value count of its
+/// column chunk.
+///
+/// The decoders size buffers by the page count (level buffers, the length
+/// blocks of the delta encodings), so a page header that declares more values
+/// than its column chunk is rejected before the page is read.
+fn verify_page_num_values(header: &PageHeader, chunk_num_values: i64) -> Result<()> {
+    let num_values = match header.r#type {
+        PageType::DATA_PAGE => header.data_page_header.as_ref().map(|h| h.num_values),
+        PageType::DATA_PAGE_V2 => header.data_page_header_v2.as_ref().map(|h| h.num_values),
+        _ => None,
+    };
+    match num_values {
+        Some(num_values) if i64::from(num_values) > chunk_num_values => Err(general_err!(
+            "Invalid page header: the page declares {} values, but its column chunk has {}",
+            num_values,
+            chunk_num_values
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn verify_page_header_len(header_len: usize, remaining_bytes: u64) -> Result<()> {
     if header_len as u64 > remaining_bytes {
         return Err(eof_err!("Invalid page header"));
@@ -978,6 +1008,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                     if header.r#type == PageType::INDEX_PAGE {
                         continue;
                     }
+                    verify_page_num_values(&header, self.num_values)?;
 
                     let buffer = self.reader.get_bytes(data_start, data_len)?;
 
@@ -1021,6 +1052,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                         *page_index,
                         is_dictionary_page,
                     )?;
+                    verify_page_num_values(&header, self.num_values)?;
                     let bytes = buffer.slice(offset..);
                     let bytes =
                         self.context
@@ -2966,5 +2998,69 @@ mod invalid_input_tests {
         // A page type that the reader skips is not an error.
         header.r#type = PageType::INDEX_PAGE;
         assert!(peeked_page_metadata(&header).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod allocation_bound_tests {
+    use super::*;
+    use crate::basic::Encoding;
+    use crate::file::metadata::thrift::{DataPageHeader, DataPageHeaderV2, DictionaryPageHeader};
+
+    fn header(page_type: PageType) -> PageHeader {
+        PageHeader {
+            r#type: page_type,
+            uncompressed_page_size: 10,
+            compressed_page_size: 10,
+            crc: None,
+            data_page_header: None,
+            index_page_header: None,
+            dictionary_page_header: None,
+            data_page_header_v2: None,
+        }
+    }
+
+    /// A data page cannot hold more values than its column chunk declares.
+    /// The decoders size buffers by the page count.
+    #[test]
+    fn data_page_value_count_above_the_column_chunk_fails() {
+        let mut v1 = header(PageType::DATA_PAGE);
+        v1.data_page_header = Some(DataPageHeader {
+            num_values: 5,
+            encoding: Encoding::PLAIN,
+            definition_level_encoding: Encoding::RLE,
+            repetition_level_encoding: Encoding::RLE,
+            statistics: None,
+        });
+        let mut v2 = header(PageType::DATA_PAGE_V2);
+        v2.data_page_header_v2 = Some(DataPageHeaderV2 {
+            num_values: 5,
+            num_nulls: 0,
+            num_rows: 5,
+            encoding: Encoding::PLAIN,
+            definition_levels_byte_length: 0,
+            repetition_levels_byte_length: 0,
+            is_compressed: Some(false),
+            statistics: None,
+        });
+        for header in [v1, v2] {
+            verify_page_num_values(&header, 5).unwrap();
+            verify_page_num_values(&header, i64::MAX).unwrap();
+            let err = verify_page_num_values(&header, 4).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "Parquet error: Invalid page header: the page declares 5 values, but its column chunk has 4"
+            );
+        }
+
+        // A dictionary can hold values that no row of the chunk uses. Its
+        // count is compared with the bytes of its page.
+        let mut dictionary = header(PageType::DICTIONARY_PAGE);
+        dictionary.dictionary_page_header = Some(DictionaryPageHeader {
+            num_values: 5,
+            encoding: Encoding::PLAIN,
+            is_sorted: None,
+        });
+        verify_page_num_values(&dictionary, 4).unwrap();
     }
 }

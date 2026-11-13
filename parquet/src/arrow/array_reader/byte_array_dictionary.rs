@@ -25,7 +25,9 @@ use arrow_buffer::ArrowNativeType;
 use arrow_schema::DataType as ArrowType;
 use bytes::Bytes;
 
-use crate::arrow::array_reader::byte_array::{ByteArrayDecoder, ByteArrayDecoderPlain};
+use crate::arrow::array_reader::byte_array::{
+    ByteArrayDecoder, ByteArrayDecoderPlain, check_dictionary_len,
+};
 use crate::arrow::array_reader::{ArrayReader, read_records, skip_records};
 use crate::arrow::buffer::{dictionary_buffer::DictionaryBuffer, offset_buffer::OffsetBuffer};
 use crate::arrow::decoder::dictionary_index_bit_width;
@@ -285,7 +287,8 @@ where
         let len = num_values as usize;
         let mut buffer = OffsetBuffer::<V>::with_capacity(0);
         let mut decoder = ByteArrayDecoderPlain::new(buf, len, Some(len), self.validate_utf8);
-        decoder.read(&mut buffer, usize::MAX)?;
+        let read = decoder.read(&mut buffer, usize::MAX)?;
+        check_dictionary_len(read, len)?;
 
         let array = buffer.into_array(None, self.value_type.clone());
         self.dict = Some(array);
@@ -665,8 +668,10 @@ mod tests {
         let column_desc = utf8_column();
         let mut decoder = DictionaryDecoder::new(&column_desc);
 
+        // The dictionary has no values. A count above the values of the page
+        // is an error.
         decoder
-            .set_dict(encoded_dictionary, 4, Encoding::PLAIN_DICTIONARY, false)
+            .set_dict(encoded_dictionary, 0, Encoding::PLAIN_DICTIONARY, false)
             .unwrap();
 
         for (encoding, page) in pages.clone() {

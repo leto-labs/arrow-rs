@@ -54,3 +54,49 @@ release build did before; the checked build no longer overflows.
 The regression files are in `parquet/tests/arrow_reader/invalid_files/`, with
 their origin in its `README.md`. Unit tests of the family are in modules named
 `invalid_input_tests`.
+
+## PAB: Parquet allocation bounds
+
+PAB is an UPSTREAMABLE patch family for PARQUET-INVALID-INPUT. A count, a
+length or a size that the reader takes from a page header or from an encoded
+block is compared with what the page can hold before the reader allocates
+memory for it. A count that the page cannot hold gives a `ParquetError`.
+Before, the reader allocated for the declared count. The Rust runtime ends the
+process when an allocation fails, and no caller can report that as an error.
+
+The limits are:
+
+- The length blocks of DELTA_LENGTH_BYTE_ARRAY and DELTA_BYTE_ARRAY (prefix
+  and suffix lengths): at most the value count of the page, and at most the
+  blocks that the remaining bytes of the page can hold (each block has at
+  least a minimum delta and one bit width for each mini block).
+- A dictionary page: at most the PLAIN values that its bytes can hold (one bit
+  for a BOOLEAN, four bytes for a BYTE_ARRAY length, the type length
+  otherwise). A byte array dictionary that holds fewer values than its header
+  declares is an error.
+- A data page: at most the value count of its column chunk.
+- Snappy and LZ4 pages: the uncompressed size is at most 22 times (Snappy) or
+  255 times (LZ4) the compressed size, the largest expansion of each format.
+  The Snappy stream length must equal the size in the page header; before, a
+  shorter stream left zeros at the end of the page without an error.
+- GZIP, Brotli and LZ4 frame pages: the decoder stops one byte after the size
+  in the page header. The Zstandard decoder writes at most that size.
+  `decode_page` reserves no memory; each codec reserves after its check.
+- `FIXED_LEN_BYTE_ARRAY` values: the type length is from the file schema and
+  can be 2^31 - 1. A capacity hint of that length for each row is dropped when
+  it cannot be allocated, and the slots for NULL values are an error then.
+
+The checks run once for each page or dictionary. No check runs for each
+value. Results for valid files do not change. `DeltaByteArrayDecoder::skip`
+of the generic decoders allocates for the values that are left, not for the
+count that the caller names.
+
+The regression files are in `parquet/tests/crafted_files/`, with the scripts
+that write them. `parquet/tests/allocation_bounds.rs` reads them with an
+allocator that refuses large allocations. Unit tests of the family are in
+modules named `allocation_bound_tests`.
+
+A file can declare the same large count in its footer, its page header and
+its encoded block. Such a file is consistent, and the reader allocates for
+its count: a length block of 2^31 - 1 lengths needs 8 GiB. PAB does not limit
+that.

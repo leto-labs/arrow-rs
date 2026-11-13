@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -196,12 +198,91 @@ pub fn create_codec(codec: CodecType, _options: &CodecOptions) -> Result<Option<
     }
 }
 
+/// Returns an error if `input_len` compressed bytes cannot hold
+/// `uncompress_size` bytes for a codec that expands a stream at most
+/// `max_ratio` times.
+///
+/// The decoders of these codecs fill the output with zeros before they
+/// decode. The size is from a page header, so compare it with the input
+/// first: a page of a few bytes can declare 2 GiB.
+#[cfg(any(feature = "snap", feature = "lz4", test))]
+fn check_uncompress_size(
+    codec: &str,
+    input_len: usize,
+    uncompress_size: usize,
+    max_ratio: usize,
+) -> Result<()> {
+    if uncompress_size > input_len.saturating_mul(max_ratio) {
+        return Err(general_err!(
+            "{} data of {} bytes cannot hold the {} bytes that the page header declares",
+            codec,
+            input_len,
+            uncompress_size
+        ));
+    }
+    Ok(())
+}
+
+/// Reserves `additional` bytes for the output of a streaming decoder, which
+/// writes only the bytes that its input holds. The size is from a page
+/// header: if the host cannot reserve it, this is an error of the file.
+#[cfg(any(
+    feature = "flate2",
+    feature = "brotli",
+    feature = "lz4",
+    feature = "zstd",
+    test
+))]
+fn reserve_output(output_buf: &mut Vec<u8>, additional: usize) -> Result<()> {
+    output_buf.try_reserve(additional).map_err(|e| {
+        general_err!(
+            "cannot allocate {} bytes for decompressed data: {}",
+            additional,
+            e
+        )
+    })
+}
+
+/// Appends the output of a streaming `decoder` to `output_buf`.
+///
+/// With `uncompress_size`, a stream that holds more bytes is an error, and
+/// the read stops one byte after that size. Without the limit a small page
+/// can expand to any size before its length is compared with the page header.
+#[cfg(any(feature = "flate2", feature = "brotli", test))]
+fn read_decompressed<R: std::io::Read>(
+    decoder: R,
+    output_buf: &mut Vec<u8>,
+    uncompress_size: Option<usize>,
+) -> Result<usize> {
+    use std::io::Read;
+
+    let Some(size) = uncompress_size else {
+        let mut decoder = decoder;
+        return decoder.read_to_end(output_buf).map_err(|e| e.into());
+    };
+    reserve_output(output_buf, size)?;
+    let read = decoder
+        .take((size as u64).saturating_add(1))
+        .read_to_end(output_buf)?;
+    if read > size {
+        return Err(general_err!(
+            "decompressed data is longer than the {} bytes that the page header declares",
+            size
+        ));
+    }
+    Ok(read)
+}
+
 #[cfg(any(feature = "snap", test))]
 mod snappy_codec {
     use snap::raw::{Decoder, Encoder, decompress_len, max_compress_len};
 
-    use crate::compression::Codec;
-    use crate::errors::Result;
+    use crate::compression::{Codec, check_uncompress_size};
+    use crate::errors::{ParquetError, Result};
+
+    /// The largest expansion of a Snappy stream: its densest element is a
+    /// three-byte copy of 64 bytes.
+    const MAX_EXPANSION: usize = 22;
 
     /// Codec for Snappy compression format.
     pub struct SnappyCodec {
@@ -226,10 +307,21 @@ mod snappy_codec {
             output_buf: &mut Vec<u8>,
             uncompress_size: Option<usize>,
         ) -> Result<usize> {
+            // The length that the stream declares for itself.
+            let stream_len = decompress_len(input_buf)?;
             let len = match uncompress_size {
-                Some(size) => size,
-                None => decompress_len(input_buf)?,
+                // The decoder accepts an output that is longer than the
+                // stream and leaves the rest as zeros, so compare the lengths.
+                Some(size) if size != stream_len => {
+                    return Err(general_err!(
+                        "Snappy data declares {} bytes, but the page header declares {}",
+                        stream_len,
+                        size
+                    ));
+                }
+                _ => stream_len,
             };
+            check_uncompress_size("Snappy", input_buf.len(), len, MAX_EXPANSION)?;
             let offset = output_buf.len();
             output_buf.resize(offset + len, 0);
             self.decoder
@@ -255,11 +347,11 @@ pub use snappy_codec::*;
 #[cfg(any(feature = "flate2", test))]
 mod gzip_codec {
 
-    use std::io::{Read, Write};
+    use std::io::Write;
 
     use flate2::{Compression, read, write};
 
-    use crate::compression::Codec;
+    use crate::compression::{Codec, read_decompressed};
     use crate::errors::Result;
 
     use super::GzipLevel;
@@ -281,10 +373,10 @@ mod gzip_codec {
             &mut self,
             input_buf: &[u8],
             output_buf: &mut Vec<u8>,
-            _uncompress_size: Option<usize>,
+            uncompress_size: Option<usize>,
         ) -> Result<usize> {
-            let mut decoder = read::MultiGzDecoder::new(input_buf);
-            decoder.read_to_end(output_buf).map_err(|e| e.into())
+            let decoder = read::MultiGzDecoder::new(input_buf);
+            read_decompressed(decoder, output_buf, uncompress_size)
         }
 
         fn compress(&mut self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
@@ -360,9 +452,9 @@ impl GzipLevel {
 #[cfg(any(feature = "brotli", test))]
 mod brotli_codec {
 
-    use std::io::{Read, Write};
+    use std::io::Write;
 
-    use crate::compression::Codec;
+    use crate::compression::{Codec, read_decompressed};
     use crate::errors::Result;
 
     use super::BrotliLevel;
@@ -389,10 +481,13 @@ mod brotli_codec {
             output_buf: &mut Vec<u8>,
             uncompress_size: Option<usize>,
         ) -> Result<usize> {
-            let buffer_size = uncompress_size.unwrap_or(BROTLI_DEFAULT_BUFFER_SIZE);
-            brotli::Decompressor::new(input_buf, buffer_size)
-                .read_to_end(output_buf)
-                .map_err(|e| e.into())
+            // The decoder allocates this buffer to read its input. The size is
+            // from the page header, so do not make it larger than the input.
+            let buffer_size = uncompress_size
+                .unwrap_or(BROTLI_DEFAULT_BUFFER_SIZE)
+                .min(input_buf.len().max(BROTLI_DEFAULT_BUFFER_SIZE));
+            let decoder = brotli::Decompressor::new(input_buf, buffer_size);
+            read_decompressed(decoder, output_buf, uncompress_size)
         }
 
         fn compress(&mut self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
@@ -439,11 +534,16 @@ impl BrotliLevel {
     }
 }
 
+/// The largest expansion of an LZ4 block: each further byte of a match length
+/// adds 255 bytes of output.
+#[cfg(any(feature = "lz4", test))]
+const MAX_LZ4_EXPANSION: usize = 255;
+
 #[cfg(any(feature = "lz4", test))]
 mod lz4_codec {
     use std::io::{Read, Write};
 
-    use crate::compression::Codec;
+    use crate::compression::{Codec, MAX_LZ4_EXPANSION, check_uncompress_size, reserve_output};
     use crate::errors::{ParquetError, Result};
 
     const LZ4_BUFFER_SIZE: usize = 4096;
@@ -463,8 +563,13 @@ mod lz4_codec {
             &mut self,
             input_buf: &[u8],
             output_buf: &mut Vec<u8>,
-            _uncompress_size: Option<usize>,
+            uncompress_size: Option<usize>,
         ) -> Result<usize> {
+            // An LZ4 block expands at most 255 times, so this is a real limit.
+            if let Some(size) = uncompress_size {
+                check_uncompress_size("LZ4", input_buf.len(), size, MAX_LZ4_EXPANSION)?;
+                reserve_output(output_buf, size)?;
+            }
             let mut decoder = lz4_flex::frame::FrameDecoder::new(input_buf);
             let mut buffer: [u8; LZ4_BUFFER_SIZE] = [0; LZ4_BUFFER_SIZE];
             let mut total_len = 0;
@@ -474,6 +579,13 @@ mod lz4_codec {
                     break;
                 }
                 total_len += len;
+                // Stop at the size that the page header declares: the frame
+                // can hold any amount of data.
+                if uncompress_size.is_some_and(|size| total_len > size) {
+                    return Err(ParquetError::General(
+                        "LZ4Codec uncompress_size is not the expected one".into(),
+                    ));
+                }
                 output_buf.write_all(&buffer[0..len])?;
             }
             Ok(total_len)
@@ -503,7 +615,7 @@ pub use lz4_codec::*;
 
 #[cfg(any(feature = "zstd", test))]
 mod zstd_codec {
-    use crate::compression::{Codec, ZstdLevel};
+    use crate::compression::{Codec, ZstdLevel, reserve_output};
     use crate::errors::Result;
     use std::io::Cursor;
 
@@ -545,7 +657,8 @@ mod zstd_codec {
                         .map(|size| size as usize)
                 })
                 .unwrap_or(input_buf.len().saturating_mul(4));
-            output_buf.reserve(len);
+            // The decoder writes at most the reserved capacity.
+            reserve_output(output_buf, len)?;
 
             let mut cursor = Cursor::new(output_buf);
             cursor.set_position(offset as u64);
@@ -603,7 +716,7 @@ impl Default for ZstdLevel {
 
 #[cfg(any(feature = "lz4", test))]
 mod lz4_raw_codec {
-    use crate::compression::Codec;
+    use crate::compression::{Codec, MAX_LZ4_EXPANSION, check_uncompress_size};
     use crate::errors::ParquetError;
     use crate::errors::Result;
 
@@ -633,6 +746,7 @@ mod lz4_raw_codec {
                     ));
                 }
             };
+            check_uncompress_size("LZ4", input_buf.len(), required_len, MAX_LZ4_EXPANSION)?;
             output_buf.resize(offset + required_len, 0);
             match lz4_flex::block::decompress_into(input_buf, &mut output_buf[offset..]) {
                 Ok(n) => {
@@ -666,9 +780,9 @@ pub use lz4_raw_codec::*;
 
 #[cfg(any(feature = "lz4", test))]
 mod lz4_hadoop_codec {
-    use crate::compression::Codec;
     use crate::compression::lz4_codec::LZ4Codec;
     use crate::compression::lz4_raw_codec::LZ4RawCodec;
+    use crate::compression::{Codec, MAX_LZ4_EXPANSION, check_uncompress_size};
     use crate::errors::{ParquetError, Result};
     use std::io;
 
@@ -772,6 +886,9 @@ mod lz4_hadoop_codec {
                     ));
                 }
             };
+            // Hadoop frames hold LZ4 blocks; the fallbacks read an LZ4 frame
+            // or one LZ4 block. None of them expands more than a block does.
+            check_uncompress_size("LZ4", input_buf.len(), required_len, MAX_LZ4_EXPANSION)?;
             output_buf.resize(output_len + required_len, 0);
             match try_decompress_hadoop(input_buf, &mut output_buf[output_len..]) {
                 Ok(n) => {
@@ -943,5 +1060,147 @@ mod tests {
     #[test]
     fn test_codec_lz4_raw() {
         test_codec_with_size(CodecType::LZ4_RAW);
+    }
+}
+
+#[cfg(test)]
+mod allocation_bound_tests {
+    use super::lz4_codec::LZ4Codec;
+    use super::*;
+
+    const CODECS: [CodecType; 6] = [
+        CodecType::SNAPPY,
+        CodecType::GZIP(GzipLevel(6)),
+        CodecType::BROTLI(BrotliLevel(1)),
+        CodecType::LZ4,
+        CodecType::ZSTD(ZstdLevel(1)),
+        CodecType::LZ4_RAW,
+    ];
+
+    fn codec(codec: CodecType) -> Box<dyn Codec> {
+        create_codec(codec, &CodecOptions::default())
+            .unwrap()
+            .unwrap()
+    }
+
+    fn compress(codec_type: CodecType, data: &[u8]) -> Vec<u8> {
+        let mut compressed = Vec::new();
+        codec(codec_type).compress(data, &mut compressed).unwrap();
+        compressed
+    }
+
+    /// The size limits are above the densest data that each codec writes:
+    /// equal bytes, which every element of the stream copies.
+    #[test]
+    fn densest_valid_data_decompresses() {
+        for codec_type in CODECS {
+            for len in [1, 63, 64, 65, 4096, 1 << 20, (1 << 22) + 3] {
+                for byte in [0, 0xa5] {
+                    let data = vec![byte; len];
+                    let compressed = compress(codec_type, &data);
+                    // Decompress after a prefix, as a V2 data page does.
+                    let mut output = vec![1, 2, 3];
+                    let read = codec(codec_type)
+                        .decompress(&compressed, &mut output, Some(len))
+                        .unwrap_or_else(|e| panic!("{codec_type} {len}: {e}"));
+                    assert_eq!(read, len, "{codec_type} {len}");
+                    assert_eq!(output[..3], [1, 2, 3]);
+                    assert!(output[3..] == data[..], "{codec_type} {len}");
+                }
+            }
+        }
+    }
+
+    /// The compressed data of 32 bytes cannot hold the declared 2^31 - 1
+    /// bytes. Snappy and LZ4 fill their output with zeros before they
+    /// decode, so they compare the size with the input first.
+    #[test]
+    fn size_that_the_data_cannot_hold_fails_without_allocation() {
+        let data: Vec<u8> = (0..32).collect();
+        for codec_type in [CodecType::SNAPPY, CodecType::LZ4, CodecType::LZ4_RAW] {
+            let mut compressed = compress(codec_type, &data);
+            if codec_type == CodecType::SNAPPY {
+                // The stream starts with its uncompressed length, as a varint.
+                assert_eq!(compressed[0], 32);
+                compressed.splice(0..1, [0xff, 0xff, 0xff, 0xff, 0x07]);
+            }
+            let mut output = Vec::new();
+            let err = codec(codec_type)
+                .decompress(&compressed, &mut output, Some(i32::MAX as usize))
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("cannot hold the 2147483647 bytes that the page header declares"),
+                "{codec_type}: {err}"
+            );
+            assert_eq!(output.capacity(), 0, "{codec_type}");
+        }
+    }
+
+    /// The Snappy decoder accepts an output that is longer than its stream.
+    /// The rest of the page was then zeros, without an error.
+    #[test]
+    fn snappy_length_that_differs_from_the_page_header_fails() {
+        let data: Vec<u8> = (0..32).collect();
+        let compressed = compress(CodecType::SNAPPY, &data);
+        for size in [31, 33] {
+            let mut output = Vec::new();
+            let err = codec(CodecType::SNAPPY)
+                .decompress(&compressed, &mut output, Some(size))
+                .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "Parquet error: Snappy data declares 32 bytes, but the page header declares {size}"
+                )
+            );
+        }
+    }
+
+    /// A stream of a few kilobytes holds 4 MiB. The page header declares 10
+    /// bytes; the streaming decoders read the stream to its end before the
+    /// lengths were compared.
+    #[test]
+    fn stream_longer_than_the_declared_size_stops() {
+        let data = vec![0; 4 << 20];
+        for codec_type in [
+            CodecType::GZIP(GzipLevel(6)),
+            CodecType::BROTLI(BrotliLevel(1)),
+        ] {
+            let compressed = compress(codec_type, &data);
+            assert!(compressed.len() < 64 << 10);
+            let mut output = Vec::new();
+            let err = codec(codec_type)
+                .decompress(&compressed, &mut output, Some(10))
+                .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "Parquet error: decompressed data is longer than the 10 bytes that the page header declares",
+                "{codec_type}"
+            );
+            assert!(
+                output.capacity() < 4096,
+                "{codec_type}: {}",
+                output.capacity()
+            );
+        }
+
+        // The LZ4 frame format is read only as a fallback of the Hadoop codec.
+        let mut compressed = Vec::new();
+        LZ4Codec::new().compress(&data, &mut compressed).unwrap();
+        let mut output = Vec::new();
+        let err = LZ4Codec::new()
+            .decompress(&compressed, &mut output, Some(10))
+            .unwrap_err();
+        assert!(err.to_string().contains("uncompress_size"), "{err}");
+        assert!(output.capacity() < 64 << 10, "{}", output.capacity());
+
+        // The Zstandard decoder writes at most the reserved size.
+        let compressed = compress(CodecType::ZSTD(ZstdLevel(1)), &data);
+        let mut output = Vec::new();
+        codec(CodecType::ZSTD(ZstdLevel(1)))
+            .decompress(&compressed, &mut output, Some(10))
+            .unwrap_err();
+        assert!(output.capacity() < 4096, "{}", output.capacity());
     }
 }

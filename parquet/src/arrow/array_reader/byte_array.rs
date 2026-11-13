@@ -223,7 +223,8 @@ impl<I: OffsetSizeTrait> ColumnValueDecoder for ByteArrayColumnValueDecoder<I> {
             Some(num_values as usize),
             self.validate_utf8,
         );
-        decoder.read(&mut buffer, usize::MAX)?;
+        let read = decoder.read(&mut buffer, usize::MAX)?;
+        check_dictionary_len(read, num_values as usize)?;
         self.dict = Some(buffer);
         Ok(())
     }
@@ -264,6 +265,20 @@ impl<I: OffsetSizeTrait> ColumnValueDecoder for ByteArrayColumnValueDecoder<I> {
     }
 }
 
+/// The PLAIN decoder stops at the end of the page. A dictionary page that
+/// holds fewer values than its header declares is invalid: the indices of the
+/// data pages can refer to the missing values.
+pub(crate) fn check_dictionary_len(read: usize, declared: usize) -> Result<()> {
+    if read != declared {
+        return Err(general_err!(
+            "dictionary page declares {} values, but holds {}",
+            declared,
+            read
+        ));
+    }
+    Ok(())
+}
+
 /// A generic decoder from uncompressed parquet value data to [`OffsetBuffer`]
 pub enum ByteArrayDecoder {
     Plain(ByteArrayDecoderPlain),
@@ -290,12 +305,16 @@ impl ByteArrayDecoder {
             Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => ByteArrayDecoder::Dictionary(
                 ByteArrayDecoderDictionary::new(data, num_levels, num_values)?,
             ),
-            Encoding::DELTA_LENGTH_BYTE_ARRAY => ByteArrayDecoder::DeltaLength(
-                ByteArrayDecoderDeltaLength::new(data, validate_utf8)?,
-            ),
-            Encoding::DELTA_BYTE_ARRAY => {
-                ByteArrayDecoder::DeltaByteArray(ByteArrayDecoderDelta::new(data, validate_utf8)?)
+            Encoding::DELTA_LENGTH_BYTE_ARRAY => {
+                ByteArrayDecoder::DeltaLength(ByteArrayDecoderDeltaLength::new(
+                    data,
+                    num_values.unwrap_or(num_levels),
+                    validate_utf8,
+                )?)
             }
+            Encoding::DELTA_BYTE_ARRAY => ByteArrayDecoder::DeltaByteArray(
+                ByteArrayDecoderDelta::new(data, num_values.unwrap_or(num_levels), validate_utf8)?,
+            ),
             _ => {
                 return Err(general_err!(
                     "unsupported encoding for byte array: {}",
@@ -381,9 +400,11 @@ impl ByteArrayDecoderPlain {
         let initial_values_length = output.values.len();
 
         let to_read = len.min(self.max_remaining_values);
-        output.offsets.reserve(to_read);
-
         let remaining_bytes = self.buf.len() - self.offset;
+        // The value count is from the page header. Each value has a four-byte
+        // length, so the remaining bytes limit the values that can be read.
+        output.offsets.reserve(to_read.min(remaining_bytes / 4));
+
         // `to_read == 0` also covers a page that declares zero values but
         // has value bytes; the byte estimate below divides by that count.
         if remaining_bytes == 0 || to_read == 0 {
@@ -460,13 +481,14 @@ pub struct ByteArrayDecoderDeltaLength {
 }
 
 impl ByteArrayDecoderDeltaLength {
-    fn new(data: Bytes, validate_utf8: bool) -> Result<Self> {
+    /// `max_values` is the value count of the page; a length block that
+    /// declares more lengths is an error.
+    fn new(data: Bytes, max_values: usize, validate_utf8: bool) -> Result<Self> {
         let mut len_decoder = DeltaBitPackDecoder::<Int32Type>::new();
         len_decoder.set_data(data.clone(), 0)?;
-        let values = len_decoder.values_left();
 
-        let mut lengths = vec![0; values];
-        len_decoder.get(&mut lengths)?;
+        let mut lengths = Vec::new();
+        len_decoder.read_lengths(max_values, "DELTA_LENGTH_BYTE_ARRAY", &mut lengths)?;
 
         let mut total_bytes = 0;
 
@@ -552,9 +574,9 @@ pub struct ByteArrayDecoderDelta {
 }
 
 impl ByteArrayDecoderDelta {
-    fn new(data: Bytes, validate_utf8: bool) -> Result<Self> {
+    fn new(data: Bytes, max_values: usize, validate_utf8: bool) -> Result<Self> {
         Ok(Self {
-            decoder: DeltaByteArrayDecoder::new(data)?,
+            decoder: DeltaByteArrayDecoder::new(data, max_values)?,
             validate_utf8,
         })
     }
@@ -745,8 +767,10 @@ mod tests {
         let column_desc = utf8_column();
         let mut decoder = ByteArrayColumnValueDecoder::new(&column_desc);
 
+        // The dictionary has no values. A count above the values of the page
+        // is an error.
         decoder
-            .set_dict(encoded_dictionary, 4, Encoding::RLE_DICTIONARY, false)
+            .set_dict(encoded_dictionary, 0, Encoding::RLE_DICTIONARY, false)
             .unwrap();
 
         // test nulls read
@@ -810,5 +834,47 @@ mod invalid_input_tests {
         let mut decoder = ByteArrayDecoderPlain::new(truncated_value(), 2, Some(0), false);
         let mut output = OffsetBuffer::<i32>::with_capacity(0);
         assert_eq!(decoder.read(&mut output, 1).unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod allocation_bound_tests {
+    use super::*;
+    use crate::arrow::array_reader::test_util::utf8_column;
+
+    /// Two PLAIN values: "a" and "bc".
+    fn two_values() -> Bytes {
+        Bytes::from_static(b"\x01\0\0\0a\x02\0\0\0bc")
+    }
+
+    /// The reservation for the offsets followed the value count of the page
+    /// header: 2^40 offsets for a page of eleven bytes.
+    #[test]
+    fn plain_read_reserves_what_the_page_can_hold() {
+        let mut decoder = ByteArrayDecoderPlain::new(two_values(), 1 << 40, None, false);
+        let mut output = OffsetBuffer::<i32>::with_capacity(0);
+        assert_eq!(decoder.read(&mut output, usize::MAX).unwrap(), 2);
+        assert_eq!(output.len(), 2);
+        assert!(
+            output.offsets.capacity() <= 8,
+            "{}",
+            output.offsets.capacity()
+        );
+    }
+
+    /// The indices of the data pages can refer to each declared value.
+    #[test]
+    fn dictionary_with_fewer_values_than_declared_fails() {
+        let mut decoder = ByteArrayColumnValueDecoder::<i32>::new(&utf8_column());
+        decoder
+            .set_dict(two_values(), 2, Encoding::PLAIN, false)
+            .unwrap();
+        let err = decoder
+            .set_dict(two_values(), i32::MAX as u32, Encoding::PLAIN, false)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: dictionary page declares 2147483647 values, but holds 2"
+        );
     }
 }

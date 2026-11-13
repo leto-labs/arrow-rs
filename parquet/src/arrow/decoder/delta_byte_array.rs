@@ -37,31 +37,30 @@ pub struct DeltaByteArrayDecoder {
 ///
 /// Checks once for the page that no length is negative, so `read` and `skip`
 /// can convert each length to `usize` without a check for each value.
-fn read_lengths(decoder: &mut DeltaBitPackDecoder<Int32Type>, name: &str) -> Result<Vec<i32>> {
-    let num_lengths = decoder.values_left();
-    let mut lengths = vec![0; num_lengths];
-    let read = decoder.get(&mut lengths)?;
-    if read != num_lengths {
-        return Err(general_err!(
-            "insufficient DELTA_BYTE_ARRAY {} lengths, expected {}, got {}",
-            name,
-            num_lengths,
-            read
-        ));
-    }
+///
+/// `max_values` is the value count of the page. A block that declares more
+/// lengths is an error, and no memory is allocated for it.
+fn read_lengths(
+    decoder: &mut DeltaBitPackDecoder<Int32Type>,
+    max_values: usize,
+    name: &str,
+) -> Result<Vec<i32>> {
+    let mut lengths = Vec::new();
+    decoder.read_lengths(max_values, name, &mut lengths)?;
     if lengths.iter().any(|length| *length < 0) {
-        return Err(general_err!("negative DELTA_BYTE_ARRAY {} length", name));
+        return Err(general_err!("negative {} length", name));
     }
     Ok(lengths)
 }
 
 impl DeltaByteArrayDecoder {
-    /// Create a new [`DeltaByteArrayDecoder`] with the provided data page
-    pub fn new(data: Bytes) -> Result<Self> {
+    /// Create a new [`DeltaByteArrayDecoder`] with the provided data page,
+    /// which has at most `max_values` values
+    pub fn new(data: Bytes, max_values: usize) -> Result<Self> {
         let mut prefix = DeltaBitPackDecoder::<Int32Type>::new();
         prefix.set_data(data.clone(), 0)?;
 
-        let prefix_lengths = read_lengths(&mut prefix, "prefix")?;
+        let prefix_lengths = read_lengths(&mut prefix, max_values, "DELTA_BYTE_ARRAY prefix")?;
         let num_prefix = prefix_lengths.len();
 
         let prefix_end = prefix.get_offset();
@@ -73,7 +72,7 @@ impl DeltaByteArrayDecoder {
         let mut suffix = DeltaBitPackDecoder::<Int32Type>::new();
         suffix.set_data(data.slice(prefix_end..), 0)?;
 
-        let suffix_lengths = read_lengths(&mut suffix, "suffix")?;
+        let suffix_lengths = read_lengths(&mut suffix, max_values, "DELTA_BYTE_ARRAY suffix")?;
         let num_suffix = suffix_lengths.len();
 
         if num_prefix != num_suffix {
@@ -189,7 +188,7 @@ mod invalid_input_tests {
     }
 
     fn read_all(data: Bytes) -> Result<Vec<Vec<u8>>> {
-        let mut decoder = DeltaByteArrayDecoder::new(data)?;
+        let mut decoder = DeltaByteArrayDecoder::new(data, 2)?;
         let mut values = Vec::new();
         decoder.read(usize::MAX, |value| {
             values.push(value.to_vec());
@@ -225,7 +224,7 @@ mod invalid_input_tests {
         let err = read_all(encode(&[0, 2], &[3, 2], b"abcd")).unwrap_err();
         assert_eq!(err.to_string(), "EOF: eof decoding byte array");
 
-        let mut decoder = DeltaByteArrayDecoder::new(encode(&[0, 2], &[3, 2], b"abcd")).unwrap();
+        let mut decoder = DeltaByteArrayDecoder::new(encode(&[0, 2], &[3, 2], b"abcd"), 2).unwrap();
         let err = decoder.skip(2).unwrap_err();
         assert_eq!(err.to_string(), "EOF: eof decoding byte array");
     }
