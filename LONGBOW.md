@@ -145,3 +145,41 @@ hardware kernel. No row value, encoding or compression policy changes.
 DataPage V1/V2, dictionary and plain encodings, supported compression samples,
 property round trips and the checksum-free default. Longbow adds result and
 parallel append corruption tests. PCV verifies these pages on read.
+
+## DPC: decompressed page cache hook
+
+DPC is an UPSTREAMABLE patch family for SCAN-PAGE-CACHE (Longbow ADR 0053).
+The crate holds no pages. It defines `parquet::file::page_cache::PageCache`
+and uses it in two places:
+
+- `SerializedPageReader` looks a page up by the file offset of its header
+  before it reads, checks and decompresses it, and offers the decoded `Page`
+  to the cache after a miss. `peek_next_page` and `skip_next_page` step over a
+  resident page by its stored length, without its file bytes.
+- The push decoder's fetch planning (`InMemoryRowGroup::fetch_ranges`) pins
+  the pages that a row group read needs. A column chunk whose needed pages
+  are all resident is not fetched (`ColumnChunkData::Cached`). The reader
+  holds the pins, so an eviction between planning and decoding cannot remove
+  a page whose bytes were not fetched.
+
+The engine attaches one handle to the `ParquetMetaData` of a file generation
+(`ParquetMetaData::with_page_cache`), and owns the memory, the eviction and
+the identity of the file. The handle takes no part in metadata equality. A
+copy of the metadata, also through `ParquetMetaDataBuilder` or a later page
+index load, keeps it.
+
+Limits that the tests state:
+
+- Only compressed, unencrypted column chunks use the cache. The buffer of an
+  uncompressed page is a slice of the fetched chunk, so caching it would keep
+  the chunk alive and save no decompression. A reader that decodes page
+  statistics (`ReaderProperties::read_page_stats`) does not use it either.
+- A cached page passed the reader's header checks and CRC when it was filled.
+  A hit repeats neither.
+- Without an offset index, a column chunk is pinned only when the resident
+  pages cover it without a gap. After a selective read that stepped over
+  pages, such a chunk is fetched again and its resident pages are still hits.
+- The synchronous `SerializedFileReader` row group reader does not pass the
+  handle. Longbow's scans read through the push decoder.
+
+With no handle attached nothing changes. Results never change.

@@ -28,6 +28,7 @@ use crate::compression::{Codec, create_codec};
 use crate::encryption::decrypt::{CryptoContext, read_and_decrypt};
 use crate::errors::{ParquetError, Result};
 use crate::file::metadata::thrift::PageHeader;
+use crate::file::page_cache::{CachedPage, PageCache, PageFill, PageLookup, PinnedPages};
 use crate::file::page_index::offset_index::{OffsetIndexMetaData, PageLocation};
 use crate::file::statistics;
 use crate::file::{
@@ -602,6 +603,57 @@ pub struct SerializedPageReader<R: ChunkReader> {
     state: SerializedPageReaderState,
 
     context: SerializedPageReaderContext,
+
+    /// Longbow family DPC: the decompressed page cache of this file, when the
+    /// column chunk is compressed and not encrypted.
+    page_cache: Option<PageCacheReader>,
+}
+
+/// The view of a file's decompressed page cache that one column chunk reader
+/// has (Longbow family DPC).
+struct PageCacheReader {
+    cache: Arc<dyn PageCache>,
+    /// Pages that fetch planning took from the cache. Their bytes were not
+    /// fetched, so the reader must find them here.
+    pinned: Option<Arc<PinnedPages>>,
+    /// File offset of the page whose header `peek_next_page` already parsed.
+    peeked_start: Option<u64>,
+}
+
+impl PageCacheReader {
+    /// The page that starts at `offset`, or the ticket to publish it.
+    fn get(&self, offset: u64) -> PageLookup {
+        if let Some(page) = self.pinned.as_ref().and_then(|pinned| pinned.get(offset)) {
+            return PageLookup::Hit(page.clone());
+        }
+        self.cache.get(offset, true)
+    }
+
+    /// The page that starts at `offset` if it is resident; records no access.
+    fn probe(&self, offset: u64) -> Option<CachedPage> {
+        if let Some(page) = self.pinned.as_ref().and_then(|pinned| pinned.get(offset)) {
+            return Some(page.clone());
+        }
+        self.cache.probe(offset)
+    }
+}
+
+/// Whether `decode_page` decompresses the body of this page into a buffer of
+/// its own. Only such a page is offered to the page cache.
+fn page_body_is_compressed(header: &PageHeader) -> bool {
+    header
+        .data_page_header_v2
+        .as_ref()
+        .is_none_or(|v2| v2.is_compressed.unwrap_or(true))
+}
+
+/// Offers a decoded page to the cache when its reader holds the ticket.
+fn publish_page(fill: Option<Box<dyn PageFill>>, cacheable: bool, page: &Page, stored_len: u64) {
+    if let Some(fill) = fill
+        && cacheable
+    {
+        fill.complete(CachedPage::new(page.clone(), stored_len));
+    }
 }
 
 impl<R: ChunkReader> SerializedPageReader<R> {
@@ -705,7 +757,40 @@ impl<R: ChunkReader> SerializedPageReader<R> {
             physical_type: meta.column_type(),
             num_values: meta.num_values(),
             context,
+            page_cache: None,
         })
+    }
+
+    /// Reads this column chunk through the decompressed page cache of its
+    /// file (Longbow family DPC). `pinned` holds the pages that fetch planning
+    /// already took from the cache.
+    ///
+    /// The cache is not used for an uncompressed chunk, an encrypted chunk or
+    /// a reader that decodes page statistics: see
+    /// [`page_cache`](crate::file::page_cache). Call this after
+    /// `add_crypto_context`.
+    pub(crate) fn with_page_cache(
+        mut self,
+        cache: Option<Arc<dyn PageCache>>,
+        pinned: Option<Arc<PinnedPages>>,
+    ) -> Self {
+        #[cfg(feature = "encryption")]
+        let encrypted = self.context.crypto_context.is_some();
+        #[cfg(not(feature = "encryption"))]
+        let encrypted = false;
+        self.page_cache = match cache {
+            Some(cache)
+                if self.decompressor.is_some() && !encrypted && !self.context.read_stats =>
+            {
+                Some(PageCacheReader {
+                    cache,
+                    pinned,
+                    peeked_start: None,
+                })
+            }
+            _ => None,
+        };
+        self
     }
 
     /// Similar to `peek_next_page`, but returns the offset of the next page instead of the page metadata.
@@ -988,6 +1073,48 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                         return Ok(None);
                     }
 
+                    // Longbow family DPC. The page starts at `offset`, or at
+                    // the recorded start when its header was already peeked.
+                    let peeked_start = self
+                        .page_cache
+                        .as_mut()
+                        .and_then(|cache| cache.peeked_start.take());
+                    let page_start = match next_page_header {
+                        Some(_) => peeked_start,
+                        None => Some(*offset),
+                    };
+                    let mut fill = None;
+                    if let Some((cache, page_start)) = self.page_cache.as_ref().zip(page_start) {
+                        match cache.get(page_start) {
+                            PageLookup::Hit(cached) => {
+                                // Bytes of this page that the peek consumed.
+                                let consumed = *offset - page_start;
+                                let rest = cached
+                                    .stored_len()
+                                    .checked_sub(consumed)
+                                    .filter(|rest| *rest <= *remaining && cached.stored_len() > 0)
+                                    .ok_or_else(|| {
+                                        general_err!(
+                                            "Cached page at offset {} does not fit its column chunk",
+                                            page_start
+                                        )
+                                    })?;
+                                *next_page_header = None;
+                                *offset += rest;
+                                *remaining -= rest;
+                                let page = cached.page().clone();
+                                if page.is_data_page() {
+                                    *page_index += 1;
+                                } else if page.is_dictionary_page() {
+                                    *require_dictionary = false;
+                                }
+                                return Ok(Some(page));
+                            }
+                            PageLookup::Miss(ticket) => fill = ticket,
+                        }
+                    }
+                    let page_start = page_start.unwrap_or(*offset);
+
                     let mut read = self.reader.get_read(*offset)?;
                     let header = if let Some(header) = next_page_header.take() {
                         *header
@@ -1024,12 +1151,14 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                         self.context
                             .decrypt_page_data(buffer, *page_index, *require_dictionary)?;
 
+                    let cacheable = fill.is_some() && page_body_is_compressed(&header);
                     let page = decode_page(
                         header,
                         buffer,
                         self.physical_type,
                         self.decompressor.as_mut(),
                     )?;
+                    publish_page(fill, cacheable, &page, *offset - page_start);
                     if page.is_data_page() {
                         *page_index += 1;
                     } else if page.is_dictionary_page() {
@@ -1051,6 +1180,27 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                         },
                     };
 
+                    // Longbow family DPC.
+                    let mut fill = None;
+                    if let Some(cache) = &self.page_cache {
+                        match cache.get(front.offset as u64) {
+                            PageLookup::Hit(cached) => {
+                                let page = cached.page().clone();
+                                if page.is_dictionary_page() != is_dictionary_page {
+                                    return Err(general_err!(
+                                        "Cached page at offset {} has the wrong page type",
+                                        front.offset
+                                    ));
+                                }
+                                if !is_dictionary_page {
+                                    *page_index += 1;
+                                }
+                                return Ok(Some(page));
+                            }
+                            PageLookup::Miss(ticket) => fill = ticket,
+                        }
+                    }
+
                     let page_len = usize::try_from(front.compressed_page_size)?;
                     let buffer = self.reader.get_bytes(front.offset as u64, page_len)?;
 
@@ -1069,12 +1219,15 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                     if !is_dictionary_page {
                         *page_index += 1;
                     }
-                    decode_page(
+                    let cacheable = fill.is_some() && page_body_is_compressed(&header);
+                    let page = decode_page(
                         header,
                         bytes,
                         self.physical_type,
                         self.decompressor.as_mut(),
-                    )?
+                    )?;
+                    publish_page(fill, cacheable, &page, page_len as u64);
+                    page
                 }
             };
 
@@ -1104,6 +1257,16 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                             continue;
                         }
                     } else {
+                        // Longbow family DPC: a resident page answers without
+                        // its file bytes, and the reader does not move.
+                        if let Some(cached) = self
+                            .page_cache
+                            .as_ref()
+                            .and_then(|cache| cache.probe(*offset))
+                        {
+                            return Ok(Some(cached.metadata()));
+                        }
+                        let page_start = *offset;
                         let mut read = self.reader.get_read(*offset)?;
                         let (header_len, header) = Self::read_page_header_len(
                             &self.context,
@@ -1121,6 +1284,9 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                             continue;
                         };
                         *next_page_header = Some(Box::new(header));
+                        if let Some(cache) = self.page_cache.as_mut() {
+                            cache.peeked_start = Some(page_start);
+                        }
                         page_meta
                     };
                 }
@@ -1173,6 +1339,25 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                     // The next page header has already been peeked, so just advance the offset
                     *offset += buffered_header.compressed_page_size as u64;
                     *remaining_bytes -= buffered_header.compressed_page_size as u64;
+                    if let Some(cache) = self.page_cache.as_mut() {
+                        cache.peeked_start = None;
+                    }
+                } else if let Some(cached) = self
+                    .page_cache
+                    .as_ref()
+                    .and_then(|cache| cache.probe(*offset))
+                {
+                    // Longbow family DPC: step over a resident page by its
+                    // stored length, without its file bytes.
+                    let stored_len = cached.stored_len();
+                    if stored_len == 0 || stored_len > *remaining_bytes {
+                        return Err(general_err!(
+                            "Cached page at offset {} does not fit its column chunk",
+                            *offset
+                        ));
+                    }
+                    *offset += stored_len;
+                    *remaining_bytes -= stored_len;
                 } else {
                     let mut read = self.reader.get_read(*offset)?;
                     let (header_len, header) = Self::read_page_header_len(

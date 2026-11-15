@@ -1,3 +1,4 @@
+// Modified by the Longbow authors; see third_party/README.md.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -21,6 +22,7 @@ use crate::arrow::arrow_reader::RowSelection;
 use crate::column::page::{PageIterator, PageReader};
 use crate::errors::ParquetError;
 use crate::file::metadata::{ParquetMetaData, RowGroupMetaData};
+use crate::file::page_cache::PinnedPages;
 use crate::file::page_index::offset_index::OffsetIndexMetaData;
 use crate::file::reader::{ChunkReader, Length, SerializedPageReader};
 use bytes::{Buf, Bytes};
@@ -56,13 +58,17 @@ impl InMemoryRowGroup<'_> {
     /// The `selection` for Cached columns is expanded to batch boundaries to simplify
     /// accounting for what data is cached.
     pub(crate) fn fetch_ranges(
-        &self,
+        &mut self,
         projection: &ProjectionMask,
         selection: Option<&RowSelection>,
         batch_size: usize,
         cache_mask: Option<&ProjectionMask>,
     ) -> FetchRanges {
         let metadata = self.metadata.row_group(self.row_group_idx);
+        // Longbow family DPC: a column chunk whose needed pages are all in the
+        // file's decompressed page cache is not fetched. Its pages are pinned
+        // in `column_chunks`, where `fill_column_chunks` skips it.
+        let page_cache = self.metadata.page_cache();
         if let Some((selection, offset_index)) = selection.zip(self.offset_index) {
             let expanded_selection =
                 selection.expand_to_batch_boundaries(batch_size, self.row_count);
@@ -71,58 +77,75 @@ impl InMemoryRowGroup<'_> {
             // pages required for the `RowSelection`
             // Consider preallocating outer vec: https://github.com/apache/arrow-rs/issues/8667
             let mut page_start_offsets: Vec<Vec<u64>> = vec![];
+            let mut all_ranges: Vec<Range<u64>> = vec![];
 
-            let ranges = self
-                .column_chunks
-                .iter()
-                .zip(metadata.columns())
-                .enumerate()
-                .filter(|&(idx, (chunk, _chunk_meta))| {
-                    chunk.is_none() && projection.leaf_included(idx)
-                })
-                .flat_map(|(idx, (_chunk, chunk_meta))| {
-                    // If the first page does not start at the beginning of the column,
-                    // then we need to also fetch a dictionary page.
-                    let mut ranges: Vec<Range<u64>> = vec![];
-                    let (start, _len) = chunk_meta.byte_range();
-                    match offset_index[idx].page_locations.first() {
-                        Some(first) if first.offset as u64 != start => {
-                            ranges.push(start..first.offset as u64);
-                        }
-                        _ => (),
+            for (idx, chunk_meta) in metadata.columns().iter().enumerate() {
+                if self.column_chunks[idx].is_some() || !projection.leaf_included(idx) {
+                    continue;
+                }
+                // If the first page does not start at the beginning of the column,
+                // then we need to also fetch a dictionary page.
+                let mut ranges: Vec<Range<u64>> = vec![];
+                let (start, length) = chunk_meta.byte_range();
+                match offset_index[idx].page_locations.first() {
+                    Some(first) if first.offset as u64 != start => {
+                        ranges.push(start..first.offset as u64);
                     }
+                    _ => (),
+                }
 
-                    // Expand selection to batch boundaries if needed for caching
-                    // (see doc comment for this function for details on `cache_mask`)
-                    let use_expanded = cache_mask.map(|m| m.leaf_included(idx)).unwrap_or(false);
-                    if use_expanded {
-                        ranges.extend(
-                            expanded_selection.scan_ranges(&offset_index[idx].page_locations),
-                        );
-                    } else {
-                        ranges.extend(selection.scan_ranges(&offset_index[idx].page_locations));
-                    }
-                    page_start_offsets.push(ranges.iter().map(|range| range.start).collect());
-
+                // Expand selection to batch boundaries if needed for caching
+                // (see doc comment for this function for details on `cache_mask`)
+                let use_expanded = cache_mask.map(|m| m.leaf_included(idx)).unwrap_or(false);
+                if use_expanded {
                     ranges
-                })
-                .collect();
+                        .extend(expanded_selection.scan_ranges(&offset_index[idx].page_locations));
+                } else {
+                    ranges.extend(selection.scan_ranges(&offset_index[idx].page_locations));
+                }
+
+                // Each range is one page and starts at its header.
+                if let Some(pages) = page_cache
+                    .filter(|_| page_cache_applies(chunk_meta))
+                    .and_then(|cache| {
+                        PinnedPages::at_offsets(cache.as_ref(), ranges.iter().map(|r| r.start))
+                    })
+                {
+                    self.column_chunks[idx] = Some(Arc::new(ColumnChunkData::Cached {
+                        length: length as usize,
+                        pages: Arc::new(pages),
+                    }));
+                    continue;
+                }
+                page_start_offsets.push(ranges.iter().map(|range| range.start).collect());
+                all_ranges.extend(ranges);
+            }
             FetchRanges {
-                ranges,
+                ranges: all_ranges,
                 page_start_offsets: Some(page_start_offsets),
             }
         } else {
-            let ranges = self
-                .column_chunks
-                .iter()
-                .enumerate()
-                .filter(|&(idx, chunk)| chunk.is_none() && projection.leaf_included(idx))
-                .map(|(idx, _chunk)| {
-                    let column = metadata.column(idx);
-                    let (start, length) = column.byte_range();
-                    start..(start + length)
-                })
-                .collect();
+            let mut ranges = vec![];
+            for (idx, column) in metadata.columns().iter().enumerate() {
+                if self.column_chunks[idx].is_some() || !projection.leaf_included(idx) {
+                    continue;
+                }
+                let (start, length) = column.byte_range();
+                if let Some(pages) =
+                    page_cache
+                        .filter(|_| page_cache_applies(column))
+                        .and_then(|cache| {
+                            PinnedPages::contiguous(cache.as_ref(), start, start + length)
+                        })
+                {
+                    self.column_chunks[idx] = Some(Arc::new(ColumnChunkData::Cached {
+                        length: length as usize,
+                        pages: Arc::new(pages),
+                    }));
+                    continue;
+                }
+                ranges.push(start..(start + length));
+            }
             FetchRanges {
                 ranges,
                 page_start_offsets: None,
@@ -217,6 +240,13 @@ impl RowGroups for InMemoryRowGroup<'_> {
                     self.metadata,
                     column_chunk_metadata,
                 )?;
+                // Longbow family DPC.
+                let pinned = match data.as_ref() {
+                    ColumnChunkData::Cached { pages, .. } => Some(Arc::clone(pages)),
+                    _ => None,
+                };
+                let page_reader =
+                    page_reader.with_page_cache(self.metadata.page_cache().cloned(), pinned);
 
                 let page_reader: Box<dyn PageReader> = Box::new(page_reader);
 
@@ -255,6 +285,24 @@ pub(crate) enum ColumnChunkData {
     },
     /// Full column chunk and the offset within the original file
     Dense { offset: usize, data: Bytes },
+    /// Longbow family DPC: no bytes of the column chunk were fetched, because
+    /// every page that the read needs was in the decompressed page cache.
+    Cached {
+        /// Length of the full column chunk
+        length: usize,
+        /// The needed pages, held for as long as this chunk is read.
+        pages: Arc<PinnedPages>,
+    },
+}
+
+/// Whether the pages of this column chunk can be in the decompressed page
+/// cache: the reader caches only compressed, unencrypted chunks.
+fn page_cache_applies(column: &crate::file::metadata::ColumnChunkMetaData) -> bool {
+    #[cfg(feature = "encryption")]
+    if column.crypto_metadata().is_some() {
+        return false;
+    }
+    column.compression() != crate::basic::Compression::UNCOMPRESSED
 }
 
 impl ColumnChunkData {
@@ -275,6 +323,9 @@ impl ColumnChunkData {
                 let start = start as usize - *offset;
                 Ok(data.slice(start..))
             }
+            ColumnChunkData::Cached { .. } => Err(ParquetError::General(format!(
+                "Page at offset {start} is not pinned from the page cache and its column chunk was not fetched"
+            ))),
         }
     }
 }
@@ -285,6 +336,7 @@ impl Length for ColumnChunkData {
         match &self {
             ColumnChunkData::Sparse { length, .. } => *length as u64,
             ColumnChunkData::Dense { data, .. } => data.len() as u64,
+            ColumnChunkData::Cached { length, .. } => *length as u64,
         }
     }
 }

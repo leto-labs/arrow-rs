@@ -1,3 +1,4 @@
+// Modified by the Longbow authors; see third_party/README.md.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -199,7 +200,7 @@ impl<'a> DataRequestBuilder<'a> {
         // Create an InMemoryRowGroup to hold the column chunks, this is a
         // temporary structure used to tell the ArrowReaders what pages are
         // needed for decoding
-        let row_group = InMemoryRowGroup {
+        let mut row_group = InMemoryRowGroup {
             row_count,
             column_chunks,
             offset_index: get_offset_index(parquet_metadata, row_group_idx),

@@ -1,3 +1,4 @@
+// Modified by the Longbow authors; see third_party/README.md.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -100,6 +101,7 @@
 #[cfg(feature = "encryption")]
 pub mod column_crypto_metadata;
 pub mod metadata;
+pub mod page_cache;
 pub mod page_index;
 pub mod properties;
 pub mod reader;
@@ -114,3 +116,6 @@ const PARQUET_MAGIC_ENCR_FOOTER: [u8; 4] = *b"PARE";
 
 #[cfg(all(test, feature = "crc"))]
 mod page_checksum_tests;
+
+#[cfg(all(test, feature = "arrow", feature = "snap"))]
+mod page_cache_tests;

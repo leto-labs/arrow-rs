@@ -1,3 +1,4 @@
+// Modified by the Longbow authors; see third_party/README.md.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -195,6 +196,9 @@ pub struct ParquetMetaData {
     /// Optional file decryptor
     #[cfg(feature = "encryption")]
     file_decryptor: Option<Box<FileDecryptor>>,
+    /// Longbow family DPC: the decompressed page cache of this file
+    /// generation, if the engine attached one. Not part of equality.
+    page_cache: crate::file::page_cache::PageCacheSlot,
 }
 
 impl ParquetMetaData {
@@ -208,7 +212,27 @@ impl ParquetMetaData {
             offset_index: None,
             #[cfg(feature = "encryption")]
             file_decryptor: None,
+            page_cache: Default::default(),
         }
+    }
+
+    /// Returns this metadata with `cache` as the decompressed page cache of
+    /// its file (Longbow family DPC). Every reader built from the returned
+    /// value looks pages up in `cache` before it reads and decompresses them.
+    ///
+    /// The caller guarantees that `cache` holds pages of exactly the file
+    /// generation that this metadata describes.
+    pub fn with_page_cache(
+        mut self,
+        cache: Option<Arc<dyn crate::file::page_cache::PageCache>>,
+    ) -> Self {
+        self.page_cache = crate::file::page_cache::PageCacheSlot(cache);
+        self
+    }
+
+    /// The decompressed page cache attached with [`Self::with_page_cache`].
+    pub fn page_cache(&self) -> Option<&Arc<dyn crate::file::page_cache::PageCache>> {
+        self.page_cache.0.as_ref()
     }
 
     /// Adds [`FileDecryptor`] to this metadata instance to enable decryption of
@@ -2047,9 +2071,9 @@ mod tests {
             .build();
 
         #[cfg(not(feature = "encryption"))]
-        let base_expected_size = 2734;
+        let base_expected_size = 2750;
         #[cfg(feature = "encryption")]
-        let base_expected_size = 2902;
+        let base_expected_size = 2918;
 
         assert_eq!(parquet_meta.memory_size(), base_expected_size);
 
@@ -2078,9 +2102,9 @@ mod tests {
             .build();
 
         #[cfg(not(feature = "encryption"))]
-        let bigger_expected_size = 3160;
+        let bigger_expected_size = 3176;
         #[cfg(feature = "encryption")]
-        let bigger_expected_size = 3328;
+        let bigger_expected_size = 3344;
 
         // more set fields means more memory usage
         assert!(bigger_expected_size > base_expected_size);
@@ -2127,7 +2151,7 @@ mod tests {
             .set_row_groups(row_group_meta.clone())
             .build();
 
-        let base_expected_size = 2042;
+        let base_expected_size = 2058;
         assert_eq!(parquet_meta_data.memory_size(), base_expected_size);
 
         let footer_key = "0123456789012345".as_bytes();
