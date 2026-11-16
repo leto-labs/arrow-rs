@@ -15,13 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Flat nullable primitives: dense decode windows, sequential logical output.
+//! Flat nullable primitives: one dense decode into the output, then an
+//! in-place expansion to logical slots, backwards, from the validity bitmap.
 pub(super) use crate::util::native::native;
 use std::mem::MaybeUninit;
 
 use crate::errors::{ParquetError, Result};
-
-const WINDOW: usize = 1024;
 
 fn low_mask(count: usize) -> u64 {
     if count == 64 {
@@ -65,7 +64,6 @@ impl<T> Drop for RestoreLength<'_, T> {
 /// than a claimed read count alone, bounds every subsequent native load.
 pub(super) fn read<T: Default + Clone + 'static>(
     out: &mut Vec<T>,
-    dense: &mut Vec<T>,
     physical: usize,
     logical: usize,
     validity: &[u8],
@@ -81,9 +79,9 @@ pub(super) fn read<T: Default + Clone + 'static>(
     if allow_native && !cfg!(miri) && std::is_x86_feature_detected!("popcnt") {
         // SAFETY: POPCNT is checked here. read_impl validates all value, bitmap,
         // and output extents independently of this CPU specialization.
-        return unsafe { read_popcnt(out, dense, physical, logical, validity, offset, fill) };
+        return unsafe { read_popcnt(out, physical, logical, validity, offset, fill) };
     }
-    read_impl(out, dense, physical, logical, validity, offset, fill)
+    read_impl(out, physical, logical, validity, offset, fill)
 }
 
 /// # Safety
@@ -92,20 +90,18 @@ pub(super) fn read<T: Default + Clone + 'static>(
 #[target_feature(enable = "popcnt")]
 unsafe fn read_popcnt<T: Default + Clone + 'static>(
     out: &mut Vec<T>,
-    dense: &mut Vec<T>,
     physical: usize,
     logical: usize,
     validity: &[u8],
     offset: usize,
     fill: impl FnMut(&mut Vec<T>, usize) -> Result<usize>,
 ) -> Result<usize> {
-    read_impl(out, dense, physical, logical, validity, offset, fill)
+    read_impl(out, physical, logical, validity, offset, fill)
 }
 
 #[inline(always)]
 fn read_impl<T: Default + Clone + 'static>(
     out: &mut Vec<T>,
-    dense: &mut Vec<T>,
     physical: usize,
     logical: usize,
     validity: &[u8],
@@ -148,97 +144,64 @@ fn read_impl<T: Default + Clone + 'static>(
     let out_end = start
         .checked_add(logical)
         .ok_or_else(|| general_err!("output length overflow"))?;
-    if physical == logical {
-        let mut guard = RestoreLength { out, keep: start };
-        let n = fill(&mut *guard.out, physical)?;
-        if n != physical || guard.out.len() != out_end {
-            return Err(general_err!(
-                "insufficient values read from column - expected: {}, got: {}",
-                physical,
-                n
-            ));
-        }
-        guard.keep = out_end;
-        return Ok(n);
-    }
     if physical == 0 {
         out.resize(out_end, T::default());
         return Ok(0);
     }
     out.reserve(logical);
-    dense.clear();
-    // Fix the window capacity before appending. Amortized growth after small
-    // pages could otherwise allocate more than WINDOW on a later large page.
-    if dense.capacity() < WINDOW {
-        dense.reserve_exact(WINDOW);
+    let mut guard = RestoreLength { out, keep: start };
+    // The physical values land at the start of the logical range, so that
+    // the decoder writes one contiguous run however the NULLs fall.
+    let n = fill(&mut *guard.out, physical)?;
+    if n != physical || guard.out.len() != start + physical {
+        return Err(general_err!(
+            "insufficient values read from column - expected: {}, got: {}",
+            physical,
+            n
+        ));
     }
-    let mut remaining = physical;
-    let mut cursor = 0;
-    let mut written = 0;
-    while written < logical {
-        if cursor == dense.len() && remaining != 0 {
-            dense.clear();
-            let want = remaining.min(WINDOW);
-            let n = fill(dense, want)?;
-            if n != want || dense.len() != want {
-                let got = (physical - remaining).saturating_add(n);
-                return Err(general_err!(
-                    "insufficient values read from column - expected: {}, got: {}",
-                    physical,
-                    got
-                ));
-            }
-            remaining -= n;
-            cursor = 0;
-        }
-        let mut count = (logical - written).min(64);
-        let mut mask = mask_at(validity, offset + written, count);
-        let available = dense.len() - cursor;
-        if mask.count_ones() as usize > available {
-            if available == 0 {
-                return Err(general_err!("short spaced value window"));
-            }
-            // End this logical prefix at the final value in the dense window.
-            // Every following decode still requests 1024 physical values, so
-            // dictionary bit-unpacking retains its byte-aligned bulk path.
-            let mut bits = mask;
-            for _ in 1..available {
-                bits &= bits - 1;
-            }
-            count = bits.trailing_zeros() as usize + 1;
-            mask &= low_mask(count);
-        }
-        let take = mask.count_ones() as usize;
-        expand(
-            &dense[cursor..cursor + take],
-            &mut out.spare_capacity_mut()[written..written + count],
-            mask,
-            count,
-        )?;
-        cursor += take;
-        written += count;
+    if physical != logical {
+        guard.out.reserve(logical - physical);
+        // SAFETY: the capacity covers start + logical slots, the first
+        // `physical` of which `fill` initialized (checked by the length
+        // above). MaybeUninit admits the uninitialized rest. The slice is the
+        // only access to the buffer until it ends.
+        let slots = unsafe {
+            std::slice::from_raw_parts_mut(
+                guard.out.as_mut_ptr().add(start).cast::<MaybeUninit<T>>(),
+                logical,
+            )
+        };
+        expand(slots, physical, validity, offset)?;
     }
-    // SAFETY: native T has no drop behavior and every logical slot was written
-    // by expand, including initialized zero/default values in NULL positions.
-    // Errors and panics before this point leave the original Vec length intact.
+    // SAFETY: native T has no drop behavior and every logical slot is
+    // initialized: by fill when all are valid, else by expand, including
+    // zero/default values in NULL positions. Errors and panics before this
+    // point leave the original Vec length intact.
     unsafe {
-        out.set_len(out_end);
+        guard.out.set_len(out_end);
     }
+    guard.keep = out_end;
     Ok(physical)
 }
 
-#[inline(always)]
+/// Moves the `physical` dense values at the start of `slots` to their logical
+/// slots and zeroes the NULL slots, from the last block to the first. A dense
+/// value never sits after its slot (its index counts only the valid slots
+/// before it), and a block's own values are loaded before its store, so no
+/// value is overwritten before it is moved.
 fn expand<T: Default + Clone + 'static>(
-    dense: &[T],
-    out: &mut [MaybeUninit<T>],
-    mask: u64,
-    count: usize,
+    slots: &mut [MaybeUninit<T>],
+    physical: usize,
+    validity: &[u8],
+    offset: usize,
 ) -> Result<()> {
+    let logical = slots.len();
     if !native::<T>()
-        || count > 64
-        || count > out.len()
-        || mask & !low_mask(count) != 0
-        || mask.count_ones() as usize > dense.len()
+        || physical > logical
+        || offset
+            .checked_add(logical)
+            .is_none_or(|end| end.div_ceil(8) > validity.len())
     {
         return Err(general_err!("invalid primitive expansion extent"));
     }
@@ -255,62 +218,87 @@ fn expand<T: Default + Clone + 'static>(
         && std::is_x86_feature_detected!("avx512f")
         && std::is_x86_feature_detected!("popcnt")
     {
-        // SAFETY: exact primitive types, AVX512F/POPCNT, active input lanes and the
-        // complete logical output extent were checked above.
-        unsafe {
-            expand_avx512(dense, &mut out[..count], mask);
-        }
-        return Ok(());
+        // SAFETY: exact primitive types and AVX512F/POPCNT are checked; the
+        // bitmap extent and the dense count are checked above, and the kernel
+        // checks every block's count against the values left.
+        return unsafe { expand_avx512(slots, physical, validity, offset) };
     }
-    let mut cursor = 0;
-    for (i, dst) in out[..count].iter_mut().enumerate() {
-        if mask & (1u64 << i) != 0 {
-            dst.write(dense[cursor].clone());
-            cursor += 1;
+    let mut dense = physical;
+    for i in (0..logical).rev() {
+        let pos = offset + i;
+        if validity[pos / 8] & (1 << (pos % 8)) != 0 {
+            let Some(from) = dense.checked_sub(1) else {
+                return Err(general_err!("validity/value count mismatch"));
+            };
+            dense = from;
+            // SAFETY: slots below `physical` are initialized, and a slot at
+            // or below `from` <= i has not been overwritten yet.
+            let value = unsafe { slots[from].assume_init_read() };
+            slots[i].write(value);
         } else {
-            dst.write(T::default());
+            slots[i].write(T::default());
         }
+    }
+    if dense != 0 {
+        return Err(general_err!("validity/value count mismatch"));
     }
     Ok(())
 }
 
 /// # Safety
-/// AVX512F and POPCNT must be available; T is exactly i32/i64/f32/f64. The mask has no
-/// set bits beyond out.len() <=64, and dense contains at least popcount(mask)
-/// initialized values. Input and output are disjoint exclusive Rust borrows.
+/// AVX512F and POPCNT must be available; T is exactly i32/i64/f32/f64. The
+/// first `physical` slots are initialized and `validity` holds the bits
+/// `offset..offset + slots.len()`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,popcnt")]
-unsafe fn expand_avx512<T>(dense: &[T], out: &mut [MaybeUninit<T>], mask: u64) {
+unsafe fn expand_avx512<T>(
+    slots: &mut [MaybeUninit<T>],
+    physical: usize,
+    validity: &[u8],
+    offset: usize,
+) -> Result<()> {
     use std::arch::x86_64::*;
     debug_assert!(matches!(size_of::<T>(), 4 | 8));
-    let mut cursor = 0;
+    let logical = slots.len();
     let lanes = if size_of::<T>() == 8 { 8 } else { 16 };
-    for (block, dst) in out.chunks_mut(lanes).enumerate() {
-        let valid = (mask >> (block * lanes)) & low_mask(dst.len());
-        // SAFETY: expand-load reads exactly popcount(valid) initialized dense
-        // values; inactive lanes do not access memory. Prefix stores initialize
-        // every logical slot, including NULLs, and never store beyond dst.
+    let base = slots.as_mut_ptr();
+    let mut dense = physical;
+    let mut block = logical.div_ceil(lanes);
+    while block > 0 {
+        block -= 1;
+        let first = block * lanes;
+        let count = (logical - first).min(lanes);
+        let valid = mask_at(validity, offset + first, count);
+        let take = valid.count_ones() as usize;
+        if take > dense {
+            return Err(general_err!("validity/value count mismatch"));
+        }
+        dense -= take;
+        // SAFETY: the masked load reads exactly `take` initialized values at
+        // `dense..dense + take` (below `physical`, not yet overwritten: they
+        // lie at or below `first`, the lowest slot stored so far); masked-off
+        // lanes do not access memory. The expansion is in registers: the
+        // memory form of VPEXPAND is microcoded on Zen 4. The store writes
+        // `count` slots inside `slots`, NULL lanes as zero.
         unsafe {
+            let from = base.add(dense).cast::<u8>();
+            let to = base.add(first).cast::<u8>();
+            let packed = low_mask(take);
             if size_of::<T>() == 8 {
-                let values =
-                    _mm512_maskz_expandloadu_epi64(valid as u8, dense.as_ptr().add(cursor).cast());
-                _mm512_mask_storeu_epi64(
-                    dst.as_mut_ptr().cast(),
-                    low_mask(dst.len()) as u8,
-                    values,
-                );
+                let values = _mm512_maskz_loadu_epi64(packed as u8, from.cast());
+                let values = _mm512_maskz_expand_epi64(valid as u8, values);
+                _mm512_mask_storeu_epi64(to.cast(), low_mask(count) as u8, values);
             } else {
-                let values =
-                    _mm512_maskz_expandloadu_epi32(valid as u16, dense.as_ptr().add(cursor).cast());
-                _mm512_mask_storeu_epi32(
-                    dst.as_mut_ptr().cast(),
-                    low_mask(dst.len()) as u16,
-                    values,
-                );
+                let values = _mm512_maskz_loadu_epi32(packed as u16, from.cast());
+                let values = _mm512_maskz_expand_epi32(valid as u16, values);
+                _mm512_mask_storeu_epi32(to.cast(), low_mask(count) as u16, values);
             }
         }
-        cursor += valid.count_ones() as usize;
     }
+    if dense != 0 {
+        return Err(general_err!("validity/value count mismatch"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -350,21 +338,12 @@ mod tests {
                     }
                     let prefix = make(0x123456789abcdef0);
                     let mut out = vec![prefix.clone(); 3];
-                    let mut cache = Vec::new();
                     let mut cursor = 0;
-                    let n = read(
-                        &mut out,
-                        &mut cache,
-                        dense.len(),
-                        len,
-                        &bitmap,
-                        offset,
-                        |dst, want| {
-                            dst.extend_from_slice(&dense[cursor..cursor + want]);
-                            cursor += want;
-                            Ok(want)
-                        },
-                    )
+                    let n = read(&mut out, dense.len(), len, &bitmap, offset, |dst, want| {
+                        dst.extend_from_slice(&dense[cursor..cursor + want]);
+                        cursor += want;
+                        Ok(want)
+                    })
                     .unwrap();
                     assert_eq!(n, dense.len());
                     assert_eq!(cursor, dense.len());
@@ -373,7 +352,6 @@ mod tests {
                     for (a, b) in out[3..].iter().zip(&expected) {
                         assert_eq!(bits(a), bits(b));
                     }
-                    assert!(cache.len() <= WINDOW);
                 }
             }
         }
@@ -395,7 +373,6 @@ mod tests {
     fn test_spaced_rejects_bad_extents_and_short_reads() {
         crate::util::native::dispatch::for_each_tier(|| {
             let mut out = vec![-17i64, 42];
-            let mut cache = Vec::new();
             for (physical, logical, bitmap, offset) in [
                 (1, 1, vec![], 0),
                 (3, 8, vec![255], 0),
@@ -404,15 +381,9 @@ mod tests {
                 (1, 2, vec![255], usize::MAX),
             ] {
                 assert!(
-                    read(
-                        &mut out,
-                        &mut cache,
-                        physical,
-                        logical,
-                        &bitmap,
-                        offset,
-                        |_, _| panic!("invalid bitmap must not reach decoder")
-                    )
+                    read(&mut out, physical, logical, &bitmap, offset, |_, _| panic!(
+                        "invalid bitmap must not reach decoder"
+                    ))
                     .is_err()
                 );
                 assert_eq!(out, [-17, 42]);
@@ -430,36 +401,27 @@ mod tests {
                 for failure in 0..4 {
                     let mut calls = 0;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        read(
-                            &mut out,
-                            &mut cache,
-                            physical,
-                            logical,
-                            &bitmap,
-                            0,
-                            |dst, want| {
-                                calls += 1;
-                                // For the mixed bitmap fail after some logical slots have
-                                // already been initialized in spare capacity.
-                                if all_valid || calls == 2 {
-                                    if failure == 0 {
-                                        return Err(general_err!("injected read error"));
-                                    }
-                                    if failure == 1 {
-                                        dst.extend(std::iter::repeat_n(5, want - 1));
-                                        return Ok(want - 1);
-                                    }
-                                    if failure == 2 {
-                                        dst.extend(std::iter::repeat_n(5, want));
-                                        return Ok(want + 1);
-                                    }
-                                    dst.push(9);
-                                    panic!("injected read panic");
+                        read(&mut out, physical, logical, &bitmap, 0, |dst, want| {
+                            calls += 1;
+                            // One decode call fills the dense prefix of the output.
+                            if calls == 1 {
+                                if failure == 0 {
+                                    return Err(general_err!("injected read error"));
                                 }
-                                dst.extend(std::iter::repeat_n(7, want));
-                                Ok(want)
-                            },
-                        )
+                                if failure == 1 {
+                                    dst.extend(std::iter::repeat_n(5, want - 1));
+                                    return Ok(want - 1);
+                                }
+                                if failure == 2 {
+                                    dst.extend(std::iter::repeat_n(5, want));
+                                    return Ok(want + 1);
+                                }
+                                dst.push(9);
+                                panic!("injected read panic");
+                            }
+                            dst.extend(std::iter::repeat_n(7, want));
+                            Ok(want)
+                        })
                     }));
                     assert!(result.is_err() || result.unwrap().is_err());
                     assert_eq!(out, [-17, 42]);
@@ -473,18 +435,10 @@ mod tests {
         crate::util::native::dispatch::for_each_tier(|| {
             for (physical, logical, bitmap) in [(8, 8, [255]), (4, 8, [85])] {
                 let mut out = vec![-17i64];
-                let error = read(
-                    &mut out,
-                    &mut Vec::new(),
-                    physical,
-                    logical,
-                    &bitmap,
-                    0,
-                    |dst, want| {
-                        dst.extend(std::iter::repeat_n(7, want - 1));
-                        Ok(want - 1)
-                    },
-                )
+                let error = read(&mut out, physical, logical, &bitmap, 0, |dst, want| {
+                    dst.extend(std::iter::repeat_n(7, want - 1));
+                    Ok(want - 1)
+                })
                 .unwrap_err();
                 assert_eq!(
                     error.to_string(),
@@ -498,73 +452,60 @@ mod tests {
         });
     }
 
+    /// The in-place expansion against a reference: every dense prefix and
+    /// bitmap pattern, unaligned offsets, and sentinels after the slots.
     #[test]
-    fn test_spaced_reuses_bounded_window() {
+    fn test_expand_in_place_masks_and_output_sentinels() {
         crate::util::native::dispatch::for_each_tier(|| {
-            let mut out = Vec::<i64>::new();
-            let mut cache = Vec::new();
-            for physical in [301usize, 601, 1023] {
-                let logical = physical + 1;
-                let mut bitmap = vec![255; logical.div_ceil(8)];
-                bitmap[physical / 8] &= !(1 << (physical % 8));
-                let start = out.len();
-                read(
-                    &mut out,
-                    &mut cache,
-                    physical,
-                    logical,
-                    &bitmap,
-                    0,
-                    |dst, want| {
-                        dst.reserve(want);
-                        dst.extend(std::iter::repeat_n(7, want));
-                        Ok(want)
-                    },
-                )
-                .unwrap();
-                assert!(
-                    cache.capacity() <= WINDOW,
-                    "physical cache capacity {}",
-                    cache.capacity()
-                );
-                assert!(out[start..start + physical].iter().all(|v| *v == 7));
-                assert_eq!(out[start + physical], 0);
-            }
-        });
-    }
-
-    #[test]
-    fn test_expand_masks_and_output_sentinels() {
-        crate::util::native::dispatch::for_each_tier(|| {
-            for count in 0..=8 {
-                for mask in 0u64..=low_mask(count) {
-                    let dense: Vec<i64> = (0..mask.count_ones())
-                        .map(|i| i64::MIN + i as i64)
-                        .collect();
-                    let mut out = [MaybeUninit::new(i64::MAX); 11];
-                    expand(&dense, &mut out[..count], mask, count).unwrap();
-                    let mut cursor = 0;
-                    for (i, slot) in out.iter().enumerate() {
-                        let expected = if i >= count {
-                            i64::MAX
-                        } else if mask & (1 << i) != 0 {
-                            let value = dense[cursor];
-                            cursor += 1;
-                            value
-                        } else {
-                            0
-                        };
-                        // SAFETY: all sentinels were initialized before expand,
-                        // whose successful call initialized every slot in count.
-                        assert_eq!(unsafe { slot.assume_init() }, expected);
+            let mut state = 0x2545_f491_4f6c_dd1du64;
+            for logical in (0usize..=70).chain([127, 128, 129, 1000]) {
+                for offset in [0usize, 1, 7, 13] {
+                    for density in [0u64, 1, 50, 99, 100] {
+                        let mut bitmap = vec![0u8; (offset + logical).div_ceil(8) + 1];
+                        let mut physical = 0;
+                        for i in 0..logical {
+                            state ^= state << 13;
+                            state ^= state >> 7;
+                            state ^= state << 17;
+                            if state % 100 < density {
+                                let pos = offset + i;
+                                bitmap[pos / 8] |= 1 << (pos % 8);
+                                physical += 1;
+                            }
+                        }
+                        let mut slots = vec![MaybeUninit::new(i64::MAX); logical + 3];
+                        for (i, slot) in slots[..physical].iter_mut().enumerate() {
+                            slot.write(i64::MIN + i as i64);
+                        }
+                        expand(&mut slots[..logical], physical, &bitmap, offset).unwrap();
+                        let mut cursor = 0;
+                        for (i, slot) in slots.iter().enumerate() {
+                            let pos = offset + i;
+                            let expected = if i >= logical {
+                                i64::MAX
+                            } else if bitmap[pos / 8] & (1 << (pos % 8)) != 0 {
+                                cursor += 1;
+                                i64::MIN + cursor as i64 - 1
+                            } else {
+                                0
+                            };
+                            // SAFETY: all slots were initialized before expand,
+                            // whose successful call initialized every logical slot.
+                            assert_eq!(unsafe { slot.assume_init() }, expected);
+                        }
+                        if physical > 0 {
+                            // A count that does not match the bitmap is an error.
+                            let mut slots = vec![MaybeUninit::new(0i32); logical];
+                            assert!(expand(&mut slots, physical - 1, &bitmap, offset).is_err());
+                        }
                     }
                 }
             }
-            assert!(expand(&[true], &mut [MaybeUninit::<bool>::uninit(); 1], 1, 1).is_err());
-            let mut out = [MaybeUninit::<i64>::uninit(); 64];
-            assert!(expand(&[], &mut out, 1, 1).is_err());
-            assert!(expand(&[7], &mut out[..1], 2, 1).is_err());
-            assert!(expand(&[7], &mut out, 0, 65).is_err());
+            let mut slots = [MaybeUninit::<bool>::uninit(); 1];
+            assert!(expand(&mut slots, 1, &[1], 0).is_err());
+            let mut slots = [MaybeUninit::<i64>::uninit(); 9];
+            assert!(expand(&mut slots, 1, &[1], 0).is_err());
+            assert!(expand(&mut slots[..8], 9, &[255], 0).is_err());
         });
     }
 }

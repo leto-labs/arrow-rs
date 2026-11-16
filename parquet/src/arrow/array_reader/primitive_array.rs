@@ -468,9 +468,20 @@ mod tests {
                 })
                     .map(|i| (i as i64).wrapping_mul(i64::MIN + 123))
                     .collect();
+                // Built once per width: dictionaries reach 2^24 entries.
+                let dictionary_page = Bytes::from(
+                    dictionary
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect::<Vec<_>>(),
+                );
                 for v2 in [false, true] {
-                    for pattern in 0..5 {
-                        let nullable = pattern != 0;
+                    // Patterns 5 and 6 are run-heavy, as surrogate keys
+                    // written in order of a parent key: repeated IDs in runs
+                    // of 1 to 40, and (5) NULLs in runs as well.
+                    for pattern in 0..7 {
+                        let nullable = pattern != 0 && pattern != 6;
+                        let (mut run_left, mut run_id, mut null_left) = (0usize, 0usize, 0usize);
                         let schema = parse_message_type(if nullable {
                             "message test { OPTIONAL INT64 value; }"
                         } else {
@@ -482,26 +493,33 @@ mod tests {
                         let mut expected = Vec::new();
                         for _ in 0..2 {
                             let mut pages = vec![Page::DictionaryPage {
-                                buf: Bytes::from(
-                                    dictionary
-                                        .iter()
-                                        .flat_map(|v| v.to_le_bytes())
-                                        .collect::<Vec<_>>(),
-                                ),
+                                buf: dictionary_page.clone(),
                                 num_values: dictionary.len() as u32,
                                 encoding: Encoding::PLAIN,
                                 is_sorted: false,
                             }];
-                            for rows in [17usize, 129, 513] {
+                            let page_rows: &[usize] = if pattern >= 5 {
+                                &[17, 513, 4099]
+                            } else {
+                                &[17, 129, 513]
+                            };
+                            for &rows in page_rows {
                                 let mut levels = RleEncoder::new(1, 8192);
                                 let mut ids = RleEncoder::new(width, 65536);
                                 let mut validity = Vec::new();
                                 let mut num_valid = 0;
                                 for i in 0..rows {
                                     let valid = match pattern {
-                                        0 | 1 => true,
+                                        0 | 1 | 6 => true,
                                         2 => rng.random_bool(0.65),
                                         3 => false,
+                                        5 => {
+                                            if null_left == 0 && rng.random_ratio(1, 20) {
+                                                null_left = rng.random_range(1..12);
+                                            }
+                                            null_left = null_left.saturating_sub(1);
+                                            null_left == 0
+                                        }
                                         _ => i % 2 == 0,
                                     };
                                     validity.push(valid);
@@ -509,6 +527,13 @@ mod tests {
                                     if valid {
                                         let id = if i == 0 {
                                             dictionary.len() - 1
+                                        } else if pattern >= 5 {
+                                            if run_left == 0 {
+                                                run_left = rng.random_range(1..=40);
+                                                run_id = rng.random_range(0..dictionary.len());
+                                            }
+                                            run_left -= 1;
+                                            run_id
                                         } else if i % 97 < 32 {
                                             0
                                         } else {

@@ -410,6 +410,7 @@ impl RleEncoder {
 }
 
 mod fused;
+mod runs;
 
 /// Size, in number of `i32s` of buffer to use for RLE batch reading
 const RLE_DECODER_INDEX_BUFFER_SIZE: usize = 1024;
@@ -625,7 +626,7 @@ impl RleDecoder {
         T: Default + Clone + 'static,
     {
         assert!(buffer.len() >= max_values);
-        if fused::native::<T>() && self.bit_width <= 24 {
+        if fused::native::<T>() {
             // SAFETY: MaybeUninit<T> has T's layout and permits initialized T.
             // Only exact no-drop primitives enter here. The mutable borrow is
             // exclusive and the decoder only overwrites slots, never reads them.
@@ -788,9 +789,7 @@ impl RleDecoder {
                         id
                     )
                 })?;
-                for slot in &mut out[written..written + n] {
-                    slot.write(value.clone());
-                }
+                runs::fill(&mut out[written..], n, value);
                 written += n;
                 self.rle_left -= n as u32;
             } else if self.bit_packed_left > 0 {
@@ -798,7 +797,14 @@ impl RleDecoder {
                     .bit_reader
                     .as_mut()
                     .ok_or_else(|| general_err!("bit_reader should be set"))?;
-                let n = (out.len() - written).min(self.bit_packed_left as usize);
+                let mut n = (out.len() - written).min(self.bit_packed_left as usize);
+                // Packed runs hold whole groups of eight values. A cursor
+                // inside a group decodes only up to the group's end, so that
+                // the fused kernels take the rest of the run.
+                let to_group = self.bit_packed_left as usize % 8;
+                if to_group != 0 {
+                    n = n.min(to_group);
+                }
                 if let Some(data) = reader.aligned_remaining()
                     && let Some(result) =
                         fused::decode(data, self.bit_width, dict, &mut out[written..written + n])
@@ -829,8 +835,12 @@ impl RleDecoder {
                 }
                 written += n;
                 self.bit_packed_left -= n as u32;
-            } else if !self.reload()? {
-                break;
+            } else {
+                let n = self.dictionary_runs(dict, &mut out[written..])?;
+                written += n;
+                if n == 0 && self.rle_left == 0 && self.bit_packed_left == 0 && !self.reload()? {
+                    break;
+                }
             }
         }
         Ok(written)

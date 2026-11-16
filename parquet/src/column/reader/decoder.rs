@@ -322,8 +322,6 @@ pub struct ColumnValueDecoderImpl<T: DataType> {
     /// Uses `EncodingMask` and dense storage keyed by encoding discriminant.
     decoder_mask: EncodingMask,
     decoders: [Option<Box<dyn Decoder<T>>>; ENCODING_SLOTS],
-    /// Reused physical decode window for nullable primitive output.
-    spaced_values: Vec<T::T>,
 }
 
 impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
@@ -335,7 +333,6 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
             current_encoding: None,
             decoder_mask: EncodingMask::default(),
             decoders: std::array::from_fn(|_| None),
-            spaced_values: Vec::new(),
         }
     }
 
@@ -444,7 +441,6 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
             .expect("current decoder should be set");
         super::spaced::read(
             out,
-            &mut self.spaced_values,
             num_values,
             num_levels,
             validity,

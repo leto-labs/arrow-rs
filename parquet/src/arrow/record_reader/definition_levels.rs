@@ -286,11 +286,14 @@ impl DefinitionLevelDecoder for DefinitionLevelBufferDecoder {
                     return Ok((count, count)); // values_read == levels_read when all valid
                 }
 
-                // Normal path: decode RLE data into the bitmap
+                // Normal path: decode RLE data into the bitmap, counting the
+                // set bits as they are written.
                 let start = nulls.len();
-                let levels_read = decoder.read(nulls, num_levels)?;
-
-                let values_read = count_set_bits(nulls.as_slice(), start..start + levels_read);
+                let (levels_read, values_read) = decoder.read(nulls, num_levels)?;
+                debug_assert_eq!(
+                    values_read,
+                    count_set_bits(nulls.as_slice(), start..start + levels_read)
+                );
                 Ok((values_read, levels_read))
             }
             _ => unreachable!("inconsistent null mask"),
@@ -302,6 +305,107 @@ impl DefinitionLevelDecoder for DefinitionLevelBufferDecoder {
             MaybePacked::Fallback(decoder) => decoder.skip_def_levels(num_levels),
             MaybePacked::Packed(decoder) => decoder.skip(num_levels),
         }
+    }
+}
+
+/// Little-endian word of `data` at byte `byte`, zero past the end.
+#[inline(always)]
+fn load_word(data: &[u8], byte: usize) -> u64 {
+    match data.get(byte..byte + 8) {
+        Some(word) => u64::from_le_bytes(word.try_into().unwrap()),
+        None => {
+            let mut word = [0u8; 8];
+            let tail = data.get(byte..).unwrap_or(&[]);
+            word[..tail.len()].copy_from_slice(tail);
+            u64::from_le_bytes(word)
+        }
+    }
+}
+
+/// Appends bits to a zeroed bitmap through one register word. Only whole
+/// little-endian words at multiples of eight bytes are stored, so a run never
+/// reloads bytes that the previous run stored.
+struct Appender<'a> {
+    bits: &'a mut [u8],
+    /// Byte offset of the word in `word`.
+    byte: usize,
+    word: u64,
+    /// Bits of `word` in use.
+    used: usize,
+}
+
+impl<'a> Appender<'a> {
+    /// `bits` holds the bitmap and at least eight bytes after bit `pos`.
+    #[inline(always)]
+    fn new(bits: &'a mut [u8], pos: usize) -> Self {
+        let byte = pos / 64 * 8;
+        let word = u64::from_le_bytes(bits[byte..byte + 8].try_into().unwrap());
+        let used = pos % 64;
+        Self {
+            bits,
+            byte,
+            word: word & ((1u64 << used) - 1),
+            used,
+        }
+    }
+
+    /// Appends the low `count` bits of `value`, at most 64. Branch-free: the
+    /// current word is stored every time (a later store of the same word
+    /// replaces it), and the bits that did not fit start the next word.
+    #[inline(always)]
+    fn push(&mut self, value: u64, count: usize) {
+        debug_assert!(count <= 64 && self.used < 64);
+        let value =
+            value & (u64::MAX >> ((64 - count) & 63)) & 0u64.wrapping_sub((count != 0) as u64);
+        let word = self.word | (value << self.used);
+        self.bits[self.byte..self.byte + 8].copy_from_slice(&word.to_le_bytes());
+        let total = self.used + count;
+        // `value >> (64 - used)`, zero when used is zero (a 64-bit value then
+        // fills the word exactly).
+        let carry = ((value >> 1) >> (63 - self.used)) & 0u64.wrapping_sub((self.used != 0) as u64);
+        let next = total >= 64;
+        self.word = if next { carry } else { word };
+        self.byte += (next as usize) * 8;
+        self.used = total & 63;
+    }
+
+    #[inline(always)]
+    fn ones(&mut self, mut count: usize) {
+        while count > 64 {
+            self.push(u64::MAX, 64);
+            count -= 64;
+        }
+        self.push(u64::MAX, count);
+    }
+
+    #[inline(always)]
+    fn zeros(&mut self, mut count: usize) {
+        while count > 64 {
+            self.push(0, 64);
+            count -= 64;
+        }
+        self.push(0, count);
+    }
+
+    /// Appends `count` bits of `src` from bit `from`. Returns how many are set.
+    #[inline(always)]
+    fn copy(&mut self, src: &[u8], mut from: usize, mut count: usize) -> usize {
+        let mut set = 0;
+        while count > 0 {
+            let n = count.min(56);
+            let value = (load_word(src, from / 8) >> (from % 8)) & ((1u64 << n) - 1);
+            self.push(value, n);
+            set += value.count_ones() as usize;
+            from += n;
+            count -= n;
+        }
+        set
+    }
+
+    /// Stores the partial word.
+    #[inline(always)]
+    fn finish(self) {
+        self.bits[self.byte..self.byte + 8].copy_from_slice(&self.word.to_le_bytes());
     }
 }
 
@@ -350,7 +454,15 @@ impl PackedDecoder {
     }
 
     /// Decodes a VLQ encoded little endian integer and returns it
+    #[inline]
     fn decode_header(&mut self) -> Result<i64> {
+        // Runs shorter than 64 levels have a one-byte header.
+        if let Some(&byte) = self.data.as_ref().get(self.data_offset)
+            && byte < 0x80
+        {
+            self.data_offset += 1;
+            return Ok(byte as i64);
+        }
         let mut offset = 0;
         let mut v: i64 = 0;
         while offset < 10 {
@@ -433,31 +545,132 @@ impl PackedDecoder {
         Ok(None)
     }
 
-    fn read(&mut self, buffer: &mut BooleanBufferBuilder, len: usize) -> Result<usize> {
-        let mut read = 0;
-        while read != len {
+    /// Appends `len` levels to `buffer` as validity bits. Returns the levels
+    /// read and how many of them are set. The bits are written in place with
+    /// word stores: a repeated run sets a bit range, a packed run copies its
+    /// bytes at the bitmap's bit offset.
+    fn read(&mut self, buffer: &mut BooleanBufferBuilder, len: usize) -> Result<(usize, usize)> {
+        let start = buffer.len();
+        // Zeroed bits for the levels and eight bytes of slack for the last
+        // word store; truncated on return.
+        buffer.advance(len + 64);
+        let mut out = Appender::new(buffer.as_slice_mut(), start);
+        let end = start + len;
+        let mut pos = start;
+        let mut valid = 0;
+        let mut result = Ok(());
+        while pos != end {
             if self.rle_left != 0 {
-                let to_read = self.rle_left.min(len - read);
-                buffer.append_n(to_read, self.rle_value);
-                self.rle_left -= to_read;
-                read += to_read;
+                let n = self.rle_left.min(end - pos);
+                if self.rle_value {
+                    out.ones(n);
+                    valid += n;
+                } else {
+                    out.zeros(n);
+                }
+                self.rle_left -= n;
+                pos += n;
             } else if self.packed_count != self.packed_offset {
-                let to_read = (self.packed_count - self.packed_offset).min(len - read);
+                let n = (self.packed_count - self.packed_offset).min(end - pos);
                 let offset = self.data_offset * 8 + self.packed_offset;
-                buffer.append_packed_range(offset..offset + to_read, self.data.as_ref());
-                self.packed_offset += to_read;
-                read += to_read;
+                // `Appender::copy` reads zeros past the data, which would be
+                // NULL levels. A packed run longer than the data is an error
+                // (`append_packed_range` panicked here before).
+                if offset + n > self.data.len() * 8 {
+                    result = Err(ParquetError::EOF(
+                        "unexpected end of file whilst decoding definition levels bit-packed run"
+                            .into(),
+                    ));
+                    break;
+                }
+                valid += out.copy(self.data.as_ref(), offset, n);
+                self.packed_offset += n;
+                pos += n;
 
                 if self.packed_offset == self.packed_count {
                     self.data_offset += self.packed_count / 8;
                 }
             } else if self.data_offset == self.data.len() {
                 break;
-            } else {
-                self.next_rle_block()?
+            } else if let Some((levels, set)) = self.whole_runs(&mut out, end - pos) {
+                pos += levels;
+                valid += set;
+            } else if let Err(error) = self.next_rle_block() {
+                result = Err(error);
+                break;
             }
         }
-        Ok(read)
+        out.finish();
+        buffer.truncate(pos);
+        result.map(|()| (pos - start, valid))
+    }
+
+    /// Decodes runs with one-byte headers from a local cursor until `end`,
+    /// the data, or a run that needs `next_rle_block` (a longer header, a
+    /// missing value byte). A run that `end` cuts is left in the decoder
+    /// state, as `next_rle_block` leaves it. Returns the levels and set bits
+    /// written, or `None` when no header was consumed and the next run needs
+    /// the general path.
+    #[inline(always)]
+    fn whole_runs(&mut self, out: &mut Appender<'_>, len: usize) -> Option<(usize, usize)> {
+        let data = self.data.as_ref();
+        let mut offset = self.data_offset;
+        let (start, end) = (0, len);
+        let mut pos = start;
+        let mut valid = 0;
+        while pos != end {
+            let Some(&header) = data.get(offset) else {
+                break;
+            };
+            if header >= 0x80 {
+                break;
+            }
+            let run = (header >> 1) as usize;
+            if header & 1 == 1 {
+                // A packed run longer than the data takes the general path
+                // (`next_rle_block`), which reports it.
+                let bytes = run;
+                if bytes > data.len() - offset - 1 {
+                    break;
+                }
+                let count = bytes * 8;
+                let n = count.min(end - pos);
+                valid += out.copy(data, (offset + 1) * 8, n);
+                pos += n;
+                if n < count {
+                    self.data_offset = offset + 1;
+                    self.packed_count = count;
+                    self.packed_offset = n;
+                    return Some((pos - start, valid));
+                }
+                offset += 1 + bytes;
+            } else {
+                let Some(&value) = data.get(offset + 1) else {
+                    break;
+                };
+                let n = run.min(end - pos);
+                if value != 0 {
+                    out.ones(n);
+                    valid += n;
+                } else {
+                    out.zeros(n);
+                }
+                pos += n;
+                offset += 2;
+                if n < run {
+                    self.data_offset = offset;
+                    self.rle_left = run - n;
+                    self.rle_value = value != 0;
+                    return Some((pos - start, valid));
+                }
+            }
+        }
+        // Packed state is complete here: the next read starts at a header.
+        self.packed_count = 0;
+        self.packed_offset = 0;
+        let progress = offset != self.data_offset;
+        self.data_offset = offset;
+        progress.then_some((pos - start, valid))
     }
 
     /// Skips `level_num` definition levels
@@ -520,6 +733,62 @@ mod tests {
         let bitmap = bitmap.finish();
         for (idx, def) in def_levels.iter().enumerate() {
             assert_eq!(bitmap.value(idx), *def >= 2);
+        }
+    }
+
+    /// The word appender against a bit-by-bit reference: every start offset,
+    /// runs of ones and zeros of 0 to 200 bits, and copied bit ranges.
+    #[test]
+    fn test_appender_matches_reference() {
+        let mut state = 0x1234_5678_9abc_def1u64;
+        let src: Vec<u8> = (0..64)
+            .map(|i| (i as u8).wrapping_mul(151) ^ 0x5a)
+            .collect();
+        for start in 0..130 {
+            let mut bits = vec![0u8; 256];
+            let mut expected = vec![false; 2048];
+            for i in 0..start {
+                if i % 3 == 0 {
+                    bits[i / 8] |= 1 << (i % 8);
+                    expected[i] = true;
+                }
+            }
+            let mut out = Appender::new(&mut bits, start);
+            let mut pos = start;
+            while pos < 1400 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let n = (state % 201) as usize;
+                match state >> 62 {
+                    0 => {
+                        out.ones(n);
+                        expected[pos..pos + n].fill(true);
+                    }
+                    1 => out.zeros(n),
+                    _ => {
+                        let from = (state >> 8) as usize % 200;
+                        let set = out.copy(&src, from, n);
+                        let mut count = 0;
+                        for i in 0..n {
+                            let bit = (src[(from + i) / 8] >> ((from + i) % 8)) & 1 == 1;
+                            expected[pos + i] = bit;
+                            count += bit as usize;
+                        }
+                        assert_eq!(set, count);
+                    }
+                }
+                pos += n;
+            }
+            out.finish();
+            for (i, &bit) in expected[..pos].iter().enumerate() {
+                assert_eq!(
+                    (bits[i / 8] >> (i % 8)) & 1 == 1,
+                    bit,
+                    "start={start} bit={i}"
+                );
+            }
+            assert!(bits[pos.div_ceil(8) + 8..].iter().all(|&b| b == 0));
         }
     }
 
@@ -598,7 +867,7 @@ mod tests {
                 skip_level += skip_level_num
             } else {
                 let mut decoded = BooleanBufferBuilder::new(to_read_or_skip_level);
-                let read_level_num = decoder.read(&mut decoded, to_read_or_skip_level).unwrap();
+                let read_level_num = decoder.read(&mut decoded, to_read_or_skip_level).unwrap().0;
                 read_level += read_level_num;
                 for i in 0..read_level_num {
                     assert!(!decoded.is_empty());
@@ -699,5 +968,28 @@ mod tests {
             err.to_string(),
             "Parquet error: Invalid or corrupted RLE run length 18446744073709551615. Max allowed is 2147483647"
         );
+    }
+
+    /// A bit-packed run that declares more groups than the data holds is an
+    /// error on both header paths, and writes no levels. The word appender
+    /// reads zeros past the data, so it must not see such a run.
+    #[test]
+    fn test_packed_decoder_run_past_data() {
+        // One-byte header (the local run loop) and a two-byte header
+        // (`next_rle_block`), each with one byte of levels.
+        for header in [vec![(4 << 1) | 1], vec![0x81, 0x01]] {
+            let mut data = header;
+            data.push(0b0101_0101);
+            let mut decoder = PackedDecoder::new();
+            decoder.set_data(Encoding::RLE, Bytes::from(data));
+            let mut decoded = BooleanBufferBuilder::new(0);
+            decoded.append_n(3, true);
+            let err = decoder.read(&mut decoded, 32).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "EOF: unexpected end of file whilst decoding definition levels bit-packed run"
+            );
+            assert_eq!(decoded.len(), 3);
+        }
     }
 }
