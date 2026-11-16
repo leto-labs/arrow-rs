@@ -237,3 +237,11 @@ definition-level decoder tests. The page-level characterization
 `test_fused_dictionary_widths_pages_and_nulls` adds two run-heavy patterns
 (repeated IDs in runs of 1 to 40, with and without NULL runs) to its widths
 1 to 32, V1/V2 pages and batch sizes.
+
+DPC follow-up (rle.34): `PageCache::pin` is an optional, nonwaiting atomic
+lease over page offsets. A supporting engine keeps the entries visible and
+charged until the last lease drops, including during pool reclamation or a
+clear. Unsupported handles return `None`, so native prefetch fetches bytes.
+Leasing records no access; decoder lookups count actual reads. Longbow uses
+this to retain pages from prefetch admission through queued units and decode
+without replacing a file's metadata or rebuilding its Arrow schema.

@@ -139,6 +139,18 @@ pub trait PageCache: Debug + Send + Sync {
     /// Returns the page that starts at `offset` if it is resident, without
     /// recording an access. Used to step over a page that is not read.
     fn probe(&self, offset: u64) -> Option<CachedPage>;
+
+    /// Atomically leases all named pages, or returns `None` without a lease.
+    /// Until the last lease is dropped, `get` and `probe` must still find these
+    /// pages, including after reclamation or a clear. The embedding engine
+    /// retains their memory charge. Acquiring a lease records no page access;
+    /// the decoder's later `get` records its read. This method never waits.
+    ///
+    /// The default does not support leases. An external prefetcher must then
+    /// fetch the encoded bytes instead of relying on residency probes alone.
+    fn pin(&self, _offsets: &[u64]) -> Option<Arc<dyn Send + Sync>> {
+        None
+    }
 }
 
 /// The handle of a file's page cache as a field of its metadata. It takes no
