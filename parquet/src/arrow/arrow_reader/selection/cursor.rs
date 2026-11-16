@@ -22,7 +22,7 @@
 //! matching [`RowSelectionCursor`], which keeps the per-reader position while
 //! the selection itself stays immutable.
 
-use super::{RowSelection, RowSelector};
+use super::{MaskRunIter, RowSelection, RowSelector};
 use crate::errors::ParquetError;
 use arrow_array::BooleanArray;
 use arrow_buffer::BooleanBuffer;
@@ -30,6 +30,13 @@ use arrow_buffer::bit_chunk_iterator::BitChunks;
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
+
+#[cfg(test)]
+std::thread_local! {
+    /// Run boundary discoveries of mask-backed selector cursors, to check the
+    /// work without timing.
+    static MASK_RUN_DISCOVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Policy for picking a strategy to materialize [`RowSelection`] during execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,6 +113,11 @@ impl RowSelectionStrategy {
                 selection.into_boolean_buffer(),
                 loaded_row_ranges,
             ),
+            // A mask-backed selection keeps its bitmap: the cursor streams
+            // its runs instead of building the selector queue up front.
+            Self::Selectors if selection.as_mask().is_some() => {
+                RowSelectionCursor::new_mask_selectors(selection.into_boolean_buffer())
+            }
             Self::Selectors => RowSelectionCursor::new_selectors(selection.into()),
         }
     }
@@ -146,8 +158,19 @@ impl RowSelectionCursor {
     /// Create a [`RowSelectionCursor::Selectors`] from the provided selectors
     pub(crate) fn new_selectors(selectors: Vec<RowSelector>) -> Self {
         Self::Selectors(SelectorsCursor {
-            selectors: selectors.into(),
+            selectors: SelectorSource::Queue(selectors.into()),
             position: 0,
+            known_run_end: 0,
+        })
+    }
+
+    /// Create a [`RowSelectionCursor::Selectors`] that streams the runs of a
+    /// bitmap, which must not end with a skip.
+    pub(crate) fn new_mask_selectors(mask: BooleanBuffer) -> Self {
+        Self::Selectors(SelectorsCursor {
+            selectors: SelectorSource::Mask(mask),
+            position: 0,
+            known_run_end: 0,
         })
     }
 
@@ -157,26 +180,70 @@ impl RowSelectionCursor {
     }
 }
 
-/// Cursor for iterating a selector-backed [`RowSelection`]
+/// The runs of a [`SelectorsCursor`]: a queue of selectors, or the bitmap of
+/// a mask-backed selection, whose runs are found as the cursor reaches them.
+#[derive(Debug)]
+enum SelectorSource {
+    Queue(VecDeque<RowSelector>),
+    Mask(BooleanBuffer),
+}
+
+#[cfg(test)]
+impl SelectorSource {
+    /// Selectors that the source holds memory for.
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Queue(queue) => queue.capacity(),
+            Self::Mask(_) => 0,
+        }
+    }
+}
+
+/// Cursor for iterating a [`RowSelection`] as selected and skipped runs.
 ///
 /// This is best for sparse selections where large contiguous
-/// blocks of rows are selected or skipped.
+/// blocks of rows are selected or skipped. A mask-backed selection keeps its
+/// bitmap, and the cursor finds each run when it reaches it, so the cursor
+/// holds no selector queue.
 #[derive(Debug)]
 pub struct SelectorsCursor {
-    selectors: VecDeque<RowSelector>,
+    selectors: SelectorSource,
     /// Current absolute offset into the selection
     position: usize,
+    /// For a bitmap: the end of the run that contains `position`, once found.
+    /// A run that the reader returns in part is not searched again.
+    known_run_end: usize,
 }
 
 impl SelectorsCursor {
     /// Returns `true` when no further rows remain
     pub fn is_empty(&self) -> bool {
-        self.selectors.is_empty()
+        match &self.selectors {
+            SelectorSource::Mask(mask) => self.position >= mask.len(),
+            SelectorSource::Queue(queue) => queue.is_empty(),
+        }
     }
 
     /// Return the next [`RowSelector`]
     pub(crate) fn next_selector(&mut self) -> RowSelector {
-        let selector = self.selectors.pop_front().unwrap();
+        let selector = match &mut self.selectors {
+            SelectorSource::Mask(mask) => {
+                if self.position < self.known_run_end {
+                    RowSelector {
+                        row_count: self.known_run_end - self.position,
+                        skip: !mask.value(self.position),
+                    }
+                } else {
+                    let remaining = mask.slice(self.position, mask.len() - self.position);
+                    #[cfg(test)]
+                    MASK_RUN_DISCOVERIES.with(|count| count.set(count.get() + 1));
+                    let run = MaskRunIter::new(&remaining).next().unwrap();
+                    self.known_run_end = self.position + run.row_count;
+                    run
+                }
+            }
+            SelectorSource::Queue(queue) => queue.pop_front().unwrap(),
+        };
         self.position += selector.row_count;
         selector
     }
@@ -184,7 +251,11 @@ impl SelectorsCursor {
     /// Return a selector to the front, rewinding the position
     pub(crate) fn return_selector(&mut self, selector: RowSelector) {
         self.position = self.position.saturating_sub(selector.row_count);
-        self.selectors.push_front(selector);
+        // A bitmap rewinds within the run that it found: the next call
+        // returns the rest of that run without searching it again.
+        if let SelectorSource::Queue(queue) = &mut self.selectors {
+            queue.push_front(selector);
+        }
     }
 }
 
@@ -647,5 +718,266 @@ mod tests {
         assert_eq!(second.selected_rows, 1);
 
         assert!(cursor.next_mask_chunk(2).is_none());
+    }
+
+    #[test]
+    fn million_row_alternating_mask_streams_runs_without_run_vector() {
+        use crate::arrow::arrow_reader::ReadPlanBuilder;
+        let rows = 1_048_576;
+        let mask = BooleanBuffer::collect_bool(rows, |i| i % 2 == 0);
+        let mut plan = ReadPlanBuilder::new(8192)
+            .with_selection(Some(RowSelection::from_boolean_buffer(mask)))
+            .with_row_selection_policy(RowSelectionPolicy::Selectors)
+            .build();
+        let RowSelectionCursor::Selectors(cursor) = plan.row_selection_cursor_mut() else {
+            panic!("expected selector execution");
+        };
+        // The bitmap is the selection's own storage; the cursor adds no
+        // selector queue, also while runs are consumed.
+        assert_eq!(cursor.selectors.capacity(), 0, "eager selector queue");
+        let mut position = 0;
+        while !cursor.is_empty() {
+            let run = cursor.next_selector();
+            assert_eq!(run.row_count, 1);
+            assert_eq!(run.skip, position % 2 != 0);
+            position += 1;
+            assert_eq!(cursor.selectors.capacity(), 0, "run traversal allocated");
+        }
+        // The plan trims the final skipped row.
+        assert_eq!(position, rows - 1);
+    }
+
+    #[test]
+    fn mask_selector_partial_run_rewind_does_not_allocate() {
+        use crate::arrow::arrow_reader::ReadPlanBuilder;
+        let mut plan = ReadPlanBuilder::new(8192)
+            .with_selection(Some(RowSelection::from_boolean_buffer(
+                BooleanBuffer::collect_bool(32768, |i| i >= 7),
+            )))
+            .with_row_selection_policy(RowSelectionPolicy::Selectors)
+            .build();
+        let RowSelectionCursor::Selectors(cursor) = plan.row_selection_cursor_mut() else {
+            panic!("expected selector execution");
+        };
+        assert_eq!(cursor.selectors.capacity(), 0);
+        assert_eq!(cursor.next_selector(), RowSelector::skip(7));
+        assert_eq!(cursor.next_selector(), RowSelector::select(32761));
+        cursor.return_selector(RowSelector::select(32761 - 8192));
+        assert_eq!(cursor.selectors.capacity(), 0);
+        assert_eq!(cursor.next_selector(), RowSelector::select(32761 - 8192));
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn mask_selectors_match_the_selector_queue() {
+        // A sliced bitmap with a nonzero offset; the queue is the reference.
+        let bits = BooleanBuffer::from(vec![false, true, true, false, false, true, true, true]);
+        let mask = bits.slice(1, 7);
+        let selectors: Vec<RowSelector> = MaskRunIter::new(&mask).collect();
+        let mut from_mask = RowSelectionCursor::new_mask_selectors(mask);
+        let mut from_queue = RowSelectionCursor::new_selectors(selectors);
+        let (RowSelectionCursor::Selectors(a), RowSelectionCursor::Selectors(b)) =
+            (&mut from_mask, &mut from_queue)
+        else {
+            unreachable!()
+        };
+        assert_eq!(a.next_selector(), b.next_selector());
+        assert_eq!(a.next_selector(), b.next_selector());
+        let third = a.next_selector();
+        assert_eq!(third, b.next_selector());
+        assert_eq!(third, RowSelector::select(3));
+        // Return part of a run to both.
+        a.return_selector(RowSelector::select(2));
+        b.return_selector(RowSelector::select(2));
+        assert_eq!(a.next_selector(), b.next_selector());
+        assert!(a.is_empty() && b.is_empty());
+    }
+
+    #[test]
+    fn long_mask_run_reuses_discovery_across_partial_batches() {
+        use crate::arrow::arrow_reader::ReadPlanBuilder;
+        const ROWS: usize = 1_048_576;
+        const BATCH: usize = 8192;
+        // A nonzero bit offset, and trailing skips that the plan trims.
+        let bits = BooleanBuffer::collect_bool(ROWS + 14, |i| (5..ROWS + 5).contains(&i));
+        let mut plan = ReadPlanBuilder::new(BATCH)
+            .with_selection(Some(RowSelection::from_boolean_buffer(
+                bits.slice(5, ROWS + 9),
+            )))
+            .with_row_selection_policy(RowSelectionPolicy::Selectors)
+            .build();
+        let RowSelectionCursor::Selectors(cursor) = plan.row_selection_cursor_mut() else {
+            panic!("expected selector execution");
+        };
+        MASK_RUN_DISCOVERIES.with(|count| count.set(0));
+        let mut remaining = ROWS;
+        while remaining > 0 {
+            assert_eq!(cursor.next_selector(), RowSelector::select(remaining));
+            remaining -= remaining.min(BATCH);
+            if remaining > 0 {
+                cursor.return_selector(RowSelector::select(remaining));
+            }
+            // One search for the run, then only known remainders: N/B
+            // partial batches must not search N + (N - B) + ... rows.
+            assert_eq!(MASK_RUN_DISCOVERIES.with(|count| count.get()), 1);
+            assert_eq!(cursor.selectors.capacity(), 0);
+        }
+        eprintln!(
+            "Q_RUN_DISCOVERY rows={ROWS} batch={BATCH} partial_batches={} discoveries={}",
+            ROWS.div_ceil(BATCH),
+            MASK_RUN_DISCOVERIES.with(|count| count.get())
+        );
+        assert!(cursor.is_empty());
+    }
+
+    // Longbow Q: this characterization runs unchanged on stock and Q.
+    #[test]
+    fn q_resource_storage_characterization() {
+        for rows in [1_024, 65_536, 1_048_576] {
+            for run_length in [1, 257, rows] {
+                let mask = BooleanBuffer::collect_bool(rows, |row| (row / run_length) % 2 == 0);
+                let selection = RowSelection::from_boolean_buffer(mask).trim();
+                let bits = selection.clone().into_boolean_buffer();
+                let runs = super::super::MaskRunIter::new(&bits).count();
+                let RowSelectionCursor::Selectors(mut cursor) =
+                    RowSelectionStrategy::Selectors.build_cursor(selection, None)
+                else {
+                    unreachable!()
+                };
+                let mut peak_capacity = cursor.selectors.capacity();
+                let mut seen = 0;
+                while !cursor.is_empty() {
+                    let selector = cursor.next_selector();
+                    let take = selector.row_count.min(8192);
+                    if !selector.skip {
+                        seen += take;
+                    }
+                    if selector.row_count > take {
+                        cursor.return_selector(RowSelector {
+                            row_count: selector.row_count - take,
+                            skip: selector.skip,
+                        });
+                    }
+                    peak_capacity = peak_capacity.max(cursor.selectors.capacity());
+                }
+                assert_eq!(seen, bits.count_set_bits());
+                eprintln!(
+                    "Q_STORAGE rows={rows} run_length={run_length} runs={runs} selector_bytes={} cursor_bytes={} peak_queue_capacity={peak_capacity} peak_owner_bytes={}",
+                    std::mem::size_of::<RowSelector>(),
+                    std::mem::size_of_val(&cursor),
+                    std::mem::size_of_val(&cursor)
+                        + peak_capacity * std::mem::size_of::<RowSelector>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn q_fragmented_cursor_owner_storage_is_bounded() {
+        let mask = BooleanBuffer::collect_bool(1_048_576, |row| row % 2 == 0);
+        let RowSelectionCursor::Selectors(cursor) = RowSelectionStrategy::Selectors
+            .build_cursor(RowSelection::from_boolean_buffer(mask).trim(), None)
+        else {
+            unreachable!()
+        };
+        let owner_bytes = std::mem::size_of_val(&cursor)
+            + cursor.selectors.capacity() * std::mem::size_of::<RowSelector>();
+        assert!(
+            owner_bytes <= 64 * 1024,
+            "cursor owns {owner_bytes} bytes, exceeding the 64 KiB bound (the input bitmap is excluded)"
+        );
+    }
+
+    #[test]
+    fn q_selector_mask_differential() {
+        fn selected_from_selectors(mut cursor: SelectorsCursor, batch: usize) -> Vec<usize> {
+            let mut selected = Vec::new();
+            let mut position = 0;
+            while !cursor.is_empty() {
+                let run = cursor.next_selector();
+                let take = run.row_count.min(batch);
+                if !run.skip {
+                    selected.extend(position..position + take);
+                }
+                position += take;
+                if take < run.row_count {
+                    cursor.return_selector(RowSelector {
+                        row_count: run.row_count - take,
+                        skip: run.skip,
+                    });
+                }
+                assert_eq!(cursor.position, position);
+            }
+            selected
+        }
+        let mut cases = 0;
+        for len in [0, 1, 2, 63, 64, 65, 129, 2049, 16_385] {
+            for offset in [0, 1, 7, 63, 64, 65] {
+                for pattern in 0..7 {
+                    let mask = BooleanBuffer::collect_bool(offset + len + 67, |i| {
+                        if !(offset..offset + len).contains(&i) {
+                            return true;
+                        }
+                        let row = i - offset;
+                        match pattern {
+                            0 => false,
+                            1 => true,
+                            2 => row % 2 == 0,
+                            3 => row % 129 == 128,
+                            4 => (7..len.saturating_sub(9)).contains(&row),
+                            5 => {
+                                (row.wrapping_mul(6364136223846793005_u64 as usize)
+                                    .wrapping_add(17)
+                                    >> 9)
+                                    % 11
+                                    < 3
+                            }
+                            _ => row % 257 < 191,
+                        }
+                    })
+                    .slice(offset, len);
+                    let expected: Vec<_> = (0..len).filter(|&row| mask.value(row)).collect();
+                    for batch in [1, 2, 7, 63, 64, 65, 8192] {
+                        let selection = RowSelection::from_boolean_buffer(mask.clone()).trim();
+                        let RowSelectionCursor::Selectors(from_mask) =
+                            RowSelectionStrategy::Selectors.build_cursor(selection.clone(), None)
+                        else {
+                            unreachable!()
+                        };
+                        let RowSelectionCursor::Selectors(from_queue) =
+                            RowSelectionCursor::new_selectors(selection.clone().into())
+                        else {
+                            unreachable!()
+                        };
+                        let RowSelectionCursor::Mask(mut from_bits) =
+                            RowSelectionStrategy::Mask.build_cursor(selection, None)
+                        else {
+                            unreachable!()
+                        };
+                        assert_eq!(
+                            selected_from_selectors(from_mask, batch),
+                            expected,
+                            "mask selectors: len={len} offset={offset} pattern={pattern} batch={batch}"
+                        );
+                        assert_eq!(selected_from_selectors(from_queue, batch), expected);
+                        let mut actual = Vec::new();
+                        while let Some(chunk) = from_bits.next_mask_chunk(batch) {
+                            let values = from_bits.mask_values_for(&chunk).unwrap();
+                            assert!(chunk.selected_rows <= batch);
+                            for row in 0..chunk.chunk_rows {
+                                if values.value(row) {
+                                    actual.push(chunk.mask_start + row);
+                                }
+                            }
+                        }
+                        assert_eq!(actual, expected);
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "Q_DIFFERENTIAL cases={cases} (mask-backed selectors, explicit queue, mask cursor, independent bit positions)"
+        );
     }
 }
