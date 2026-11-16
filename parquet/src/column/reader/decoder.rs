@@ -118,6 +118,27 @@ pub trait ColumnValueDecoder {
     /// Read up to `num_values` values into `out`.
     fn read(&mut self, out: &mut Self::Buffer, num_values: usize) -> Result<usize>;
 
+    /// Whether this decoder supports flat primitive nullable output.
+    fn can_read_spaced() -> bool {
+        false
+    }
+
+    /// Decode physical values into logical slots, including initialized NULL
+    /// placeholders. Returns the physical non-null value count consumed.
+    /// Only called when `can_read_spaced` is true.
+    fn read_spaced(
+        &mut self,
+        _out: &mut Self::Buffer,
+        _num_values: usize,
+        _num_levels: usize,
+        _validity: &[u8],
+        _offset: usize,
+    ) -> Result<usize> {
+        Err(general_err!(
+            "spaced reads are not supported for this value type"
+        ))
+    }
+
     /// Skips over `num_values` values
     ///
     /// Returns the number of values skipped
@@ -301,6 +322,8 @@ pub struct ColumnValueDecoderImpl<T: DataType> {
     /// Uses `EncodingMask` and dense storage keyed by encoding discriminant.
     decoder_mask: EncodingMask,
     decoders: [Option<Box<dyn Decoder<T>>>; ENCODING_SLOTS],
+    /// Reused physical decode window for nullable primitive output.
+    spaced_values: Vec<T::T>,
 }
 
 impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
@@ -312,6 +335,7 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
             current_encoding: None,
             decoder_mask: EncodingMask::default(),
             decoders: std::array::from_fn(|_| None),
+            spaced_values: Vec::new(),
         }
     }
 
@@ -398,6 +422,35 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
             .unwrap_or_else(|| panic!("decoder for encoding {encoding} should be set"));
 
         current_decoder.get_to_vec(out, num_values)
+    }
+
+    fn can_read_spaced() -> bool {
+        super::spaced::native::<T::T>()
+    }
+
+    fn read_spaced(
+        &mut self,
+        out: &mut Self::Buffer,
+        num_values: usize,
+        num_levels: usize,
+        validity: &[u8],
+        offset: usize,
+    ) -> Result<usize> {
+        let encoding = self
+            .current_encoding
+            .expect("current_encoding should be set");
+        let decoder = self.decoders[encoding as usize]
+            .as_mut()
+            .expect("current decoder should be set");
+        super::spaced::read(
+            out,
+            &mut self.spaced_values,
+            num_values,
+            num_levels,
+            validity,
+            offset,
+            |dense, count| decoder.get_to_vec(dense, count),
+        )
     }
 
     fn skip_values(&mut self, num_values: usize) -> Result<usize> {

@@ -287,6 +287,9 @@ where
 
         let padding_threshold = self.padding_threshold;
         let max_def = self.column_desc.max_def_level();
+        let direct_nullable = padding_threshold.is_none()
+            && packed_null_mask(&self.column_desc)
+            && CV::can_read_spaced();
         let mut physical_values_to_read = 0usize;
         let mut output_slots_to_read = 0usize;
 
@@ -297,16 +300,13 @@ where
             values.reserve_exact(self.capacity_hint.saturating_sub(self.num_values));
         }
 
-        let (records_read, values_read, levels_read) = self
-            .column_reader
-            .as_mut()
-            .unwrap()
-            .read_records_with_reservation(
+        let (records_read, values_read, levels_read) =
+            self.column_reader.as_mut().unwrap().read_records_with(
                 batch_size,
                 self.def_levels.as_mut(),
                 self.rep_levels.as_mut(),
                 values,
-                |values, values_to_read, levels_to_read, def_levels| {
+                |decoder, values, values_to_read, levels_to_read, def_levels| {
                     let output_slots = if let Some(threshold) = padding_threshold {
                         let bitmap =
                             compact_bitmap.get_or_insert_with(|| BooleanBufferBuilder::new(0));
@@ -340,14 +340,31 @@ where
                         levels_to_read
                     };
 
-                    let additional = output_slots_to_read
-                        .saturating_add(output_slots)
-                        .saturating_sub(physical_values_to_read);
+                    let additional = if direct_nullable {
+                        output_slots
+                    } else {
+                        output_slots_to_read
+                            .saturating_add(output_slots)
+                            .saturating_sub(physical_values_to_read)
+                    };
                     values.reserve_exact(additional);
 
                     output_slots_to_read += output_slots;
                     physical_values_to_read += values_to_read;
-                    Ok(())
+                    if direct_nullable {
+                        let levels =
+                            def_levels.ok_or_else(|| general_err!("missing definition levels"))?;
+                        let nulls = levels.nulls();
+                        decoder.read_spaced(
+                            values,
+                            values_to_read,
+                            levels_to_read,
+                            nulls.as_slice(),
+                            nulls.len() - levels_to_read,
+                        )
+                    } else {
+                        decoder.read(values, values_to_read)
+                    }
                 },
             )?;
 
@@ -376,7 +393,7 @@ where
                 "compact bitmap length must equal total items written"
             );
             self.values_written += item_count;
-        } else if values_read < levels_read {
+        } else if !direct_nullable && values_read < levels_read {
             debug_assert_eq!(
                 output_slots_to_read, levels_read,
                 "reservation accounting must match decoded levels"

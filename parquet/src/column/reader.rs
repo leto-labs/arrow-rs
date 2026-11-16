@@ -33,6 +33,7 @@ use crate::util::bit_util::{ceil, num_required_bits, read_num_bytes};
 
 pub(crate) mod decoder;
 mod legacy_fixed_len_byte_array;
+mod spaced;
 
 /// Column reader for a Parquet type.
 pub enum ColumnReader {
@@ -219,27 +220,28 @@ where
         rep_levels: Option<&mut R::Buffer>,
         values: &mut V::Buffer,
     ) -> Result<(usize, usize, usize)> {
-        self.read_records_with_reservation(
+        self.read_records_with(
             max_records,
             def_levels,
             rep_levels,
             values,
-            |_, _, _, _| Ok(()),
+            |decoder, out, count, _, _| decoder.read(out, count),
         )
     }
 
-    /// Like [`Self::read_records`], but invokes `reserve_values` after levels
-    /// are decoded and before values are read.
-    pub(crate) fn read_records_with_reservation<F>(
+    /// Like [`Self::read_records`], but delegates value reads after levels are
+    /// decoded. The callback can reserve and place values in their final slots;
+    /// it returns the physical non-null value count consumed.
+    pub(crate) fn read_records_with<F>(
         &mut self,
         max_records: usize,
         mut def_levels: Option<&mut D::Buffer>,
         mut rep_levels: Option<&mut R::Buffer>,
         values: &mut V::Buffer,
-        mut reserve_values: F,
+        mut read_values: F,
     ) -> Result<(usize, usize, usize)>
     where
-        F: FnMut(&mut V::Buffer, usize, usize, Option<&D::Buffer>) -> Result<()>,
+        F: FnMut(&mut V, &mut V::Buffer, usize, usize, Option<&D::Buffer>) -> Result<usize>,
     {
         let mut total_records_read = 0;
         let mut total_levels_read = 0;
@@ -298,9 +300,13 @@ where
             self.check_fixed_len_bytes(values_to_read, levels_to_read == remaining_levels)?;
 
             let def_levels = def_levels.as_deref();
-            reserve_values(values, values_to_read, levels_to_read, def_levels)?;
-
-            let values_read = self.values_decoder.read(values, values_to_read)?;
+            let values_read = read_values(
+                &mut self.values_decoder,
+                values,
+                values_to_read,
+                levels_to_read,
+                def_levels,
+            )?;
 
             if values_read != values_to_read {
                 return Err(general_err!(
