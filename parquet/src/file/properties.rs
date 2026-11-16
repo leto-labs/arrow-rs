@@ -262,6 +262,7 @@ pub struct WriterProperties {
     write_row_group_number_distinct_values: bool,
     content_defined_chunking: Option<CdcOptions>,
     write_path_in_schema: bool,
+    write_page_checksum: bool,
     #[cfg(feature = "encryption")]
     pub(crate) file_encryption_properties: Option<Arc<FileEncryptionProperties>>,
 }
@@ -273,6 +274,11 @@ impl Default for WriterProperties {
 }
 
 impl WriterProperties {
+    /// Whether each data and dictionary page carries its compressed payload CRC-32.
+    pub fn write_page_checksum(&self) -> bool {
+        self.write_page_checksum
+    }
+
     /// Create a new [`WriterProperties`] with the default settings
     ///
     /// See [`WriterProperties::builder`] for customising settings
@@ -655,6 +661,7 @@ pub struct WriterPropertiesBuilder {
     write_row_group_number_distinct_values: bool,
     content_defined_chunking: Option<CdcOptions>,
     write_path_in_schema: bool,
+    write_page_checksum: bool,
     #[cfg(feature = "encryption")]
     file_encryption_properties: Option<Arc<FileEncryptionProperties>>,
 }
@@ -682,6 +689,7 @@ impl Default for WriterPropertiesBuilder {
             write_row_group_number_distinct_values: DEFAULT_WRITE_ROW_GROUP_NUMBER_DISTINCT_VALUES,
             content_defined_chunking: None,
             write_path_in_schema: DEFAULT_WRITE_PATH_IN_SCHEMA,
+            write_page_checksum: false,
             #[cfg(feature = "encryption")]
             file_encryption_properties: None,
         }
@@ -689,6 +697,14 @@ impl Default for WriterPropertiesBuilder {
 }
 
 impl WriterPropertiesBuilder {
+    /// Enable CRC-32 for every data and dictionary page (default: false).
+    /// Checksums cover the compressed payload, before encryption, excluding headers.
+    #[cfg(feature = "crc")]
+    pub fn set_write_page_checksum(mut self, enabled: bool) -> Self {
+        self.write_page_checksum = enabled;
+        self
+    }
+
     /// Finalizes the configuration and returns immutable writer properties struct.
     pub fn build(self) -> WriterProperties {
         // Pre-compute offset_index_setting
@@ -739,6 +755,7 @@ impl WriterPropertiesBuilder {
             write_row_group_number_distinct_values: self.write_row_group_number_distinct_values,
             content_defined_chunking: self.content_defined_chunking,
             write_path_in_schema: self.write_path_in_schema,
+            write_page_checksum: self.write_page_checksum,
             #[cfg(feature = "encryption")]
             file_encryption_properties: self.file_encryption_properties,
         }
@@ -1487,6 +1504,7 @@ impl From<WriterProperties> for WriterPropertiesBuilder {
             write_row_group_number_distinct_values: props.write_row_group_number_distinct_values,
             content_defined_chunking: props.content_defined_chunking,
             write_path_in_schema: props.write_path_in_schema,
+            write_page_checksum: props.write_page_checksum,
             #[cfg(feature = "encryption")]
             file_encryption_properties: props.file_encryption_properties,
         }

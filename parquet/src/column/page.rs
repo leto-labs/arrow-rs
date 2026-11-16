@@ -206,6 +206,15 @@ impl CompressedPage {
         self.compressed_page.buffer().len()
     }
 
+    /// CRC-32 of the compressed payload, excluding the page header.
+    pub(crate) fn crc(&self, enabled: bool) -> Option<i32> {
+        if enabled {
+            #[cfg(feature = "crc")]
+            return Some(crc32fast::hash(self.data()) as i32);
+        }
+        None
+    }
+
     /// Returns the thrift page header
     pub(crate) fn to_thrift_header(&self) -> Result<PageHeader> {
         let uncompressed_size = self.uncompressed_size();
@@ -230,7 +239,6 @@ impl CompressedPage {
             r#type: page_type,
             uncompressed_page_size: uncompressed_size as i32,
             compressed_page_size: compressed_size as i32,
-            // TODO: Add support for crc checksum
             crc: None,
             data_page_header: None,
             index_page_header: None,

@@ -809,6 +809,7 @@ impl Iterator for StreamingColumnChunkPages {
 type SharedColumnChunk = Arc<Mutex<ArrowColumnChunkData>>;
 
 struct ArrowPageWriter {
+    write_page_checksum: bool,
     buffer: SharedColumnChunk,
     #[cfg(feature = "encryption")]
     page_encryptor: Option<PageEncryptor>,
@@ -816,9 +817,10 @@ struct ArrowPageWriter {
 
 impl ArrowPageWriter {
     /// Create a page writer that buffers completed pages in `store`.
-    fn new(store: Box<dyn PageStore>) -> Self {
+    fn new(store: Box<dyn PageStore>, write_page_checksum: bool) -> Self {
         Self {
             buffer: Arc::new(Mutex::new(ArrowColumnChunkData::new(store))),
+            write_page_checksum,
             #[cfg(feature = "encryption")]
             page_encryptor: None,
         }
@@ -849,12 +851,14 @@ impl ArrowPageWriter {
 
 impl PageWriter for ArrowPageWriter {
     fn write_page(&mut self, page: CompressedPage) -> Result<PageWriteSpec> {
+        let crc = page.crc(self.write_page_checksum);
         let page = match self.page_encryptor_mut() {
             Some(page_encryptor) => page_encryptor.encrypt_compressed_page(page)?,
             None => page,
         };
 
-        let page_header = page.to_thrift_header()?;
+        let mut page_header = page.to_thrift_header()?;
+        page_header.crc = crc;
         let header = {
             let mut header = Vec::with_capacity(1024);
 
@@ -1439,6 +1443,7 @@ impl ArrowColumnWriterFactory {
         &self,
         column_descriptor: &ColumnDescPtr,
         column_index: usize,
+        write_page_checksum: bool,
     ) -> Result<Box<ArrowPageWriter>> {
         let column_path = column_descriptor.path().string();
         let page_encryptor = PageEncryptor::create_if_column_encrypted(
@@ -1450,7 +1455,7 @@ impl ArrowColumnWriterFactory {
         let args = PageStoreArgs::new(column_index, column_descriptor);
         let store = self.page_store_factory.create(&args)?;
         Ok(Box::new(
-            ArrowPageWriter::new(store).with_encryptor(page_encryptor),
+            ArrowPageWriter::new(store, write_page_checksum).with_encryptor(page_encryptor),
         ))
     }
 
@@ -1459,10 +1464,11 @@ impl ArrowColumnWriterFactory {
         &self,
         column_descriptor: &ColumnDescPtr,
         column_index: usize,
+        write_page_checksum: bool,
     ) -> Result<Box<ArrowPageWriter>> {
         let args = PageStoreArgs::new(column_index, column_descriptor);
         let store = self.page_store_factory.create(&args)?;
-        Ok(Box::new(ArrowPageWriter::new(store)))
+        Ok(Box::new(ArrowPageWriter::new(store, write_page_checksum)))
     }
 
     /// Gets an [`ArrowColumnWriter`] for the given `data_type`, appending the
@@ -1478,7 +1484,8 @@ impl ArrowColumnWriterFactory {
 
         // Instantiate writers for normal columns
         let col = |desc: &ColumnDescPtr| -> Result<ArrowColumnWriter> {
-            let page_writer = self.create_page_writer(desc, out.len())?;
+            let page_writer =
+                self.create_page_writer(desc, out.len(), props.write_page_checksum())?;
             let chunk = page_writer.buffer.clone();
             let writer = get_column_writer(desc.clone(), props.clone(), page_writer);
             Ok(ArrowColumnWriter {
@@ -1490,7 +1497,8 @@ impl ArrowColumnWriterFactory {
 
         // Instantiate writers for byte arrays (e.g. Utf8,  Binary, etc)
         let bytes = |desc: &ColumnDescPtr| -> Result<ArrowColumnWriter> {
-            let page_writer = self.create_page_writer(desc, out.len())?;
+            let page_writer =
+                self.create_page_writer(desc, out.len(), props.write_page_checksum())?;
             let chunk = page_writer.buffer.clone();
             let writer = GenericColumnWriter::new(desc.clone(), props.clone(), page_writer);
             Ok(ArrowColumnWriter {
