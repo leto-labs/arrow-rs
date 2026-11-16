@@ -899,6 +899,14 @@ impl BitReader {
         self.byte_offset + ceil(self.bit_offset, 8)
     }
 
+    /// The unread bytes when the current cursor is byte-aligned. Borrowing
+    /// does not consume them; a successful fused decoder advances with skip.
+    pub(crate) fn aligned_remaining(&self) -> Option<&[u8]> {
+        self.bit_offset
+            .is_multiple_of(8)
+            .then(|| &self.buffer[self.byte_offset + self.bit_offset / 8..])
+    }
+
     /// Reads a single bit-packed value of `num_bits` bits as a `T` from the
     /// stream.
     ///

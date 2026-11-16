@@ -451,6 +451,144 @@ fn pack_dictionary_impl<K: ArrowDictionaryKeyType, V: ArrowPrimitiveType>(
 mod tests {
     use super::*;
 
+    /// Cross all dictionary index widths with actual V1/V2 page boundaries,
+    /// row groups, partial output batches, and five definition-level patterns.
+    #[test]
+    fn test_fused_dictionary_widths_pages_and_nulls() {
+        use crate::encodings::rle::{RleDecoder, RleEncoder};
+        use bytes::Bytes;
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5232_2026);
+        for width in 1u8..=32 {
+            let dictionary: Vec<i64> = (0..(1usize << width.min(7)).min(67))
+                .map(|i| (i as i64).wrapping_mul(i64::MIN + 123))
+                .collect();
+            for v2 in [false, true] {
+                for pattern in 0..5 {
+                    let nullable = pattern != 0;
+                    let schema = parse_message_type(if nullable {
+                        "message test { OPTIONAL INT64 value; }"
+                    } else {
+                        "message test { REQUIRED INT64 value; }"
+                    })
+                    .unwrap();
+                    let desc = SchemaDescriptor::new(Arc::new(schema)).column(0);
+                    let mut groups = Vec::new();
+                    let mut expected = Vec::new();
+                    for _ in 0..2 {
+                        let mut pages = vec![Page::DictionaryPage {
+                            buf: Bytes::from(
+                                dictionary
+                                    .iter()
+                                    .flat_map(|v| v.to_le_bytes())
+                                    .collect::<Vec<_>>(),
+                            ),
+                            num_values: dictionary.len() as u32,
+                            encoding: Encoding::PLAIN,
+                            is_sorted: false,
+                        }];
+                        for rows in [17usize, 129, 513] {
+                            let mut levels = RleEncoder::new(1, 8192);
+                            let mut ids = RleEncoder::new(width, 65536);
+                            let mut validity = Vec::new();
+                            let mut num_valid = 0;
+                            for i in 0..rows {
+                                let valid = match pattern {
+                                    0 | 1 => true,
+                                    2 => rng.random_bool(0.65),
+                                    3 => false,
+                                    _ => i % 2 == 0,
+                                };
+                                validity.push(valid);
+                                levels.put(valid as u64);
+                                if valid {
+                                    let id = if i % 97 < 32 {
+                                        0
+                                    } else {
+                                        rng.random_range(0..dictionary.len())
+                                    };
+                                    ids.put(id as u64);
+                                    num_valid += 1;
+                                }
+                            }
+                            let encoded_ids = Bytes::from(ids.consume());
+                            let mut scalar = RleDecoder::new(width);
+                            scalar.set_data(encoded_ids.clone()).unwrap();
+                            let mut reference_ids = vec![0i32; num_valid];
+                            assert_eq!(scalar.get_batch(&mut reference_ids).unwrap(), num_valid);
+                            let mut ids = reference_ids.into_iter();
+                            expected.extend(validity.iter().map(|&valid| {
+                                valid.then(|| dictionary[ids.next().unwrap() as u32 as usize])
+                            }));
+                            assert!(ids.next().is_none());
+                            let levels = if nullable {
+                                levels.consume()
+                            } else {
+                                Vec::new()
+                            };
+                            let mut data = Vec::new();
+                            if nullable && !v2 {
+                                data.extend_from_slice(&(levels.len() as u32).to_le_bytes());
+                            }
+                            data.extend_from_slice(&levels);
+                            data.push(width);
+                            data.extend_from_slice(&encoded_ids);
+                            pages.push(if v2 {
+                                Page::DataPageV2 {
+                                    buf: Bytes::from(data),
+                                    num_values: rows as u32,
+                                    encoding: Encoding::RLE_DICTIONARY,
+                                    num_nulls: (rows - num_valid) as u32,
+                                    num_rows: rows as u32,
+                                    def_levels_byte_len: levels.len() as u32,
+                                    rep_levels_byte_len: 0,
+                                    is_compressed: false,
+                                    statistics: None,
+                                }
+                            } else {
+                                Page::DataPage {
+                                    buf: Bytes::from(data),
+                                    num_values: rows as u32,
+                                    encoding: Encoding::RLE_DICTIONARY,
+                                    def_level_encoding: Encoding::RLE,
+                                    rep_level_encoding: Encoding::RLE,
+                                    statistics: None,
+                                }
+                            });
+                        }
+                        groups.push(pages);
+                    }
+                    let expected = Int64Array::from(expected);
+                    for batch in [1, 7, 31, 1023, 8192] {
+                        let mut reader = PrimitiveArrayReader::<Int64Type>::new(
+                            Box::new(InMemoryPageIterator::new(groups.clone())),
+                            desc.clone(),
+                            None,
+                            batch,
+                            None,
+                        )
+                        .unwrap();
+                        let mut offset = 0;
+                        loop {
+                            let actual = reader.next_batch(batch).unwrap();
+                            if actual.is_empty() {
+                                break;
+                            }
+                            let actual = actual.as_any().downcast_ref::<Int64Array>().unwrap();
+                            assert_eq!(
+                                actual,
+                                &expected.slice(offset, actual.len()),
+                                "width={width} v2={v2} pattern={pattern} batch={batch}"
+                            );
+                            offset += actual.len();
+                        }
+                        assert_eq!(offset, expected.len());
+                    }
+                }
+            }
+        }
+    }
+
     /// Exercise every integer value encoding through actual page and row-group
     /// boundaries. The input arrays are the oracle, independent of the reader.
     #[test]
