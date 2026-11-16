@@ -26,7 +26,7 @@ use arrow_array::temporal_conversions::{NANOSECONDS, SECONDS_IN_DAY};
 use arrow_array::timezone::Tz;
 use arrow_array::types::*;
 use arrow_array::*;
-use arrow_buffer::{ArrowNativeType, IntervalDayTime, IntervalMonthDayNano};
+use arrow_buffer::{ArrowNativeType, IntervalDayTime, IntervalMonthDayNano, NullBuffer, i256};
 use arrow_schema::{ArrowError, DataType, IntervalUnit, TimeUnit};
 use num_traits::{CheckedMul, ToPrimitive};
 
@@ -1018,6 +1018,232 @@ fn abs_checked<T: DecimalType>(value: T::Native) -> Result<T::Native, ArrowError
     }
 }
 
+/// Decimal arithmetic that reports overflow as a flag instead of an error.
+///
+/// The optimistic kernels below compute every slot without a branch on
+/// overflow and test the combined flag once for each array. A result is the
+/// wrapped value; the flag is `true` exactly when the checked operation of
+/// [`ArrowNativeTypeOp`] returns an error.
+trait OverflowingDecimal: ArrowNativeTypeOp {
+    fn add_overflowing(self, rhs: Self) -> (Self, bool);
+    fn sub_overflowing(self, rhs: Self) -> (Self, bool);
+    fn mul_overflowing(self, rhs: Self) -> (Self, bool);
+}
+
+macro_rules! overflowing_decimal {
+    ($t:ty) => {
+        impl OverflowingDecimal for $t {
+            #[inline(always)]
+            fn add_overflowing(self, rhs: Self) -> (Self, bool) {
+                // The sign test vectorizes; `overflowing_add` does not.
+                let sum = self.wrapping_add(rhs);
+                (sum, ((self ^ sum) & (rhs ^ sum)) < 0)
+            }
+
+            #[inline(always)]
+            fn sub_overflowing(self, rhs: Self) -> (Self, bool) {
+                let difference = self.wrapping_sub(rhs);
+                (difference, ((self ^ rhs) & (self ^ difference)) < 0)
+            }
+
+            #[inline(always)]
+            fn mul_overflowing(self, rhs: Self) -> (Self, bool) {
+                self.overflowing_mul(rhs)
+            }
+        }
+    };
+}
+overflowing_decimal!(i32);
+overflowing_decimal!(i64);
+
+impl OverflowingDecimal for i128 {
+    #[inline(always)]
+    fn add_overflowing(self, rhs: Self) -> (Self, bool) {
+        self.overflowing_add(rhs)
+    }
+
+    #[inline(always)]
+    fn sub_overflowing(self, rhs: Self) -> (Self, bool) {
+        self.overflowing_sub(rhs)
+    }
+
+    #[inline(always)]
+    fn mul_overflowing(self, rhs: Self) -> (Self, bool) {
+        // The product of two values that fit in `i64` fits in `i128`, and it
+        // is one widening multiplication. Most decimal values are that small.
+        if self as i64 as i128 == self && rhs as i64 as i128 == rhs {
+            ((self as i64 as i128) * (rhs as i64 as i128), false)
+        } else {
+            self.overflowing_mul(rhs)
+        }
+    }
+}
+
+impl OverflowingDecimal for i256 {
+    #[inline(always)]
+    fn add_overflowing(self, rhs: Self) -> (Self, bool) {
+        match self.checked_add(rhs) {
+            Some(sum) => (sum, false),
+            None => (self.wrapping_add(rhs), true),
+        }
+    }
+
+    #[inline(always)]
+    fn sub_overflowing(self, rhs: Self) -> (Self, bool) {
+        match self.checked_sub(rhs) {
+            Some(difference) => (difference, false),
+            None => (self.wrapping_sub(rhs), true),
+        }
+    }
+
+    #[inline(always)]
+    fn mul_overflowing(self, rhs: Self) -> (Self, bool) {
+        match self.checked_mul(rhs) {
+            Some(product) => (product, false),
+            None => (self.wrapping_mul(rhs), true),
+        }
+    }
+}
+
+/// Applies `op` to every slot of `l` and `r`, null or not, and returns `None`
+/// if any slot overflowed or the lengths differ.
+///
+/// The caller then runs the checked kernel, which visits only valid slots and
+/// reports the first overflow among them. An overflow in a null slot is
+/// therefore not an error, as before.
+#[inline(always)]
+fn optimistic_binary<T: DecimalType>(
+    l: &PrimitiveArray<T>,
+    r: &PrimitiveArray<T>,
+    op: impl Fn(T::Native, T::Native) -> (T::Native, bool),
+) -> Option<PrimitiveArray<T>> {
+    if l.len() != r.len() {
+        return None;
+    }
+    let mut overflow = false;
+    let values: Vec<T::Native> = l
+        .values()
+        .iter()
+        .zip(r.values().iter())
+        .map(|(l, r)| {
+            let (value, wrapped) = op(*l, *r);
+            overflow |= wrapped;
+            value
+        })
+        .collect();
+    (!overflow).then(|| PrimitiveArray::new(values.into(), NullBuffer::union(l.nulls(), r.nulls())))
+}
+
+/// [`optimistic_binary`] for one array and a value that is already valid.
+#[inline(always)]
+fn optimistic_unary<T: DecimalType>(
+    array: &PrimitiveArray<T>,
+    op: impl Fn(T::Native) -> (T::Native, bool),
+) -> Option<PrimitiveArray<T>> {
+    let mut overflow = false;
+    let values: Vec<T::Native> = array
+        .values()
+        .iter()
+        .map(|value| {
+            let (value, wrapped) = op(*value);
+            overflow |= wrapped;
+            value
+        })
+        .collect();
+    (!overflow).then(|| PrimitiveArray::new(values.into(), array.nulls().cloned()))
+}
+
+/// The optimistic kernel of a binary decimal operation on potentially scalar
+/// inputs. `None` means that the checked kernel must decide the result.
+#[inline(always)]
+fn optimistic_op<T: DecimalType>(
+    l: &PrimitiveArray<T>,
+    l_s: bool,
+    r: &PrimitiveArray<T>,
+    r_s: bool,
+    op: impl Fn(T::Native, T::Native) -> (T::Native, bool),
+) -> Option<PrimitiveArray<T>> {
+    match (l_s, r_s) {
+        (true, true) | (false, false) => optimistic_binary(l, r, op),
+        (true, false) => match (l.null_count() == 0).then(|| l.value(0)) {
+            None => Some(PrimitiveArray::new_null(r.len())),
+            Some(l) => optimistic_unary(r, |r| op(l, r)),
+        },
+        (false, true) => match (r.null_count() == 0).then(|| r.value(0)) {
+            None => Some(PrimitiveArray::new_null(l.len())),
+            Some(r) => optimistic_unary(l, |l| op(l, r)),
+        },
+    }
+}
+
+/// `l * l_mul ± r * r_mul` without a branch on overflow.
+///
+/// A scalar operand is rescaled once, not once for each row, and an operand
+/// whose multiplier is one is not multiplied. `None` means that the checked
+/// kernel must decide the result: a slot overflowed, or the scalar does not
+/// fit after rescaling.
+fn optimistic_add_sub<T: DecimalType>(
+    l: &PrimitiveArray<T>,
+    l_s: bool,
+    l_mul: T::Native,
+    r: &PrimitiveArray<T>,
+    r_s: bool,
+    r_mul: T::Native,
+    subtract: bool,
+) -> Option<PrimitiveArray<T>>
+where
+    T::Native: OverflowingDecimal,
+{
+    // Rescale a valid scalar here. A null scalar keeps its multiplier, because
+    // `optimistic_op` returns nulls without reading it.
+    let rescaled;
+    let (l, l_mul) = if l_s && !r_s && l.null_count() == 0 && l_mul != T::Native::ONE {
+        let value = l.value(0).mul_checked(l_mul).ok()?;
+        rescaled = PrimitiveArray::<T>::new(vec![value].into(), None);
+        (&rescaled, T::Native::ONE)
+    } else {
+        (l, l_mul)
+    };
+    let rescaled;
+    let (r, r_mul) = if r_s && !l_s && r.null_count() == 0 && r_mul != T::Native::ONE {
+        let value = r.value(0).mul_checked(r_mul).ok()?;
+        rescaled = PrimitiveArray::<T>::new(vec![value].into(), None);
+        (&rescaled, T::Native::ONE)
+    } else {
+        (r, r_mul)
+    };
+
+    // One loop for each combination, so that no loop tests a multiplier.
+    macro_rules! combine {
+        ($combine:ident) => {
+            match (l_mul == T::Native::ONE, r_mul == T::Native::ONE) {
+                (true, true) => optimistic_op(l, l_s, r, r_s, |l, r| l.$combine(r)),
+                (true, false) => optimistic_op(l, l_s, r, r_s, |l, r| {
+                    let (r, scaled) = r.mul_overflowing(r_mul);
+                    let (value, wrapped) = l.$combine(r);
+                    (value, scaled | wrapped)
+                }),
+                (false, true) => optimistic_op(l, l_s, r, r_s, |l, r| {
+                    let (l, scaled) = l.mul_overflowing(l_mul);
+                    let (value, wrapped) = l.$combine(r);
+                    (value, scaled | wrapped)
+                }),
+                (false, false) => optimistic_op(l, l_s, r, r_s, |l, r| {
+                    let (l, l_scaled) = l.mul_overflowing(l_mul);
+                    let (r, r_scaled) = r.mul_overflowing(r_mul);
+                    let (value, wrapped) = l.$combine(r);
+                    (value, l_scaled | r_scaled | wrapped)
+                }),
+            }
+        };
+    }
+    if subtract {
+        combine!(sub_overflowing)
+    } else {
+        combine!(add_overflowing)
+    }
+}
+
 /// Perform arithmetic operation on decimal arrays
 fn decimal_op<T: DecimalType>(
     op: Op,
@@ -1027,7 +1253,7 @@ fn decimal_op<T: DecimalType>(
     r_s: bool,
 ) -> Result<ArrayRef, ArrowError>
 where
-    T::Native: CheckedMul,
+    T::Native: CheckedMul + OverflowingDecimal,
 {
     let l = l.as_primitive::<T>();
     let r = r.as_primitive::<T>();
@@ -1055,33 +1281,39 @@ where
             let l_mul = T::Native::usize_as(10).pow_checked((result_scale - s1) as _)?;
             let r_mul = T::Native::usize_as(10).pow_checked((result_scale - s2) as _)?;
 
-            match op {
-                // Equal scales make both decimal multipliers one.
-                Op::Add | Op::AddWrapping if s1 == s2 => {
-                    try_op!(l, l_s, r, r_s, l.add_checked(r))
-                }
-                Op::Sub | Op::SubWrapping if s1 == s2 => {
-                    try_op!(l, l_s, r, r_s, l.sub_checked(r))
-                }
-                Op::Add | Op::AddWrapping => {
-                    try_op!(
-                        l,
-                        l_s,
-                        r,
-                        r_s,
-                        l.mul_checked(l_mul)?.add_checked(r.mul_checked(r_mul)?)
-                    )
-                }
-                Op::Sub | Op::SubWrapping => {
-                    try_op!(
-                        l,
-                        l_s,
-                        r,
-                        r_s,
-                        l.mul_checked(l_mul)?.sub_checked(r.mul_checked(r_mul)?)
-                    )
-                }
-                _ => unreachable!(),
+            let subtract = matches!(op, Op::Sub | Op::SubWrapping);
+            match optimistic_add_sub(l, l_s, l_mul, r, r_s, r_mul, subtract) {
+                Some(array) => array,
+                // A slot overflowed. The checked kernel reports the error, or
+                // returns the result if only null slots overflowed.
+                None => match op {
+                    // Equal scales make both decimal multipliers one.
+                    Op::Add | Op::AddWrapping if s1 == s2 => {
+                        try_op!(l, l_s, r, r_s, l.add_checked(r))
+                    }
+                    Op::Sub | Op::SubWrapping if s1 == s2 => {
+                        try_op!(l, l_s, r, r_s, l.sub_checked(r))
+                    }
+                    Op::Add | Op::AddWrapping => {
+                        try_op!(
+                            l,
+                            l_s,
+                            r,
+                            r_s,
+                            l.mul_checked(l_mul)?.add_checked(r.mul_checked(r_mul)?)
+                        )
+                    }
+                    Op::Sub | Op::SubWrapping => {
+                        try_op!(
+                            l,
+                            l_s,
+                            r,
+                            r_s,
+                            l.mul_checked(l_mul)?.sub_checked(r.mul_checked(r_mul)?)
+                        )
+                    }
+                    _ => unreachable!(),
+                },
             }
             .with_precision_and_scale(result_precision, result_scale as i8)?
         }
@@ -1107,8 +1339,11 @@ where
                 ))
             })?;
 
-            try_op!(l, l_s, r, r_s, l.mul_checked(r))
-                .with_precision_and_scale(result_precision, result_scale)?
+            match optimistic_op(l, l_s, r, r_s, |l, r| l.mul_overflowing(r)) {
+                Some(array) => array,
+                None => try_op!(l, l_s, r, r_s, l.mul_checked(r)),
+            }
+            .with_precision_and_scale(result_precision, result_scale)?
         }
 
         Op::Div => {
@@ -2861,5 +3096,326 @@ mod tests {
     fn test_date_month_day_nano_operations() {
         test_month_day_nano_ops!(Date32Type, date_to_days);
         test_month_day_nano_ops!(Date64Type, date_to_millis);
+    }
+}
+
+/// Property tests of the optimistic decimal kernels against the checked
+/// formulas, on deterministic random inputs.
+#[cfg(test)]
+mod optimistic_decimal_tests {
+    use super::*;
+    use arrow_buffer::NullBuffer;
+
+    /// A deterministic generator (xorshift64*); the tests need no entropy.
+    struct Random(u64);
+
+    impl Random {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+
+        fn signed(&mut self, magnitude: i128) -> i128 {
+            let value = ((i128::from(self.next()) << 64) | i128::from(self.next())) % magnitude;
+            if self.below(2) == 0 { value } else { -value }
+        }
+
+        /// A value of one of the classes that decide overflow: small, of a
+        /// money column, near `10^18`, near the `i64` limits and near the
+        /// limits of `max`.
+        fn value(&mut self, max: i128) -> i128 {
+            let near = |random: &mut Self, center: i128| {
+                let offset = random.signed(1000);
+                let value = center.saturating_add(offset).clamp(-max - 1, max);
+                if random.below(2) == 0 {
+                    value
+                } else {
+                    value.checked_neg().unwrap_or(value)
+                }
+            };
+            let value = match self.below(8) {
+                0 => self.signed(100),
+                1 => self.signed(10_i128.pow(4)),
+                2 | 3 => self.signed(10_i128.pow(15)),
+                4 => near(self, 10_i128.pow(18)),
+                5 => near(self, i128::from(i64::MAX)),
+                6 => near(self, max),
+                _ => self.signed(max),
+            };
+            value.clamp(-max - 1, max)
+        }
+    }
+
+    trait Narrow: DecimalType {
+        fn from_wide(value: i128) -> Self::Native;
+        const LIMIT: i128;
+    }
+
+    impl Narrow for Decimal64Type {
+        fn from_wide(value: i128) -> i64 {
+            value as i64
+        }
+        const LIMIT: i128 = i64::MAX as i128;
+    }
+
+    impl Narrow for Decimal128Type {
+        fn from_wide(value: i128) -> i128 {
+            value
+        }
+        const LIMIT: i128 = i128::MAX;
+    }
+
+    fn array<T: Narrow>(
+        random: &mut Random,
+        rows: usize,
+        precision: u8,
+        scale: i8,
+        nulls: bool,
+    ) -> PrimitiveArray<T> {
+        let values: Vec<T::Native> = (0..rows)
+            .map(|_| T::from_wide(random.value(T::LIMIT)))
+            .collect();
+        let nulls = nulls.then(|| {
+            NullBuffer::from(
+                (0..rows)
+                    .map(|_| random.below(4) != 0)
+                    .collect::<Vec<bool>>(),
+            )
+        });
+        PrimitiveArray::<T>::new(values.into(), nulls)
+            .with_precision_and_scale(precision, scale)
+            .unwrap()
+    }
+
+    /// The checked formula of `decimal_op` for one row.
+    fn checked<T: DecimalType>(
+        op: Op,
+        l: T::Native,
+        l_mul: T::Native,
+        r: T::Native,
+        r_mul: T::Native,
+    ) -> Result<T::Native, ArrowError> {
+        match op {
+            Op::Add => l.mul_checked(l_mul)?.add_checked(r.mul_checked(r_mul)?),
+            Op::Sub => l.mul_checked(l_mul)?.sub_checked(r.mul_checked(r_mul)?),
+            Op::Mul => l.mul_checked(r),
+            _ => unreachable!(),
+        }
+    }
+
+    /// The values of valid rows, or `Err` when a valid row overflows.
+    fn reference<T: DecimalType>(
+        op: Op,
+        l: &PrimitiveArray<T>,
+        l_s: bool,
+        r: &PrimitiveArray<T>,
+        r_s: bool,
+    ) -> Result<Vec<Option<T::Native>>, ArrowError> {
+        let (s1, s2) = (l.scale(), r.scale());
+        let scale = s1.max(s2);
+        let l_mul = T::Native::usize_as(10).pow_checked((scale - s1) as _)?;
+        let r_mul = T::Native::usize_as(10).pow_checked((scale - s2) as _)?;
+        let rows = match (l_s, r_s) {
+            (true, false) => r.len(),
+            _ => l.len(),
+        };
+        (0..rows)
+            .map(|row| {
+                let (l_row, r_row) = (if l_s { 0 } else { row }, if r_s { 0 } else { row });
+                if l.is_null(l_row) || r.is_null(r_row) {
+                    return Ok(None);
+                }
+                checked::<T>(op, l.value(l_row), l_mul, r.value(r_row), r_mul).map(Some)
+            })
+            .collect()
+    }
+
+    fn kernel(op: Op, l: &dyn Datum, r: &dyn Datum) -> Result<ArrayRef, ArrowError> {
+        match op {
+            Op::Add => add(l, r),
+            Op::Sub => sub(l, r),
+            Op::Mul => mul(l, r),
+            _ => unreachable!(),
+        }
+    }
+
+    fn datum<T: DecimalType>(array: &PrimitiveArray<T>, scalar: bool) -> Box<dyn Datum + '_> {
+        if scalar {
+            Box::new(Scalar::new(array))
+        } else {
+            Box::new(array)
+        }
+    }
+
+    fn matches_reference<T: Narrow>(seed: u64) {
+        let mut random = Random(seed);
+        let (mut errors, mut results) = (0, 0);
+        for case in 0..4000 {
+            let op = [Op::Add, Op::Sub, Op::Mul][case % 3];
+            let precision = T::MAX_PRECISION;
+            let (s1, s2) = match op {
+                // The scale of a product is `s1 + s2`, which must fit.
+                Op::Mul => (random.below(4) as i8, random.below(4) as i8),
+                _ => (random.below(5) as i8, random.below(5) as i8),
+            };
+            let (l_s, r_s) = [(false, false), (true, false), (false, true)][case / 3 % 3];
+            let rows = 1 + random.below(40) as usize;
+            let nulls = random.below(3) == 0;
+            let l = array::<T>(
+                &mut random,
+                if l_s { 1 } else { rows },
+                precision,
+                s1,
+                nulls,
+            );
+            let r = array::<T>(
+                &mut random,
+                if r_s { 1 } else { rows },
+                precision,
+                s2,
+                nulls,
+            );
+            let expected = reference(op, &l, l_s, &r, r_s);
+            let actual = kernel(op, datum(&l, l_s).as_ref(), datum(&r, r_s).as_ref());
+            match (expected, actual) {
+                (Err(_), Err(ArrowError::ArithmeticOverflow(_))) => errors += 1,
+                (Ok(expected), Ok(actual)) => {
+                    let actual = actual.as_primitive::<T>();
+                    let actual: Vec<Option<T::Native>> = actual.iter().collect();
+                    assert_eq!(actual, expected, "case {case} {op} seed {seed}");
+                    results += 1;
+                }
+                (expected, actual) => {
+                    panic!("case {case} {op}: expected {expected:?}, got {actual:?}")
+                }
+            }
+        }
+        // The value classes must exercise both outcomes.
+        assert!(
+            errors > 100 && results > 100,
+            "{errors} errors, {results} results"
+        );
+    }
+
+    #[test]
+    fn decimal64_matches_the_checked_formula() {
+        matches_reference::<Decimal64Type>(0x9E37_79B9_7F4A_7C15);
+    }
+
+    #[test]
+    fn decimal128_matches_the_checked_formula() {
+        matches_reference::<Decimal128Type>(0xD1B5_4A32_D192_ED03);
+    }
+
+    /// A `Decimal64` result equals the `Decimal128` result of the same values
+    /// whenever the `Decimal64` operation does not overflow.
+    #[test]
+    fn decimal64_agrees_with_decimal128() {
+        let mut random = Random(0xA076_1D64_78BD_642F);
+        let mut compared = 0;
+        for case in 0..4000 {
+            let op = [Op::Add, Op::Sub, Op::Mul][case % 3];
+            let (s1, s2) = (random.below(4) as i8, random.below(4) as i8);
+            let (l_s, r_s) = [(false, false), (true, false), (false, true)][case / 3 % 3];
+            let rows = 1 + random.below(40) as usize;
+            let nulls = random.below(3) == 0;
+            let l = array::<Decimal64Type>(&mut random, if l_s { 1 } else { rows }, 18, s1, nulls);
+            let r = array::<Decimal64Type>(&mut random, if r_s { 1 } else { rows }, 18, s2, nulls);
+            let widen = |array: &Decimal64Array, scale: i8| -> Decimal128Array {
+                let values: Vec<i128> = array.values().iter().map(|v| i128::from(*v)).collect();
+                Decimal128Array::new(values.into(), array.nulls().cloned())
+                    .with_precision_and_scale(18, scale)
+                    .unwrap()
+            };
+            let (wide_l, wide_r) = (widen(&l, s1), widen(&r, s2));
+            let narrow = kernel(op, datum(&l, l_s).as_ref(), datum(&r, r_s).as_ref());
+            let wide = kernel(
+                op,
+                datum(&wide_l, l_s).as_ref(),
+                datum(&wide_r, r_s).as_ref(),
+            )
+            .expect("values of 64 bits cannot overflow 128 bits here");
+            let Ok(narrow) = narrow else { continue };
+            let narrow: Vec<Option<i128>> = narrow
+                .as_primitive::<Decimal64Type>()
+                .iter()
+                .map(|value| value.map(i128::from))
+                .collect();
+            let wide: Vec<Option<i128>> = wide.as_primitive::<Decimal128Type>().iter().collect();
+            assert_eq!(narrow, wide, "case {case} {op}");
+            assert_eq!(
+                narrow.len(),
+                if l_s { r.len() } else { l.len() },
+                "case {case} {op}"
+            );
+            compared += 1;
+        }
+        // Many cases overflow 64 bits; the rest must be a real sample.
+        assert!(compared > 300, "{compared} comparisons");
+    }
+
+    /// An overflow in a null slot is not an error.
+    #[test]
+    fn overflow_in_a_null_slot_is_not_an_error() {
+        let l = Decimal64Array::new(
+            vec![i64::MAX, 5].into(),
+            Some(NullBuffer::from(vec![false, true])),
+        )
+        .with_precision_and_scale(18, 2)
+        .unwrap();
+        let r = Decimal64Array::from(vec![i64::MAX, 7])
+            .with_precision_and_scale(18, 2)
+            .unwrap();
+        for (op, expected) in [(Op::Add, 12), (Op::Mul, 35)] {
+            let result = kernel(op, &l, &r).unwrap();
+            let result = result.as_primitive::<Decimal64Type>();
+            assert!(result.is_null(0));
+            assert_eq!(result.value(1), expected);
+        }
+        // The same overflow in a valid slot is the checked kernel's error.
+        let valid = Decimal64Array::from(vec![i64::MAX, 5])
+            .with_precision_and_scale(18, 2)
+            .unwrap();
+        let error = kernel(Op::Add, &valid, &r).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            format!(
+                "Arithmetic overflow: Overflow happened on: {} + {}",
+                i64::MAX,
+                i64::MAX
+            )
+        );
+    }
+
+    /// A scalar that does not fit after rescaling fails only when a valid row
+    /// uses it, as in the checked kernel.
+    #[test]
+    fn an_unscalable_scalar_fails_only_for_valid_rows() {
+        let scalar = Decimal64Array::from(vec![i64::MAX / 10])
+            .with_precision_and_scale(18, 0)
+            .unwrap();
+        let scalar = Scalar::new(&scalar);
+        let valid = Decimal64Array::from(vec![1])
+            .with_precision_and_scale(18, 2)
+            .unwrap();
+        assert!(matches!(
+            add(&scalar, &valid),
+            Err(ArrowError::ArithmeticOverflow(_))
+        ));
+        let null = Decimal64Array::new_null(3)
+            .with_precision_and_scale(18, 2)
+            .unwrap();
+        let result = add(&scalar, &null).unwrap();
+        assert_eq!(result.null_count(), 3);
+        let empty = Decimal64Array::from(Vec::<i64>::new())
+            .with_precision_and_scale(18, 2)
+            .unwrap();
+        assert_eq!(add(&scalar, &empty).unwrap().len(), 0);
     }
 }
