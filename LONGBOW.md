@@ -1,8 +1,10 @@
 # Longbow Arrow fork notes
 
-FUG, PIO and NEX are UPSTREAMABLE patch families for
+FUG, PIO, NEX and DRL are UPSTREAMABLE patch families for
 NATIVE-PARQUET-DECODE. They change Parquet's native dictionary and flat nullable
 primitive readers; CPU-specific kernels remain behind checked runtime dispatch.
+DRL (below) replaced NEX's dense decode window and forward expansion with one
+dense decode and an in-place backward expansion; NEX's zero NULL slots remain.
 
 NEX initializes NULL value slots to zero. The previous padding path could leave
 stale values in these slots. The validity bitmap and every valid value are
@@ -183,3 +185,55 @@ Limits that the tests state:
   handle. Longbow's scans read through the push decoder.
 
 With no handle attached nothing changes. Results never change.
+
+## DRL: dictionary runs and definition levels
+
+DRL is an UPSTREAMABLE patch family for NATIVE-PARQUET-DECODE (Longbow scale-up
+task 5.10, lane V4). It changes how the native primitive reader decodes
+dictionary indices and the definition levels of flat nullable columns. Results
+do not change; NULL slots stay zero, as NEX defined them.
+
+- **Run loop** (`encodings/rle/runs.rs`). The dictionary decoder of `i32`,
+  `i64`, `f32` and `f64` reads run headers, repeated values and packed runs
+  from one borrowed slice with the cursor in a register, instead of one
+  `BitReader` call for each header and value. A repeated run of at most 16
+  values is one block of vector stores when the output has room; the slots
+  after the run are overwritten by the next values or lie outside the
+  initialized prefix. A packed run goes to the fused kernels. A cursor inside
+  a packed group (after a read that ended mid-run) decodes only to the end of
+  the group, so the rest of the run stays on the fused path.
+- **Every bit width is fused.** The AVX-512 VBMI kernel unpacks widths 25 to 32
+  into 64-bit lanes; widths 1 to 24 as before. It also takes a last block of
+  eight values, so a run of 504 values no longer leaves eight for the scalar
+  path. On AVX-512 hosts AVX2 stays for widths 1 to 16; AVX2-only hosts use
+  it for widths 1 to 24; the scalar path covers CPUs without either.
+- **Small dictionaries are looked up by permutation**, not gathered: up to 128
+  four-byte or 64 eight-byte entries, in eight 64-byte tables, two
+  `vpermi2d`/`vpermi2q` per pair and a blend per index bit. IDs are checked
+  against the dictionary length before any lookup, so padding entries are
+  never selected.
+- **Definition levels** (`arrow/record_reader/definition_levels.rs`). The
+  bit-width-1 level decoder writes the validity bitmap through one register
+  word and stores only whole aligned words, and counts the set bits as it
+  writes them (the extra `count_set_bits` pass is now a debug assertion). Runs
+  with one-byte headers are decoded from a local cursor.
+- **NULL expansion in place** (`column/reader/spaced.rs`). A nullable batch is
+  decoded as one dense run of physical values into the output, then expanded
+  to logical slots from the last block to the first, with AVX-512 expand-loads
+  of 16 or 8 lanes. A dense value never lies after its slot, so the backward
+  order overwrites nothing that is still to be moved. This replaces NEX's
+  1,024-value dense window and its forward expansion; the window buffer is
+  gone.
+
+The `ss_customer_sk` shape (TPC-DS: repeated runs of about 12 IDs, a NULL about
+every 22 rows) was dominated by the cost of a run, not by the gather.
+
+The unit properties of the family run every dispatch tier (scalar, AVX2,
+AVX-512): `encodings::rle::runs` (headers, values, block stores),
+`encodings::rle::fused` (exact invalid IDs for widths 1 to 32, permutation
+table-pair boundaries for both value sizes), `column::reader::spaced`
+(in-place expansion against a reference, count mismatches) and the
+definition-level decoder tests. The page-level characterization
+`test_fused_dictionary_widths_pages_and_nulls` adds two run-heavy patterns
+(repeated IDs in runs of 1 to 40, with and without NULL runs) to its widths
+1 to 32, V1/V2 pages and batch sizes.
