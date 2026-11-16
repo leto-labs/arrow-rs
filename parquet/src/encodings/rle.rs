@@ -663,6 +663,7 @@ impl RleDecoder {
                     .as_mut()
                     .ok_or_else(|| general_err!("bit_reader should be set"))?;
 
+                let mut failed = None;
                 loop {
                     let to_read = index_buf
                         .len()
@@ -680,56 +681,30 @@ impl RleDecoder {
                         self.bit_packed_left = 0;
                         break;
                     }
-                    if !std::mem::needs_drop::<T>() && matches!(std::mem::size_of::<T>(), 4 | 8) {
-                        gather_primitive_dictionary(
-                            dict,
-                            &index_buf[..num_values],
-                            &mut buffer[values_read..values_read + num_values],
-                        )?;
+                    let out = &mut buffer[values_read..values_read + num_values];
+                    let indices = &index_buf[..num_values];
+                    let gathered = if !std::mem::needs_drop::<T>()
+                        && matches!(std::mem::size_of::<T>(), 4 | 8)
+                    {
+                        gather_primitive_dictionary(dict, indices, out)
                     } else {
-                        #[cold]
-                        #[inline(never)]
-                        fn oob(max_idx: u32, dict_len: usize) -> ParquetError {
-                            general_err!(
-                                "dictionary index out of bounds: the len is {} but the index is {}",
-                                dict_len,
-                                max_idx
-                            )
-                        }
-                        const CHUNK: usize = 16;
-                        let out = &mut buffer[values_read..values_read + num_values];
-                        let idx = &index_buf[..num_values];
-                        let dict_len = dict.len();
-                        let (out_chunks, out_chunks_remainder) = out.as_chunks_mut::<CHUNK>();
-                        let (idx_chunks, idx_chunks_remainder) = idx.as_chunks::<CHUNK>();
-                        for (out_chunk, idx_chunk) in out_chunks.iter_mut().zip(idx_chunks) {
-                            // u32 max-reduction instead of `.all(|&i| ..)`: `.all`
-                            // short-circuits and blocks autovectorisation. Negative
-                            // i32 cast to u32 becomes a large value so the bounds
-                            // check still rejects it.
-                            let max_idx = idx_chunk.iter().fold(0u32, |acc, &i| acc.max(i as u32));
-                            if (max_idx as usize) >= dict_len {
-                                return Err(oob(max_idx, dict_len));
-                            }
-                            for (b, i) in out_chunk.iter_mut().zip(idx_chunk.iter()) {
-                                // SAFETY: all indices checked above to be in bounds
-                                b.clone_from(unsafe { dict.get_unchecked(*i as usize) });
-                            }
-                        }
-                        for (b, i) in out_chunks_remainder.iter_mut().zip(idx_chunks_remainder) {
-                            let dict_idx = *i as usize;
-                            if dict_idx >= dict_len {
-                                return Err(oob(*i as u32, dict_len));
-                            }
-                            // SAFETY: bounds checked above
-                            b.clone_from(unsafe { dict.get_unchecked(dict_idx) });
-                        }
+                        gather_dictionary_chunks(dict, indices, out)
+                    };
+                    if let Err(err) = gathered {
+                        // The reader is past these indices.
+                        failed = Some(err);
+                        break;
                     }
                     self.bit_packed_left -= num_values as u32;
                     values_read += num_values;
                     if num_values < to_read {
                         break;
                     }
+                }
+                if let Some(err) = failed {
+                    // Fail the decoder, so that a retry cannot return the
+                    // values after the indices that were read.
+                    return Err(self.fail(err));
                 }
             } else if !self.reload()? {
                 break;
@@ -823,11 +798,13 @@ impl RleDecoder {
                 }
                 let max_index = indices[..n].iter().map(|&i| i as u32).max().unwrap();
                 if max_index as usize >= dict.len() {
-                    return Err(general_err!(
+                    // The reader is past these indices: fail the decoder, so
+                    // that a retry cannot return the values after them.
+                    return Err(self.fail(general_err!(
                         "dictionary index out of bounds: the len is {} but the index is {}",
                         dict.len(),
                         max_index
-                    ));
+                    )));
                 }
                 for (slot, &id) in out[written..written + n].iter_mut().zip(&indices[..n]) {
                     // SAFETY: every unsigned ID is bounded by the maximum checked above.
@@ -846,12 +823,31 @@ impl RleDecoder {
         Ok(written)
     }
 
+    /// Ends decoding after an error. The reader may already have consumed
+    /// part of the failed run, so a later call must not continue from its
+    /// position: it returns an error until [`Self::set_data`] is called.
+    #[cold]
+    fn fail(&mut self, err: ParquetError) -> ParquetError {
+        self.bit_reader = None;
+        self.rle_left = 0;
+        self.bit_packed_left = 0;
+        self.current_value = None;
+        err
+    }
+
+    /// Reads the next run header. On an error the decoder is failed (see
+    /// [`Self::fail`]), so it never keeps the counter or the value of a
+    /// previous run.
     #[inline]
     fn reload(&mut self) -> Result<bool> {
-        let bit_reader = self
-            .bit_reader
-            .as_mut()
-            .ok_or_else(|| general_err!("bit_reader should be set"))?;
+        self.reload_run().map_err(|err| self.fail(err))
+    }
+
+    #[inline]
+    fn reload_run(&mut self) -> Result<bool> {
+        let bit_reader = self.bit_reader.as_mut().ok_or_else(|| {
+            general_err!("RLE decoder has no data: no page was set or an earlier read failed")
+        })?;
 
         if let Some(indicator_value) = bit_reader.get_vlq_int() {
             // fastparquet adds padding to the end of pages. This is not spec-compliant
@@ -864,7 +860,6 @@ impl RleDecoder {
             if indicator_value & 1 == 1 {
                 self.bit_packed_left = num_values;
             } else {
-                self.rle_left = num_values;
                 let value_width = bit_util::ceil(self.bit_width as usize, u8::BITS as usize);
                 let value = bit_reader.get_aligned::<u64>(value_width).ok_or_else(|| {
                     general_err!("parquet_data_error: not enough data for RLE decoding")
@@ -875,6 +870,8 @@ impl RleDecoder {
                         self.bit_width
                     ));
                 }
+                // Set the run only after its value is valid.
+                self.rle_left = num_values;
                 self.current_value = Some(value);
             }
             Ok(true)
@@ -882,6 +879,48 @@ impl RleDecoder {
             Ok(false)
         }
     }
+}
+
+/// Gathers `indices` from `dict` into `out` for any value type, 16 indices at
+/// a time. Returns an error for an index outside the dictionary.
+#[inline]
+fn gather_dictionary_chunks<T: Clone>(dict: &[T], idx: &[i32], out: &mut [T]) -> Result<()> {
+    #[cold]
+    #[inline(never)]
+    fn oob(max_idx: u32, dict_len: usize) -> ParquetError {
+        general_err!(
+            "dictionary index out of bounds: the len is {} but the index is {}",
+            dict_len,
+            max_idx
+        )
+    }
+    const CHUNK: usize = 16;
+    let dict_len = dict.len();
+    let (out_chunks, out_chunks_remainder) = out.as_chunks_mut::<CHUNK>();
+    let (idx_chunks, idx_chunks_remainder) = idx.as_chunks::<CHUNK>();
+    for (out_chunk, idx_chunk) in out_chunks.iter_mut().zip(idx_chunks) {
+        // u32 max-reduction instead of `.all(|&i| ..)`: `.all`
+        // short-circuits and blocks autovectorisation. Negative
+        // i32 cast to u32 becomes a large value so the bounds
+        // check still rejects it.
+        let max_idx = idx_chunk.iter().fold(0u32, |acc, &i| acc.max(i as u32));
+        if (max_idx as usize) >= dict_len {
+            return Err(oob(max_idx, dict_len));
+        }
+        for (b, i) in out_chunk.iter_mut().zip(idx_chunk.iter()) {
+            // SAFETY: all indices checked above to be in bounds
+            b.clone_from(unsafe { dict.get_unchecked(*i as usize) });
+        }
+    }
+    for (b, i) in out_chunks_remainder.iter_mut().zip(idx_chunks_remainder) {
+        let dict_idx = *i as usize;
+        if dict_idx >= dict_len {
+            return Err(oob(*i as u32, dict_len));
+        }
+        // SAFETY: bounds checked above
+        b.clone_from(unsafe { dict.get_unchecked(dict_idx) });
+    }
+    Ok(())
 }
 
 /// Validate one unpacked scratch batch before gathering its values. A complete
@@ -1902,5 +1941,101 @@ mod tests {
             assert!(bit_width < 64);
             test_round_trip(&values[..], bit_width);
         }
+    }
+}
+
+#[cfg(test)]
+mod invalid_input_tests {
+    use super::*;
+
+    /// Bit width 1: an RLE run of two 1s, then an RLE run of three values
+    /// whose value byte 0xff does not fit the bit width.
+    fn rle_run_then_invalid_value() -> Bytes {
+        Bytes::from_static(&[2 << 1, 1, 3 << 1, 0xff])
+    }
+
+    /// A failed reload must not leave the counter of the new run with the
+    /// value of the previous run. Before, a retry returned three more 1s.
+    #[test]
+    fn retry_after_an_invalid_run_value_fails() {
+        let mut decoder = RleDecoder::new(1);
+        decoder.set_data(rle_run_then_invalid_value()).unwrap();
+        let mut out = [0i32; 8];
+        let err = decoder.get_batch(&mut out).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: Invalid or corrupted RLE value 255 exceeds bit width 1"
+        );
+        for _ in 0..2 {
+            assert!(decoder.get_batch(&mut out).is_err());
+            assert!(decoder.skip(8).is_err());
+        }
+
+        // The dictionary paths: native primitive and any other type.
+        let mut decoder = RleDecoder::new(1);
+        decoder.set_data(rle_run_then_invalid_value()).unwrap();
+        let mut out = [0i64; 8];
+        assert!(decoder.get_batch_with_dict(&[10, 20], &mut out, 8).is_err());
+        assert!(decoder.get_batch_with_dict(&[10, 20], &mut out, 8).is_err());
+
+        let dict = ["a".to_string(), "b".to_string()];
+        let mut decoder = RleDecoder::new(1);
+        decoder.set_data(rle_run_then_invalid_value()).unwrap();
+        let mut out = vec![String::new(); 8];
+        assert!(decoder.get_batch_with_dict(&dict, &mut out, 8).is_err());
+        assert!(decoder.get_batch_with_dict(&dict, &mut out, 8).is_err());
+
+        // New page data makes the decoder usable again.
+        let mut decoder = RleDecoder::new(1);
+        decoder.set_data(rle_run_then_invalid_value()).unwrap();
+        let mut out = [0i32; 8];
+        assert!(decoder.get_batch(&mut out).is_err());
+        decoder.set_data(Bytes::from_static(&[2 << 1, 1])).unwrap();
+        assert_eq!(decoder.get_batch(&mut out).unwrap(), 2);
+        assert_eq!(&out[..2], &[1, 1]);
+    }
+
+    /// Bit width 3: one bit-packed group of eight indices 0, 1, 5, 0, 0, 0,
+    /// 0, 0. Index 5 is outside a dictionary of two values.
+    fn packed_group_with_invalid_index() -> Bytes {
+        let packed: u32 = (1 << 3) | (5 << 6);
+        Bytes::from(vec![(1 << 1) | 1, packed as u8, (packed >> 8) as u8, 0])
+    }
+
+    /// The scratch path reads the indices before it checks them. A retry
+    /// after an index error must not return the values after them. Before,
+    /// it returned the next four indices as valid values.
+    #[test]
+    fn retry_after_an_index_out_of_bounds_fails() {
+        // Four values at a time: fewer than a fused kernel takes, so every
+        // dispatch tier uses the scratch path.
+        let mut decoder = RleDecoder::new(3);
+        decoder.set_data(packed_group_with_invalid_index()).unwrap();
+        let mut out = [0i32; 4];
+        let err = decoder
+            .get_batch_with_dict(&[10, 20], &mut out, 4)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: dictionary index out of bounds: the len is 2 but the index is 5"
+        );
+        for _ in 0..2 {
+            assert!(decoder.get_batch_with_dict(&[10, 20], &mut out, 4).is_err());
+        }
+
+        let mut decoder = RleDecoder::new(3);
+        decoder.set_data(packed_group_with_invalid_index()).unwrap();
+        let mut spare = Vec::<i32>::with_capacity(4);
+        assert!(decoder.append_dictionary(&[10, 20], &mut spare, 4).is_err());
+        assert!(spare.is_empty());
+        assert!(decoder.append_dictionary(&[10, 20], &mut spare, 4).is_err());
+        assert!(spare.is_empty());
+
+        let dict = ["a".to_string(), "b".to_string()];
+        let mut decoder = RleDecoder::new(3);
+        decoder.set_data(packed_group_with_invalid_index()).unwrap();
+        let mut out = vec![String::new(); 4];
+        assert!(decoder.get_batch_with_dict(&dict, &mut out, 4).is_err());
+        assert!(decoder.get_batch_with_dict(&dict, &mut out, 4).is_err());
     }
 }

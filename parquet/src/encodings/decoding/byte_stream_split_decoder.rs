@@ -87,8 +87,11 @@ fn join_streams_variable(
 
 impl<T: DataType> Decoder<T> for ByteStreamSplitDecoder<T> {
     fn set_data(&mut self, data: Bytes, num_values: usize) -> Result<()> {
+        // `num_values` comes from the page header and can include NULLs. The
+        // streams hold `data.len() / type_size` values; never read more.
+        let stored_values = data.len() / T::get_type_size().max(1);
         self.encoded_bytes = data;
-        self.total_num_values = num_values;
+        self.total_num_values = num_values.min(stored_values);
         self.values_decoded = 0;
 
         Ok(())
@@ -165,6 +168,11 @@ impl<T: DataType> VariableWidthByteStreamSplitDecoder<T> {
 
 impl<T: DataType> Decoder<T> for VariableWidthByteStreamSplitDecoder<T> {
     fn set_data(&mut self, data: Bytes, num_values: usize) -> Result<()> {
+        if self.type_width == 0 {
+            return Err(general_err!(
+                "byte stream split unsupported for a type width of 0"
+            ));
+        }
         // Rough check that all data elements are the same length
         if !data.len().is_multiple_of(self.type_width) {
             return Err(general_err!(
@@ -175,8 +183,10 @@ impl<T: DataType> Decoder<T> for VariableWidthByteStreamSplitDecoder<T> {
 
         match T::get_physical_type() {
             Type::FIXED_LEN_BYTE_ARRAY => {
+                // As above: the page header count can exceed the stored values.
+                let stored_values = data.len() / self.type_width;
                 self.encoded_bytes = data;
-                self.total_num_values = num_values;
+                self.total_num_values = num_values.min(stored_values);
                 self.values_decoded = 0;
                 Ok(())
             }
@@ -258,5 +268,48 @@ impl<T: DataType> Decoder<T> for VariableWidthByteStreamSplitDecoder<T> {
         let to_skip = usize::min(self.values_left(), num_values);
         self.values_decoded += to_skip;
         Ok(to_skip)
+    }
+}
+
+#[cfg(test)]
+mod invalid_input_tests {
+    use super::*;
+    use crate::data_type::{FixedLenByteArrayType, FloatType};
+
+    /// The page header count can exceed the values in the streams. The
+    /// decoder gives the values that exist; before, it read past the end.
+    #[test]
+    fn value_count_larger_than_data() {
+        // Two `f32` values: four streams of two bytes.
+        let data = Bytes::from(vec![0, 0, 0, 0, 0x80, 0, 0x3F, 0x40]);
+
+        let mut decoder = ByteStreamSplitDecoder::<FloatType>::new();
+        decoder.set_data(data.clone(), 100).unwrap();
+        assert_eq!(decoder.values_left(), 2);
+        let mut out = [0f32; 10];
+        assert_eq!(decoder.get(&mut out).unwrap(), 2);
+        assert_eq!(&out[..2], &[1.0, 2.0]);
+        assert_eq!(decoder.get(&mut out).unwrap(), 0);
+
+        let mut decoder = ByteStreamSplitDecoder::<FloatType>::new();
+        decoder.set_data(data.clone(), 100).unwrap();
+        assert_eq!(decoder.skip(50).unwrap(), 2);
+        assert_eq!(decoder.get(&mut out).unwrap(), 0);
+
+        let mut decoder = VariableWidthByteStreamSplitDecoder::<FixedLenByteArrayType>::new(4);
+        decoder.set_data(data, 100).unwrap();
+        assert_eq!(decoder.values_left(), 2);
+        let mut out = vec![Default::default(); 10];
+        assert_eq!(decoder.get(&mut out).unwrap(), 2);
+    }
+
+    #[test]
+    fn zero_type_width_fails() {
+        let mut decoder = VariableWidthByteStreamSplitDecoder::<FixedLenByteArrayType>::new(0);
+        let err = decoder.set_data(Bytes::from(vec![0; 8]), 2).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: byte stream split unsupported for a type width of 0"
+        );
     }
 }

@@ -691,6 +691,14 @@ impl PackedDecoder {
                 let to_skip =
                     (self.packed_count - self.packed_offset).min(level_num - skipped_level);
                 let offset = self.data_offset * 8 + self.packed_offset;
+                // A packed run longer than the data is an error, as in `read`
+                // (`UnalignedBitChunk::new` panicked here before).
+                if offset + to_skip > self.data.len() * 8 {
+                    return Err(ParquetError::EOF(
+                        "unexpected end of file whilst decoding definition levels bit-packed run"
+                            .into(),
+                    ));
+                }
                 let bit_chunk = UnalignedBitChunk::new(self.data.as_ref(), offset, to_skip);
                 skipped_value += bit_chunk.count_ones();
                 self.packed_offset += to_skip;
@@ -991,5 +999,33 @@ mod tests {
             );
             assert_eq!(decoded.len(), 3);
         }
+    }
+}
+
+#[cfg(test)]
+mod invalid_input_tests {
+    use super::*;
+
+    /// A bit-packed run that declares more groups than the data holds is an
+    /// error in a skip, as in a read. Before, the skip panicked.
+    #[test]
+    fn skip_of_a_packed_run_past_data_fails() {
+        // One-byte and two-byte headers of 4 groups, with one byte of levels.
+        for header in [vec![(4 << 1) | 1], vec![0x81, 0x01]] {
+            let mut data = header;
+            data.push(0b0101_0101);
+            let mut decoder = PackedDecoder::new();
+            decoder.set_data(Encoding::RLE, Bytes::from(data));
+            let err = decoder.skip(32).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "EOF: unexpected end of file whilst decoding definition levels bit-packed run"
+            );
+        }
+
+        // A skip within the data still works.
+        let mut decoder = PackedDecoder::new();
+        decoder.set_data(Encoding::RLE, Bytes::from(vec![(1 << 1) | 1, 0b0101_0101]));
+        assert_eq!(decoder.skip(8).unwrap(), (4, 8));
     }
 }

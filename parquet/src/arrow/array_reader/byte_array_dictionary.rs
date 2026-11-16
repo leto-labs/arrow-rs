@@ -398,6 +398,14 @@ where
                         "Invalid or corrupted RLE bit width {bit_width}. Max allowed is {MAX_RLE_DICTIONARY_BIT_WIDTH}"
                     ));
                 }
+                // The indices decode directly into the key type.
+                if bit_width as usize > K::BIT_CAPACITY {
+                    return Err(general_err!(
+                        "dictionary index bit width {} exceeds the {} bits of the key type",
+                        bit_width,
+                        K::BIT_CAPACITY
+                    ));
+                }
                 let mut decoder = RleDecoder::new(bit_width);
                 decoder.set_data(data.slice(1..))?;
                 MaybeDictionaryDecoder::Dict {
@@ -981,5 +989,53 @@ mod tests {
             err.to_string(),
             "Parquet error: Invalid or corrupted RLE value 255 exceeds bit width 1"
         );
+    }
+}
+
+#[cfg(test)]
+mod invalid_input_tests {
+    use super::*;
+    use crate::arrow::array_reader::test_util::{encode_dictionary, utf8_column};
+    use crate::arrow::record_reader::buffer::ValuesBuffer;
+    use crate::data_type::ByteArray;
+
+    /// The indices decode into the key type, so the index bit width of a page
+    /// cannot exceed the key width. Before, a wider index made the bit reader
+    /// panic.
+    #[test]
+    fn index_bit_width_is_checked() {
+        let data: Vec<_> = ["a", "b"].into_iter().map(ByteArray::from).collect();
+        let (dict, _) = encode_dictionary(&data);
+        let column_desc = utf8_column();
+
+        let mut decoder = DictionaryDecoder::<u8, i32>::new(&column_desc);
+        decoder
+            .set_dict(dict, 2, Encoding::RLE_DICTIONARY, false)
+            .unwrap();
+
+        // Width 16, then an RLE run of two indices with the value 1.
+        let wide = Bytes::from(vec![16, 2 << 1, 1, 0]);
+        let err = decoder
+            .set_data(Encoding::RLE_DICTIONARY, wide, 2, None)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: dictionary index bit width 16 exceeds the 8 bits of the key type"
+        );
+
+        let err = decoder
+            .set_data(Encoding::RLE_DICTIONARY, Bytes::new(), 2, None)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: dictionary index page is empty"
+        );
+
+        let narrow = Bytes::from(vec![8, 2 << 1, 1]);
+        decoder
+            .set_data(Encoding::RLE_DICTIONARY, narrow, 2, None)
+            .unwrap();
+        let mut output = DictionaryBuffer::<u8, i32>::with_capacity(0);
+        assert_eq!(decoder.read(&mut output, 2).unwrap(), 2);
     }
 }

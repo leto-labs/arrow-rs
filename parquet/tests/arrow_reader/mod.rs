@@ -46,6 +46,7 @@ mod bloom_filter;
 mod checksum;
 mod custom_page_index_provider;
 mod int96_stats_roundtrip;
+mod invalid_files;
 mod invalid_utf8;
 mod io;
 mod large_string_overflow;

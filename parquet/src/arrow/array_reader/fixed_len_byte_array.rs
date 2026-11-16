@@ -420,16 +420,26 @@ impl ValueDecoder {
                 Ok(to_read)
             }
             Decoder::Dict { decoder } => {
-                let dict = self.dict_page.as_ref().unwrap();
+                let dict = self
+                    .dict_page
+                    .as_ref()
+                    .ok_or_else(|| general_err!("missing dictionary page for column"))?;
+                // All data must be NULL
                 if dict.is_empty() {
                     return Ok(0);
                 }
 
+                let byte_length = self.byte_length;
                 decoder.read(num_values, |keys| {
-                    out.reserve(keys.len() * self.byte_length);
+                    out.reserve(keys.len() * byte_length);
                     for key in keys {
-                        let offset = *key as usize * self.byte_length;
-                        out.extend_from_slice(&dict.as_ref()[offset..offset + self.byte_length]);
+                        // The key is page data. A key outside the dictionary
+                        // is an error, as in the byte array readers.
+                        let val = (*key as u32 as usize)
+                            .checked_mul(byte_length)
+                            .and_then(|offset| dict.get(offset..offset.checked_add(byte_length)?))
+                            .ok_or_else(|| general_err!("invalid key={} for dictionary", *key))?;
+                        out.extend_from_slice(val);
                     }
                     Ok(())
                 })
@@ -663,5 +673,70 @@ mod tests {
         assert_eq!(&written.slice(0, 3), &read[0]);
         assert_eq!(&written.slice(3, 3), &read[1]);
         assert_eq!(&written.slice(6, 1), &read[2]);
+    }
+}
+
+#[cfg(test)]
+mod invalid_input_tests {
+    use super::*;
+    use crate::basic::Type as PhysicalType;
+    use crate::schema::types::{ColumnDescriptor, ColumnPath, Type};
+
+    fn decoder() -> ValueDecoder {
+        let field = Type::primitive_type_builder("v", PhysicalType::FIXED_LEN_BYTE_ARRAY)
+            .with_length(2)
+            .build()
+            .unwrap();
+        let column = ColumnDescriptor::new(Arc::new(field), 0, 0, ColumnPath::from("v"));
+        ValueDecoder::new(&Arc::new(column))
+    }
+
+    /// Dictionary indices with a bit width of 3: one bit-packed group that
+    /// holds the keys 0, 1, `key` and five zeros.
+    fn indices(key: u32) -> Bytes {
+        let packed = (1 << 3) | (key << 6);
+        Bytes::from(vec![3, 0x03, packed as u8, (packed >> 8) as u8, 0])
+    }
+
+    /// A dictionary key is page data. A key outside the dictionary indexed
+    /// the dictionary page past its end.
+    #[test]
+    fn dictionary_key_outside_the_dictionary_fails() {
+        let mut decoder = decoder();
+        decoder
+            .set_dict(Bytes::from_static(b"aabb"), 2, Encoding::PLAIN, false)
+            .unwrap();
+
+        decoder
+            .set_data(Encoding::RLE_DICTIONARY, indices(1), 3, None)
+            .unwrap();
+        let mut out = FixedLenByteArrayBuffer::default();
+        assert_eq!(decoder.read(&mut out, 3).unwrap(), 3);
+        assert_eq!(out.buffer, b"aabbbb");
+
+        decoder
+            .set_data(Encoding::RLE_DICTIONARY, indices(5), 3, None)
+            .unwrap();
+        let mut out = FixedLenByteArrayBuffer::default();
+        let err = decoder.read(&mut out, 3).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: invalid key=5 for dictionary"
+        );
+    }
+
+    /// A dictionary-encoded data page without a dictionary page before it.
+    #[test]
+    fn dictionary_page_is_required() {
+        let mut decoder = decoder();
+        decoder
+            .set_data(Encoding::RLE_DICTIONARY, indices(1), 3, None)
+            .unwrap();
+        let mut out = FixedLenByteArrayBuffer::default();
+        let err = decoder.read(&mut out, 3).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: missing dictionary page for column"
+        );
     }
 }

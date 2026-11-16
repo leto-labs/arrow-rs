@@ -382,7 +382,9 @@ impl ByteArrayDecoderPlain {
         output.offsets.reserve(to_read);
 
         let remaining_bytes = self.buf.len() - self.offset;
-        if remaining_bytes == 0 {
+        // `to_read == 0` also covers a page that declares zero values but
+        // has value bytes; the byte estimate below divides by that count.
+        if remaining_bytes == 0 || to_read == 0 {
             return Ok(0);
         }
 
@@ -433,8 +435,13 @@ impl ByteArrayDecoderPlain {
             }
             let len_bytes: [u8; 4] = buf[self.offset..self.offset + 4].try_into().unwrap();
             let len = u32::from_le_bytes(len_bytes) as usize;
+            let end_offset = self.offset + 4 + len;
+            // Keep `offset` inside the buffer, as `read` does.
+            if end_offset > buf.len() {
+                return Err(ParquetError::EOF("eof decoding byte array".into()));
+            }
             skip += 1;
-            self.offset = self.offset + 4 + len;
+            self.offset = end_offset;
         }
         self.max_remaining_values -= skip;
         Ok(skip)
@@ -766,5 +773,40 @@ mod tests {
         assert_eq!(output.values.as_slice(), b"foo");
         assert_eq!(output.offsets.as_slice(), &[0, 3]);
         assert_eq!(decoder.max_remaining_values, 1);
+    }
+}
+
+#[cfg(test)]
+mod invalid_input_tests {
+    use super::*;
+
+    /// One value of length 100 in a buffer that holds one byte of it.
+    fn truncated_value() -> Bytes {
+        let mut data = 100u32.to_le_bytes().to_vec();
+        data.push(b'a');
+        Bytes::from(data)
+    }
+
+    /// A skip must not move the offset past the buffer. Before, the next read
+    /// subtracted that offset from the buffer length.
+    #[test]
+    fn plain_skip_past_end_fails() {
+        let mut decoder = ByteArrayDecoderPlain::new(truncated_value(), 2, None, false);
+        let err = decoder.skip(1).unwrap_err();
+        assert_eq!(err.to_string(), "EOF: eof decoding byte array");
+
+        let mut output = OffsetBuffer::<i32>::with_capacity(0);
+        let err = decoder.read(&mut output, 1).unwrap_err();
+        assert_eq!(err.to_string(), "EOF: eof decoding byte array");
+    }
+
+    /// A page can declare zero values and still hold value bytes: the
+    /// regression file is a dictionary page. Before, the byte estimate
+    /// divided by that count.
+    #[test]
+    fn plain_read_without_declared_values_reads_nothing() {
+        let mut decoder = ByteArrayDecoderPlain::new(truncated_value(), 2, Some(0), false);
+        let mut output = OffsetBuffer::<i32>::with_capacity(0);
+        assert_eq!(decoder.read(&mut output, 1).unwrap(), 0);
     }
 }

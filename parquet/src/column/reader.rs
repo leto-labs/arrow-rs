@@ -380,6 +380,15 @@ where
                     let (mut records_read, levels_read) =
                         decoder.skip_rep_levels(remaining_records, remaining_levels)?;
 
+                    if records_read == 0 && levels_read == 0 && remaining_levels != 0 {
+                        // The page has levels left, but the decoder has none:
+                        // without this check the loop does not end. A page
+                        // without values has no levels left and is not an
+                        // error.
+                        return Err(general_err!(
+                            "Insufficient repetition levels read from column"
+                        ));
+                    }
                     if levels_read == remaining_levels && self.has_record_delimiter {
                         check_partial_record_fits(records_read, remaining_records)?;
                         records_read += decoder.flush_partial() as usize;
@@ -634,6 +643,21 @@ where
                                 ));
                             }
 
+                            // Page readers other than the serialized reader can
+                            // supply these lengths, so check them where they index.
+                            let levels_byte_len =
+                                u64::from(rep_levels_byte_len) + u64::from(def_levels_byte_len);
+                            let levels_byte_len = usize::try_from(levels_byte_len)
+                                .ok()
+                                .filter(|len| *len <= buf.len())
+                                .ok_or_else(|| {
+                                    general_err!(
+                                        "DataPage v2 levels need {} bytes, but the page has {} bytes",
+                                        levels_byte_len,
+                                        buf.len()
+                                    )
+                                })?;
+
                             self.num_buffered_values = num_values as _;
                             self.num_decoded_values = 0;
 
@@ -659,15 +683,11 @@ where
                             if self.descr.max_def_level() > 0 {
                                 self.def_level_decoder.as_mut().unwrap().set_data(
                                     Encoding::RLE,
-                                    buf.slice(
-                                        rep_levels_byte_len as usize
-                                            ..(rep_levels_byte_len + def_levels_byte_len) as usize,
-                                    ),
+                                    buf.slice(rep_levels_byte_len as usize..levels_byte_len),
                                 )?;
                             }
 
-                            let data =
-                                buf.slice((rep_levels_byte_len + def_levels_byte_len) as usize..);
+                            let data = buf.slice(levels_byte_len..);
                             let (encoding, data) =
                                 if self.descr.physical_type() == Type::FIXED_LEN_BYTE_ARRAY {
                                     normalize_fixed_len_byte_array_data(
@@ -752,6 +772,9 @@ fn parse_v1_level(
         Encoding::BIT_PACKED => {
             let bit_width = num_required_bits(max_level as u64);
             let num_bytes = ceil(num_buffered_values as usize * bit_width as usize, 8);
+            if num_bytes > buf.len() {
+                return Err(general_err!("not enough data to read levels"));
+            }
             Ok((num_bytes, buf.slice(..num_bytes)))
         }
         _ => Err(general_err!("invalid level encoding: {}", encoding)),
@@ -2112,5 +2135,186 @@ mod tests {
         assert_eq!(values, vec![70, 80], "should contain 4th record's values");
         assert_eq!(rep_levels, vec![0, 1], "rep levels for a 2-element list");
         assert_eq!(def_levels, vec![1, 1], "def levels (all non-null)");
+    }
+}
+
+#[cfg(test)]
+mod invalid_input_tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use crate::basic::Type as PhysicalType;
+    use crate::schema::types::{ColumnDescriptor, ColumnPath, Type as SchemaType};
+    use crate::util::test_common::page_util::InMemoryPageReader;
+
+    /// An `INT32` list element column: one repetition and one definition level.
+    fn list_element_reader(pages: Vec<Page>) -> ColumnReaderImpl<Int32Type> {
+        let primitive_type = SchemaType::primitive_type_builder("element", PhysicalType::INT32)
+            .with_repetition(Repetition::REQUIRED)
+            .build()
+            .unwrap();
+        let desc = Arc::new(ColumnDescriptor::new(
+            Arc::new(primitive_type),
+            1,
+            1,
+            ColumnPath::new(vec!["list".to_string(), "element".to_string()]),
+        ));
+        let page_reader = InMemoryPageReader::new(pages);
+        get_typed_column_reader(get_column_reader(desc, Box::new(page_reader)))
+    }
+
+    fn v2_page(
+        rep_levels: &[u8],
+        def_levels: &[u8],
+        values: &[i32],
+        num_values: u32,
+        encoding: Encoding,
+    ) -> Page {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(rep_levels);
+        buf.extend_from_slice(def_levels);
+        buf.extend(values.iter().flat_map(|v| v.to_le_bytes()));
+        Page::DataPageV2 {
+            buf: Bytes::from(buf),
+            num_values,
+            encoding,
+            num_nulls: 0,
+            // More rows than a test skips, so the reader loads the page.
+            num_rows: 100,
+            def_levels_byte_len: def_levels.len() as u32,
+            rep_levels_byte_len: rep_levels.len() as u32,
+            is_compressed: false,
+            statistics: None,
+        }
+    }
+
+    /// RLE run header and value: `count` levels of `value`.
+    fn rle_run(count: u8, value: u8) -> [u8; 2] {
+        [count << 1, value]
+    }
+
+    /// The page declares four values but has two repetition levels. The skip
+    /// must fail when the levels end; before, it did not end.
+    #[test]
+    fn skip_records_with_too_few_repetition_levels_fails() {
+        let page = v2_page(
+            &rle_run(2, 0),
+            &rle_run(4, 1),
+            &[1, 2, 3, 4],
+            4,
+            Encoding::PLAIN,
+        );
+        let mut reader = list_element_reader(vec![page]);
+        let err = reader.skip_records(3).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: Insufficient repetition levels read from column"
+        );
+    }
+
+    /// A V1 data page without values is valid. The skip continues with the
+    /// next page, as it did before the progress check.
+    #[test]
+    fn skip_records_over_a_page_without_values() {
+        // RLE levels of a V1 page have a 4-byte length; both are empty here.
+        let empty = Page::DataPage {
+            buf: Bytes::from(vec![0; 8]),
+            num_values: 0,
+            encoding: Encoding::PLAIN,
+            def_level_encoding: Encoding::RLE,
+            rep_level_encoding: Encoding::RLE,
+            statistics: None,
+        };
+        // Two records of two values each.
+        let page = v2_page(
+            &[(2 << 1) | 1, 0b1010],
+            &rle_run(4, 1),
+            &[1, 2, 3, 4],
+            4,
+            Encoding::PLAIN,
+        );
+        let mut reader = list_element_reader(vec![empty, page]);
+        assert_eq!(reader.skip_records(1).unwrap(), 1);
+
+        let (mut values, mut def_levels, mut rep_levels) = (vec![], vec![], vec![]);
+        let (records, values_read, levels_read) = reader
+            .read_records(1, Some(&mut def_levels), Some(&mut rep_levels), &mut values)
+            .unwrap();
+        assert_eq!((records, values_read, levels_read), (1, 2, 2));
+        assert_eq!(values, vec![3, 4]);
+    }
+
+    /// The level lengths of a page come from its header and can exceed the
+    /// page data.
+    #[test]
+    fn v2_levels_longer_than_page_fails() {
+        let mut page = v2_page(
+            &rle_run(4, 0),
+            &rle_run(4, 1),
+            &[1, 2, 3, 4],
+            4,
+            Encoding::PLAIN,
+        );
+        let Page::DataPageV2 {
+            rep_levels_byte_len,
+            def_levels_byte_len,
+            ..
+        } = &mut page
+        else {
+            unreachable!()
+        };
+        *rep_levels_byte_len = 12;
+        *def_levels_byte_len = u32::MAX;
+
+        for skip in [false, true] {
+            let mut reader = list_element_reader(vec![page.clone()]);
+            let result = if skip {
+                reader.skip_records(1)
+            } else {
+                let (mut values, mut def_levels, mut rep_levels) = (vec![], vec![], vec![]);
+                reader
+                    .read_records(1, Some(&mut def_levels), Some(&mut rep_levels), &mut values)
+                    .map(|(records, _, _)| records)
+            };
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "Parquet error: DataPage v2 levels need 4294967307 bytes, but the page has 20 bytes"
+            );
+        }
+    }
+
+    /// A dictionary-encoded data page needs a dictionary page before it.
+    #[test]
+    fn dictionary_data_page_without_dictionary_fails() {
+        let page = v2_page(
+            &rle_run(4, 0),
+            &rle_run(4, 1),
+            &[0],
+            4,
+            Encoding::RLE_DICTIONARY,
+        );
+        let mut reader = list_element_reader(vec![page]);
+        let err = reader.skip_records(1).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: missing dictionary page for column"
+        );
+    }
+
+    #[test]
+    #[expect(deprecated)]
+    fn bit_packed_levels_longer_than_page_fails() {
+        // 100 levels of one bit need 13 bytes.
+        let buf = Bytes::from(vec![0; 12]);
+        let err = parse_v1_level(1, 100, Encoding::BIT_PACKED, buf).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: not enough data to read levels"
+        );
+
+        let buf = Bytes::from(vec![0; 13]);
+        let (bytes_read, levels) = parse_v1_level(1, 100, Encoding::BIT_PACKED, buf).unwrap();
+        assert_eq!((bytes_read, levels.len()), (13, 13));
     }
 }

@@ -1176,12 +1176,9 @@ impl BitReader {
     /// is first advanced to the next byte boundary before decoding.
     ///
     /// Returns `Some(value)` on success, or `None` if the buffer is exhausted
-    /// before a complete VLQ value is read.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the encoded integer is longer than [`MAX_VLQ_BYTE_LEN`]
-    /// bytes (bad input).
+    /// before a complete VLQ value is read, or if the encoded integer is
+    /// longer than [`MAX_VLQ_BYTE_LEN`] bytes (bad input). On `None` the
+    /// reader does not move past the alignment boundary.
     pub fn get_vlq_int(&mut self) -> Option<i64> {
         // Align to byte boundary once, then read bytes directly
         self.byte_offset = self.get_byte_offset();
@@ -1191,13 +1188,10 @@ impl BitReader {
         let mut shift = 0;
         let mut v: i64 = 0;
 
-        for (i, &byte) in buf.iter().enumerate() {
+        // The last permitted byte has shift 63, so the shift cannot overflow.
+        for (i, &byte) in buf.iter().take(MAX_VLQ_BYTE_LEN).enumerate() {
             v |= ((byte & 0x7F) as i64) << shift;
             shift += 7;
-            assert!(
-                shift <= MAX_VLQ_BYTE_LEN * 7,
-                "Num of bytes exceed MAX_VLQ_BYTE_LEN ({MAX_VLQ_BYTE_LEN})"
-            );
             if byte & 0x80 == 0 {
                 self.byte_offset += i + 1;
                 return Some(v);
@@ -1904,5 +1898,27 @@ mod tests {
             // Values should be read correctly
             assert_eq!(v, 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod invalid_input_tests {
+    use super::*;
+
+    #[test]
+    fn vlq_longer_than_the_maximum_is_none() {
+        // Ten bytes is the longest valid encoding.
+        let mut longest = vec![0xFF; MAX_VLQ_BYTE_LEN - 1];
+        longest.push(0x01);
+        let mut reader = BitReader::from(longest);
+        assert_eq!(reader.get_vlq_int(), Some(-1));
+
+        // Eleven bytes made the reader panic.
+        let mut too_long = vec![0x80; MAX_VLQ_BYTE_LEN];
+        too_long.push(0x01);
+        let mut reader = BitReader::from(too_long);
+        assert_eq!(reader.get_vlq_int(), None);
+        assert_eq!(reader.get_zigzag_vlq_int(), None);
+        assert_eq!(reader.get_byte_offset(), 0);
     }
 }
