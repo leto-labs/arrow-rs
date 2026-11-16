@@ -22,7 +22,9 @@ use crate::column::page::{PageIterator, PageReader};
 use crate::errors::ParquetError;
 use crate::file::metadata::page_index::RowGroupPageIndex;
 use crate::file::metadata::{ParquetMetaData, RowGroupMetaData};
+use crate::file::page_cache::{PageCache, PinnedPages, page_cache_applies};
 use crate::file::page_index::offset_index::PageLocation;
+use crate::file::properties::ReaderProperties;
 use crate::file::reader::{ChunkReader, Length, SerializedPageReader};
 use bytes::{Buf, Bytes};
 use std::ops::Range;
@@ -59,8 +61,14 @@ impl InMemoryRowGroup<'_> {
     /// accounting for what data is cached.
     ///
     /// The ranges of each column chunk come from [`ColumnFetch`].
+    ///
+    /// With a page cache in the metadata, a column chunk whose needed pages
+    /// (the pages of its [`ColumnFetch`]) are all resident is not fetched:
+    /// its pages are pinned in `column_chunks` as [`ColumnChunkData::Cached`],
+    /// where [`Self::fill_column_chunks`] skips it, and its page reader holds
+    /// them until it is dropped.
     pub(crate) fn fetch_ranges(
-        &self,
+        &mut self,
         projection: &ProjectionMask,
         selection: Option<&RowSelection>,
         batch_size: usize,
@@ -77,6 +85,9 @@ impl InMemoryRowGroup<'_> {
         // Consider preallocating outer vec: https://github.com/apache/arrow-rs/issues/8667
         let mut page_start_offsets: Option<Vec<Option<Vec<u64>>>> = page_index.map(|_| vec![]);
         let mut ranges = vec![];
+        let mut cached = vec![];
+        // `column_chunks` reads with the default reader properties.
+        let read_page_stats = ReaderProperties::builder().build().read_page_stats();
         let columns = columns_to_fetch(projection, self.column_chunks.len(), |idx| {
             self.column_chunks[idx].is_some()
         });
@@ -86,8 +97,24 @@ impl InMemoryRowGroup<'_> {
                 .map(|offset_index| offset_index.page_locations().as_slice());
             let column_selection =
                 column_selection(selection, expanded_selection.as_ref(), cache_mask, idx);
-            let (start, len) = metadata.column(idx).byte_range();
+            let column = metadata.column(idx);
+            let (start, len) = column.byte_range();
             let fetch = ColumnFetch::new(start..start + len, locations, column_selection);
+            if let Some(pages) = self
+                .metadata
+                .page_cache()
+                .filter(|_| page_cache_applies(column, read_page_stats))
+                .and_then(|cache| fetch.pin(cache.as_ref()))
+            {
+                cached.push((
+                    idx,
+                    ColumnChunkData::Cached {
+                        length: len as usize,
+                        pages: Arc::new(pages),
+                    },
+                ));
+                continue;
+            }
             let first = ranges.len();
             ranges.extend(fetch.ranges());
             if let Some(page_start_offsets) = page_start_offsets.as_mut() {
@@ -99,6 +126,9 @@ impl InMemoryRowGroup<'_> {
                     }
                 });
             }
+        }
+        for (idx, chunk) in cached {
+            self.column_chunks[idx] = Some(Arc::new(chunk));
         }
         FetchRanges {
             ranges,
@@ -262,6 +292,21 @@ impl<'a> ColumnFetch<'a> {
         }
     }
 
+    /// Pins the pages of this fetch in `cache`: the pages of the dictionary
+    /// range and of the selected data pages, or the pages that cover the
+    /// whole column chunk. Returns `None` unless every one is resident.
+    fn pin(&self, cache: &dyn PageCache) -> Option<PinnedPages> {
+        match self {
+            Self::Chunk { range } => PinnedPages::contiguous(cache, range.start, range.end),
+            Self::Pages { .. } => {
+                // Each range of a page fetch is one page and starts at its
+                // header.
+                let offsets: Vec<u64> = self.ranges().map(|range| range.start).collect();
+                PinnedPages::at_offsets(cache, &offsets)
+            }
+        }
+    }
+
     /// The byte ranges to fetch, in file order.
     pub(crate) fn ranges(&self) -> impl Iterator<Item = Range<u64>> + '_ {
         let (chunk, dictionary, pages) = match self {
@@ -325,6 +370,12 @@ impl RowGroups for InMemoryRowGroup<'_> {
                     self.metadata,
                     column_chunk_metadata,
                 )?;
+                let pinned = match data.as_ref() {
+                    ColumnChunkData::Cached { pages, .. } => Some(Arc::clone(pages)),
+                    _ => None,
+                };
+                let page_reader =
+                    page_reader.with_page_cache(self.metadata.page_cache().cloned(), pinned);
 
                 let page_reader: Box<dyn PageReader> = Box::new(page_reader);
 
@@ -363,6 +414,14 @@ pub(crate) enum ColumnChunkData {
     },
     /// Full column chunk and the offset within the original file
     Dense { offset: usize, data: Bytes },
+    /// No bytes of the column chunk were fetched, because every page that
+    /// the read needs was in the decompressed page cache.
+    Cached {
+        /// Length of the full column chunk
+        length: usize,
+        /// The needed pages, held for as long as this chunk is read.
+        pages: Arc<PinnedPages>,
+    },
 }
 
 impl ColumnChunkData {
@@ -383,6 +442,9 @@ impl ColumnChunkData {
                 let start = start as usize - *offset;
                 Ok(data.slice(start..))
             }
+            ColumnChunkData::Cached { .. } => Err(ParquetError::General(format!(
+                "Page at offset {start} is not pinned from the page cache and its column chunk was not fetched"
+            ))),
         }
     }
 }
@@ -393,6 +455,7 @@ impl Length for ColumnChunkData {
         match &self {
             ColumnChunkData::Sparse { length, .. } => *length as u64,
             ColumnChunkData::Dense { data, .. } => data.len() as u64,
+            ColumnChunkData::Cached { length, .. } => *length as u64,
         }
     }
 }

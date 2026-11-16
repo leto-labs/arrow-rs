@@ -216,7 +216,7 @@ impl<'a> DataRequestBuilder<'a> {
         // Create an InMemoryRowGroup to hold the column chunks, this is a
         // temporary structure used to tell the ArrowReaders what pages are
         // needed for decoding
-        let row_group = InMemoryRowGroup {
+        let mut row_group = InMemoryRowGroup {
             row_count,
             column_chunks,
             page_index,

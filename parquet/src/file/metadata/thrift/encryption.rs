@@ -300,6 +300,7 @@ pub(crate) fn parquet_metadata_with_encryption(
         row_groups,
         page_index: _,
         file_decryptor: _,
+        page_cache: _,
     } = parquet_meta;
 
     // Take the encryption algorithm and footer signing key metadata as they are no longer

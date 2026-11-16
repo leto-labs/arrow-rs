@@ -75,6 +75,7 @@ pub(crate) use crate::file::metadata::memory::HeapSize;
 use crate::file::metadata::page_index::{PageIndex, PageIndexProvider, RowGroupPageIndex};
 #[cfg(feature = "encryption")]
 use crate::file::metadata::thrift::encryption::EncryptionAlgorithm;
+use crate::file::page_cache::PageCache;
 use crate::file::page_index::column_index::{ByteArrayColumnIndex, PrimitiveColumnIndex};
 use crate::file::page_index::{column_index::ColumnIndexMetaData, offset_index::PageLocation};
 use crate::file::statistics::Statistics;
@@ -130,6 +131,9 @@ pub struct ParquetMetaData {
     /// Optional file decryptor
     #[cfg(feature = "encryption")]
     file_decryptor: Option<Box<FileDecryptor>>,
+    /// The decompressed page cache of this file generation, if the engine
+    /// attached one. Not part of equality.
+    page_cache: Option<Arc<dyn PageCache>>,
 }
 
 impl ParquetMetaData {
@@ -142,7 +146,28 @@ impl ParquetMetaData {
             page_index: None,
             #[cfg(feature = "encryption")]
             file_decryptor: None,
+            page_cache: None,
         }
+    }
+
+    /// Returns this metadata with `cache` as the decompressed page cache of
+    /// its file. Every reader that the push decoder builds from the returned
+    /// value looks pages up in `cache` before it reads and decompresses them,
+    /// and its fetch planning does not request column chunks whose needed
+    /// pages are resident. See [`page_cache`](crate::file::page_cache).
+    ///
+    /// The caller guarantees that `cache` holds pages of exactly the file
+    /// generation that this metadata describes. The handle takes no part in
+    /// equality. [`ParquetMetaDataBuilder`] and a later page index load keep
+    /// it.
+    pub fn with_page_cache(mut self, cache: Option<Arc<dyn PageCache>>) -> Self {
+        self.page_cache = cache;
+        self
+    }
+
+    /// The decompressed page cache attached with [`Self::with_page_cache`].
+    pub fn page_cache(&self) -> Option<&Arc<dyn PageCache>> {
+        self.page_cache.as_ref()
     }
 
     /// Adds [`FileDecryptor`] to this metadata instance to enable decryption of
@@ -267,6 +292,12 @@ impl ParquetMetaData {
     }
 }
 
+/// The page cache handle takes no part in equality. Equality compares what
+/// the file says: two values that describe the same file are equal whether
+/// or not an engine attached a cache, and the handle is a trait object with
+/// no value to compare. The engine attaches a handle to the metadata of
+/// exactly one file generation (see [`ParquetMetaData::with_page_cache`]), so
+/// equal metadata never needs different pages.
 impl PartialEq for ParquetMetaData {
     fn eq(&self, other: &Self) -> bool {
         // Compare file metadata and row groups
@@ -2085,9 +2116,9 @@ mod tests {
 
         // Base size without page index
         #[cfg(not(feature = "encryption"))]
-        let base_expected_size = 2766;
+        let base_expected_size = 2782;
         #[cfg(feature = "encryption")]
-        let base_expected_size = 2934;
+        let base_expected_size = 2950;
 
         assert_eq!(parquet_meta.memory_size(), base_expected_size);
 
@@ -2122,9 +2153,9 @@ mod tests {
 
         // Size with page index (includes Arc overhead plus PageIndex heap size)
         #[cfg(not(feature = "encryption"))]
-        let bigger_expected_size = 3280;
+        let bigger_expected_size = 3296;
         #[cfg(feature = "encryption")]
-        let bigger_expected_size = 3448;
+        let bigger_expected_size = 3464;
 
         // more set fields means more memory usage
         assert!(bigger_expected_size > base_expected_size);
@@ -2171,7 +2202,7 @@ mod tests {
             .set_row_groups(row_group_meta.clone())
             .build();
 
-        let base_expected_size = 2042;
+        let base_expected_size = 2058;
         assert_eq!(parquet_meta_data.memory_size(), base_expected_size);
 
         let footer_key = b"0123456789012345";
@@ -2197,7 +2228,7 @@ mod tests {
             .set_file_decryptor(Some(decryptor))
             .build();
 
-        let expected_size_with_decryptor = 3056;
+        let expected_size_with_decryptor = 3072;
         assert!(expected_size_with_decryptor > base_expected_size);
 
         assert_eq!(
