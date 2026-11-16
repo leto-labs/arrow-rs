@@ -23,8 +23,7 @@ use crate::arrow::schema::parquet_to_arrow_field;
 use crate::basic::{ConvertedType, Encoding};
 use crate::column::page::PageIterator;
 use crate::column::reader::decoder::ColumnValueDecoder;
-use crate::data_type::Int32Type;
-use crate::encodings::decoding::{Decoder, DeltaBitPackDecoder};
+use crate::encodings::decoding::DeltaLengths;
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 use crate::util::utf8::check_valid_utf8;
@@ -177,6 +176,17 @@ impl ColumnValueDecoder for ByteViewArrayColumnValueDecoder {
         }
 
         let num_values = num_values as usize;
+        // The count is from the page header and sizes the dictionary. Each
+        // value has a four-byte length, so the page holds at most a quarter
+        // of its bytes in values.
+        if num_values > buf.len() / 4 {
+            return Err(general_err!(
+                "dictionary page declares {} values, but its {} bytes hold at most {}",
+                num_values,
+                buf.len(),
+                buf.len() / 4
+            ));
+        }
         let mut buffer = ViewBuffer::with_capacity(num_values);
         let mut decoder =
             ByteViewArrayDecoderPlain::new(buf, num_values, Some(num_values), self.validate_utf8);
@@ -249,12 +259,20 @@ impl ByteViewArrayDecoder {
                     data, num_levels, num_values,
                 )?)
             }
-            Encoding::DELTA_LENGTH_BYTE_ARRAY => ByteViewArrayDecoder::DeltaLength(
-                ByteViewArrayDecoderDeltaLength::new(data, validate_utf8)?,
-            ),
-            Encoding::DELTA_BYTE_ARRAY => ByteViewArrayDecoder::DeltaByteArray(
-                ByteViewArrayDecoderDelta::new(data, validate_utf8)?,
-            ),
+            Encoding::DELTA_LENGTH_BYTE_ARRAY => {
+                ByteViewArrayDecoder::DeltaLength(ByteViewArrayDecoderDeltaLength::new(
+                    data,
+                    num_values.unwrap_or(num_levels),
+                    validate_utf8,
+                )?)
+            }
+            Encoding::DELTA_BYTE_ARRAY => {
+                ByteViewArrayDecoder::DeltaByteArray(ByteViewArrayDecoderDelta::new(
+                    data,
+                    num_values.unwrap_or(num_levels),
+                    validate_utf8,
+                )?)
+            }
             _ => {
                 return Err(general_err!(
                     "unsupported encoding for byte array: {}",
@@ -357,6 +375,12 @@ impl ByteViewArrayDecoderPlain {
         let mut end_offset = self.offset;
         let mut utf8_validation_begin = end_offset;
 
+        // Each value has a four-byte length. If the remaining bytes cannot
+        // hold `to_read` values, the loop below ends with this error; return
+        // it before the reservation, which is as large as the header declares.
+        if to_read > (buf_len - end_offset) / 4 {
+            return Err(ParquetError::EOF("eof decoding byte array".into()));
+        }
         output.views.reserve(to_read);
 
         // Safety: we reserved enough space in output.views
@@ -574,94 +598,102 @@ impl ByteViewArrayDecoderDictionary {
 
 /// Decoder from [`Encoding::DELTA_LENGTH_BYTE_ARRAY`] data to [`ViewBuffer`]
 pub struct ByteViewArrayDecoderDeltaLength {
-    lengths: Vec<i32>,
+    /// The lengths, decoded a window at a time. Boxed: the decoder enum
+    /// holds this beside much smaller decoders.
+    lengths: Box<DeltaLengths>,
     data: Bytes,
-    length_offset: usize,
     data_offset: usize,
     validate_utf8: bool,
 }
 
 impl ByteViewArrayDecoderDeltaLength {
-    fn new(data: Bytes, validate_utf8: bool) -> Result<Self> {
-        let mut len_decoder = DeltaBitPackDecoder::<Int32Type>::new();
-        len_decoder.set_data(data.clone(), 0)?;
-        let values = len_decoder.values_left();
-
-        let mut lengths = vec![0; values];
-        len_decoder.get(&mut lengths)?;
-
-        let mut total_bytes = 0;
-
-        for l in &lengths {
-            if *l < 0 {
-                return Err(ParquetError::General(
-                    "negative delta length byte array length".to_string(),
-                ));
-            }
-            total_bytes += *l as usize;
-        }
-
-        if total_bytes + len_decoder.get_offset() > data.len() {
-            return Err(ParquetError::General(
-                "Insufficient delta length byte array bytes".to_string(),
-            ));
-        }
-
+    /// `max_values` is the value count of the page; a length block that
+    /// declares more lengths is an error.
+    fn new(data: Bytes, max_values: usize, validate_utf8: bool) -> Result<Self> {
+        let lengths = Box::new(DeltaLengths::try_new(
+            data.clone(),
+            max_values,
+            "DELTA_LENGTH_BYTE_ARRAY",
+        )?);
         Ok(Self {
+            data_offset: lengths.end_offset(),
             lengths,
             data,
             validate_utf8,
-            length_offset: 0,
-            data_offset: len_decoder.get_offset(),
         })
     }
 
-    fn read(&mut self, output: &mut ViewBuffer, len: usize) -> Result<usize> {
-        let to_read = len.min(self.lengths.len() - self.length_offset);
-        output.views.reserve(to_read);
+    /// The end of the data of the next `total_bytes` bytes, if the page holds
+    /// them.
+    fn data_end(&self, total_bytes: usize) -> Result<usize> {
+        self.data_offset
+            .checked_add(total_bytes)
+            .filter(|end| *end <= self.data.len())
+            .ok_or_else(|| {
+                ParquetError::General("Insufficient delta length byte array bytes".to_string())
+            })
+    }
 
-        let src_lengths = &self.lengths[self.length_offset..self.length_offset + to_read];
+    fn read(&mut self, output: &mut ViewBuffer, len: usize) -> Result<usize> {
+        let to_read = len.min(self.lengths.remaining());
+        output.views.reserve(to_read);
 
         // Zero copy convert `bytes::Bytes` into `arrow_buffer::Buffer`
         let bytes = Buffer::from(self.data.clone());
         let block_id = output.append_block(bytes);
 
-        let mut current_offset = self.data_offset;
-        let initial_offset = current_offset;
+        let initial_offset = self.data_offset;
+        let mut read = 0;
+        while read < to_read {
+            let src_lengths = self.lengths.peek(to_read - read)?;
+            let count = src_lengths.len();
+            let total_bytes: usize = src_lengths.iter().map(|x| *x as usize).sum();
+            let data_end = self
+                .data_offset
+                .checked_add(total_bytes)
+                .filter(|end| *end <= self.data.len())
+                .ok_or_else(|| {
+                    ParquetError::General("Insufficient delta length byte array bytes".to_string())
+                })?;
 
-        output.views.extend(src_lengths.iter().map(|length| {
-            let len = *length as u32;
-            let start_offset = current_offset;
-            current_offset += len as usize;
-            // # Safety
-            // The length and offset are guaranteed valid by the entry check in `new`
-            make_view(
-                &self.data[start_offset..start_offset + len as usize],
-                block_id,
-                start_offset as u32,
-            )
-        }));
+            let mut current_offset = self.data_offset;
+            output.views.extend(src_lengths.iter().map(|length| {
+                let len = *length as u32;
+                let start_offset = current_offset;
+                current_offset += len as usize;
+                // The window's lengths are non-negative and end at
+                // `data_end`, inside the data (checked above).
+                make_view(
+                    &self.data[start_offset..start_offset + len as usize],
+                    block_id,
+                    start_offset as u32,
+                )
+            }));
+
+            self.data_offset = data_end;
+            self.lengths.consume(count);
+            read += count;
+        }
 
         // Delta length encoding has continuous strings, we can validate utf8 in one go
         if self.validate_utf8 {
-            check_valid_utf8(&self.data[initial_offset..current_offset])?;
+            check_valid_utf8(&self.data[initial_offset..self.data_offset])?;
         }
-
-        self.data_offset = current_offset;
-        self.length_offset += to_read;
 
         Ok(to_read)
     }
 
     fn skip(&mut self, to_skip: usize) -> Result<usize> {
-        let remain_values = self.lengths.len() - self.length_offset;
-        let to_skip = remain_values.min(to_skip);
-
-        let src_lengths = &self.lengths[self.length_offset..self.length_offset + to_skip];
-        let total_bytes: usize = src_lengths.iter().map(|x| *x as usize).sum();
-
-        self.data_offset += total_bytes;
-        self.length_offset += to_skip;
+        let to_skip = self.lengths.remaining().min(to_skip);
+        let mut skipped = 0;
+        while skipped < to_skip {
+            let src_lengths = self.lengths.peek(to_skip - skipped)?;
+            let count = src_lengths.len();
+            let total_bytes: usize = src_lengths.iter().map(|x| *x as usize).sum();
+            self.data_offset = self.data_end(total_bytes)?;
+            self.lengths.consume(count);
+            skipped += count;
+        }
         Ok(to_skip)
     }
 }
@@ -673,9 +705,9 @@ pub struct ByteViewArrayDecoderDelta {
 }
 
 impl ByteViewArrayDecoderDelta {
-    fn new(data: Bytes, validate_utf8: bool) -> Result<Self> {
+    fn new(data: Bytes, max_values: usize, validate_utf8: bool) -> Result<Self> {
         Ok(Self {
-            decoder: DeltaByteArrayDecoder::new(data)?,
+            decoder: DeltaByteArrayDecoder::new(data, max_values)?,
             validate_utf8,
         })
     }
@@ -875,5 +907,50 @@ mod invalid_input_tests {
             let err = decoder.read(&mut output, 1).unwrap_err();
             assert_eq!(err.to_string(), "EOF: eof decoding byte array");
         }
+    }
+}
+
+#[cfg(test)]
+mod allocation_bound_tests {
+    use super::*;
+    use crate::arrow::array_reader::test_util::utf8_column;
+    use crate::arrow::buffer::view_buffer::ViewBuffer;
+
+    /// Two PLAIN values: "a" and "bc".
+    fn two_values() -> Bytes {
+        Bytes::from_static(b"\x01\0\0\0a\x02\0\0\0bc")
+    }
+
+    /// The read fails when the page ends before the declared count. The views
+    /// were reserved for the declared count before the first value was read.
+    #[test]
+    fn plain_read_above_the_page_bytes_fails_without_reservation() {
+        for validate_utf8 in [false, true] {
+            let mut decoder =
+                ByteViewArrayDecoderPlain::new(two_values(), 1 << 40, None, validate_utf8);
+            let mut output = ViewBuffer::default();
+            let err = decoder.read(&mut output, usize::MAX).unwrap_err();
+            assert_eq!(err.to_string(), "EOF: eof decoding byte array");
+            assert_eq!(output.views.capacity(), 0);
+
+            // The values that the page holds are still read.
+            assert_eq!(decoder.read(&mut output, 2).unwrap(), 2);
+            assert_eq!(output.views.len(), 2);
+        }
+    }
+
+    #[test]
+    fn dictionary_count_above_the_page_bytes_fails() {
+        let mut decoder = ByteViewArrayColumnValueDecoder::new(&utf8_column());
+        decoder
+            .set_dict(two_values(), 2, Encoding::PLAIN, false)
+            .unwrap();
+        let err = decoder
+            .set_dict(two_values(), i32::MAX as u32, Encoding::PLAIN, false)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: dictionary page declares 2147483647 values, but its 11 bytes hold at most 2"
+        );
     }
 }

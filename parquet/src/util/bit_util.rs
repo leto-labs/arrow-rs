@@ -843,6 +843,7 @@ fn count_set_bits(bytes: &[u8], range: std::ops::Range<usize>) -> usize {
 /// Reads advance an internal cursor; once the buffer is exhausted, the
 /// `get_*` methods return `None` rather than panicking. To rewind, use
 /// [`BitReader::reset`] with the same (or a different) buffer.
+#[derive(Clone)]
 pub struct BitReader {
     /// The byte buffer to read from, passed in by client
     buffer: Bytes,

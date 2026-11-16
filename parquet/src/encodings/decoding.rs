@@ -452,9 +452,38 @@ impl<T: DataType> DictDecoder<T> {
             }
         }
 
+        // `set_dict` allocates one value for each declared dictionary entry
+        // before it decodes the page, so compare the count with the page.
+        if num_values > max_plain_values::<T>(data.len(), type_length) {
+            return Err(eof_err!(
+                "Not enough bytes to decode dictionary: the page header declares {} values in {} bytes",
+                num_values,
+                data.len()
+            ));
+        }
+
         let mut decoder = PlainDecoder::<T>::new(type_length);
         decoder.set_data(data, num_values)?;
         self.set_dict(Box::new(decoder))
+    }
+}
+
+/// The largest number of PLAIN values of type `T` that `num_bytes` bytes can
+/// hold. A count from a page header above this value is invalid.
+fn max_plain_values<T: DataType>(num_bytes: usize, type_length: i32) -> usize {
+    match T::get_physical_type() {
+        // One bit for each value.
+        Type::BOOLEAN => num_bytes.saturating_mul(8),
+        // A four-byte length for each value.
+        Type::BYTE_ARRAY => num_bytes / 4,
+        // The PLAIN decoder does not support a type length of zero.
+        Type::FIXED_LEN_BYTE_ARRAY => match usize::try_from(type_length) {
+            Ok(type_length) if type_length > 0 => num_bytes / type_length,
+            _ => 0,
+        },
+        Type::INT96 => num_bytes / 12,
+        Type::INT32 | Type::FLOAT => num_bytes / 4,
+        Type::INT64 | Type::DOUBLE => num_bytes / 8,
     }
 }
 
@@ -609,6 +638,8 @@ const MAX_SKIP_BUFFER_VALUES: usize = 64;
 /// information.
 pub struct DeltaBitPackDecoder<T: DataType> {
     bit_reader: BitReader,
+    /// The length of the data that `bit_reader` reads
+    data_len: usize,
     initialized: bool,
 
     // Header info
@@ -656,6 +687,7 @@ where
     pub fn new() -> Self {
         Self {
             bit_reader: BitReader::from(vec![]),
+            data_len: 0,
             initialized: false,
             block_size: 0,
             values_left: 0,
@@ -741,6 +773,98 @@ where
         }
     }
 
+    /// Byte offset of the end of the block data, from the state after
+    /// `set_data`, without decoding a value: each block's minimum delta and
+    /// bit widths give the length of its mini blocks, as in `next_block`.
+    /// Returns an error if a block header or block lies outside the data.
+    pub(crate) fn end_offset(&self) -> Result<usize> {
+        let mut reader = self.bit_reader.clone();
+        // The first value is in the header; the blocks hold the others.
+        let mut remaining = self
+            .values_left
+            .saturating_sub(usize::from(self.first_value.is_some()));
+        let mut end = reader.get_byte_offset();
+        // The mini block count is from the header and is not bounded when
+        // the block holds no value: `get_aligned_bytes` reserves only the
+        // bytes that the data holds.
+        let mut widths = Vec::new();
+        while remaining > 0 {
+            reader
+                .get_zigzag_vlq_int()
+                .ok_or_else(|| eof_err!("Not enough data to decode 'min_delta'"))?;
+            widths.clear();
+            reader.get_aligned_bytes(&mut widths, self.mini_blocks_per_block);
+            if widths.len() != self.mini_blocks_per_block {
+                return Err(eof_err!("insufficient mini block bit widths"));
+            }
+            let mut offset = reader.get_byte_offset();
+            for &width in &widths {
+                if remaining == 0 {
+                    // Trailing mini blocks of the last block are not stored.
+                    break;
+                }
+                self.check_bit_width(width as usize)?;
+                remaining = remaining.saturating_sub(self.values_per_mini_block);
+                offset = (width as usize)
+                    .checked_mul(self.values_per_mini_block)
+                    .and_then(|bits| offset.checked_add(bits / 8))
+                    .ok_or_else(|| general_err!("mini block size overflows"))?;
+            }
+            if offset > self.data_len {
+                return Err(eof_err!("Not enough data to decode the delta blocks"));
+            }
+            let skipped = reader.skip(offset - reader.get_byte_offset(), 8);
+            debug_assert_eq!(reader.get_byte_offset(), offset, "{skipped}");
+            end = offset;
+        }
+        Ok(end)
+    }
+
+    /// Returns an error if the header of a length block declares more values
+    /// than the page can hold: more than `max_values`, the value count of the
+    /// page, or more blocks than the remaining bytes of the page can contain.
+    ///
+    /// The delta byte array decoders call this first. The header is a few bytes and can
+    /// declare up to 2^63 values. `name` is the encoding of the page.
+    fn check_declared_lengths(&self, max_values: usize, name: &str) -> Result<()> {
+        if self.values_left > max_values {
+            return Err(general_err!(
+                "{} length block declares {} values, but the page has {}",
+                name,
+                self.values_left,
+                max_values
+            ));
+        }
+        // The header holds the first value. Each block holds up to
+        // `block_size` further values and has at least one byte for its
+        // minimum delta and one byte for the bit width of each mini block.
+        if self.values_left > 1 {
+            let remaining_bytes = self
+                .data_len
+                .saturating_sub(self.bit_reader.get_byte_offset());
+            let fits = (self.values_left - 1)
+                .checked_div(self.block_size)
+                .map(|full_blocks| {
+                    let blocks = full_blocks
+                        + usize::from(!(self.values_left - 1).is_multiple_of(self.block_size));
+                    blocks.saturating_mul(self.mini_blocks_per_block.saturating_add(1))
+                        <= remaining_bytes
+                })
+                // A block size of zero holds no value.
+                .unwrap_or(false);
+            if !fits {
+                return Err(eof_err!(
+                    "{} length block declares {} values in blocks of {}, but the page has {} bytes left",
+                    name,
+                    self.values_left,
+                    self.block_size,
+                    remaining_bytes
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Verify the bit width is smaller then the integer type that it is trying to decode.
     #[inline]
     fn check_bit_width(&self, bit_width: usize) -> Result<()> {
@@ -762,6 +886,7 @@ where
     // # of total values is derived from encoding
     #[inline]
     fn set_data(&mut self, data: Bytes, _index: usize) -> Result<()> {
+        self.data_len = data.len();
         self.bit_reader = BitReader::new(data);
         self.initialized = true;
 
@@ -1030,12 +1155,8 @@ where
 /// See [`DeltaLengthByteArrayEncoder`](crate::encoding::DeltaLengthByteArrayEncoder)
 /// for more information.
 pub struct DeltaLengthByteArrayDecoder<T: DataType> {
-    // Lengths for each byte array in `data`
-    // TODO: add memory tracker to this
-    lengths: Vec<i32>,
-
-    // Current index into `lengths`
-    current_idx: usize,
+    // Lengths for each byte array in `data`, decoded a window at a time
+    lengths: Option<DeltaLengths>,
 
     // Concatenated byte array data
     data: Option<Bytes>,
@@ -1060,13 +1181,111 @@ impl<T: DataType> DeltaLengthByteArrayDecoder<T> {
     /// Creates new delta length byte array decoder.
     pub fn new() -> Self {
         Self {
-            lengths: vec![],
-            current_idx: 0,
+            lengths: None,
             data: None,
             offset: 0,
             num_values: 0,
             _phantom: PhantomData,
         }
+    }
+}
+
+/// The lengths of one DELTA_LENGTH_BYTE_ARRAY or DELTA_BYTE_ARRAY length
+/// block, decoded [`LENGTH_WINDOW`] at a time as the values are read.
+///
+/// The header of a length block declares its count, and a block of bit
+/// width 0 holds any count in a few bytes: a page of 2^31 - 1 empty strings
+/// is valid and needs 10 bytes for its lengths. Decoding every length when
+/// the page is set needs 4 bytes for each declared value (8 GiB), so the
+/// lengths are decoded a window at a time and memory does not depend on the
+/// declared count. The end of the block, where the data that follows starts,
+/// comes from the block headers alone ([`DeltaBitPackDecoder::end_offset`]).
+pub(crate) struct DeltaLengths {
+    decoder: DeltaBitPackDecoder<Int32Type>,
+    /// Decoded lengths; `window[position..]` are not yet consumed.
+    window: Vec<i32>,
+    position: usize,
+    /// Lengths not yet consumed, the rest of the window included.
+    remaining: usize,
+    /// Byte offset of the end of the block in the data it was read from.
+    end_offset: usize,
+    /// The encoding and the block, for error messages.
+    name: &'static str,
+}
+
+/// The number of lengths that [`DeltaLengths`] decodes at a time.
+pub(crate) const LENGTH_WINDOW: usize = 1024;
+
+impl DeltaLengths {
+    /// Reads the header of the length block at the start of `data`.
+    ///
+    /// `max_values` is the value count of the page. The count in the block
+    /// header is checked against it and against the bytes of the page, and
+    /// the block headers are checked to lie inside `data`. `name` is the
+    /// encoding of the page, for error messages.
+    pub(crate) fn try_new(data: Bytes, max_values: usize, name: &'static str) -> Result<Self> {
+        let mut decoder = DeltaBitPackDecoder::<Int32Type>::new();
+        decoder.set_data(data, 0)?;
+        decoder.check_declared_lengths(max_values, name)?;
+        let end_offset = decoder.end_offset()?;
+        Ok(Self {
+            remaining: decoder.values_left(),
+            decoder,
+            window: Vec::new(),
+            position: 0,
+            end_offset,
+            name,
+        })
+    }
+
+    /// The number of lengths not yet consumed.
+    pub(crate) fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    /// Byte offset of the end of the length block in the data that it was
+    /// read from: the start of the data that follows it.
+    pub(crate) fn end_offset(&self) -> usize {
+        self.end_offset
+    }
+
+    /// Returns up to `max` of the next lengths without consuming them. The
+    /// slice is empty only if no length is left or `max` is 0. Every length
+    /// is non-negative.
+    pub(crate) fn peek(&mut self, max: usize) -> Result<&[i32]> {
+        if self.position == self.window.len() && self.remaining > 0 {
+            let count = LENGTH_WINDOW.min(self.remaining);
+            self.window.resize(count, 0);
+            let read = self.decoder.get(&mut self.window)?;
+            if read != count {
+                return Err(general_err!(
+                    "insufficient {} lengths, expected {}, got {}",
+                    self.name,
+                    count,
+                    read
+                ));
+            }
+            if let Some(length) = self.window.iter().find(|length| **length < 0) {
+                return Err(general_err!("Invalid {} length {}", self.name, length));
+            }
+            self.position = 0;
+        }
+        let count = max.min(self.window.len() - self.position);
+        Ok(&self.window[self.position..self.position + count])
+    }
+
+    /// Consumes `count` lengths, at most the slice that `peek` returned.
+    pub(crate) fn consume(&mut self, count: usize) {
+        debug_assert!(count <= self.window.len() - self.position);
+        self.position += count;
+        self.remaining -= count;
+    }
+
+    /// The lengths that the last `peek` filled, from the current position:
+    /// for reading two blocks in step after both were peeked.
+    #[cfg(feature = "arrow")]
+    pub(crate) fn window(&self, count: usize) -> &[i32] {
+        &self.window[self.position..self.position + count]
     }
 }
 
@@ -1083,16 +1302,12 @@ impl<T: DataType> Decoder<T> for DeltaLengthByteArrayDecoder<T> {
     fn set_data(&mut self, data: Bytes, num_values: usize) -> Result<()> {
         match T::get_physical_type() {
             Type::BYTE_ARRAY => {
-                let mut len_decoder = DeltaBitPackDecoder::<Int32Type>::new();
-                len_decoder.set_data(data.clone(), num_values)?;
-                let num_lengths = len_decoder.values_left();
-                self.lengths.resize(num_lengths, 0);
-                len_decoder.get(&mut self.lengths[..])?;
-
-                self.data = Some(slice_from(&data, len_decoder.get_offset())?);
+                let lengths =
+                    DeltaLengths::try_new(data.clone(), num_values, "DELTA_LENGTH_BYTE_ARRAY")?;
+                self.data = Some(slice_from(&data, lengths.end_offset())?);
                 self.offset = 0;
-                self.current_idx = 0;
-                self.num_values = num_lengths;
+                self.num_values = lengths.remaining();
+                self.lengths = Some(lengths);
                 Ok(())
             }
             _ => Err(general_err!(
@@ -1104,17 +1319,26 @@ impl<T: DataType> Decoder<T> for DeltaLengthByteArrayDecoder<T> {
     fn get(&mut self, buffer: &mut [T::T]) -> Result<usize> {
         match T::get_physical_type() {
             Type::BYTE_ARRAY => {
-                assert!(self.data.is_some());
-
-                let data = self.data.as_ref().unwrap();
+                let (Some(data), Some(lengths)) = (self.data.as_ref(), self.lengths.as_mut())
+                else {
+                    return Err(general_err!("DeltaLengthByteArrayDecoder has no data"));
+                };
                 let num_values = cmp::min(buffer.len(), self.num_values);
 
-                for item in buffer.iter_mut().take(num_values) {
-                    let len = self.lengths[self.current_idx] as usize;
-                    item.set_from_bytes(data.slice(self.offset..self.offset + len));
-
-                    self.offset += len;
-                    self.current_idx += 1;
+                let mut read = 0;
+                while read < num_values {
+                    let window = lengths.peek(num_values - read)?;
+                    let count = window.len();
+                    for (item, length) in buffer[read..read + count].iter_mut().zip(window) {
+                        let end = self.offset + *length as usize;
+                        if end > data.len() {
+                            return Err(eof_err!("eof decoding DELTA_LENGTH_BYTE_ARRAY data"));
+                        }
+                        item.set_from_bytes(data.slice(self.offset..end));
+                        self.offset = end;
+                    }
+                    lengths.consume(count);
+                    read += count;
                 }
 
                 self.num_values -= num_values;
@@ -1137,15 +1361,20 @@ impl<T: DataType> Decoder<T> for DeltaLengthByteArrayDecoder<T> {
     fn skip(&mut self, num_values: usize) -> Result<usize> {
         match T::get_physical_type() {
             Type::BYTE_ARRAY => {
+                let Some(lengths) = self.lengths.as_mut() else {
+                    return Err(general_err!("DeltaLengthByteArrayDecoder has no data"));
+                };
                 let num_values = cmp::min(num_values, self.num_values);
 
-                let next_offset: i32 = self.lengths
-                    [self.current_idx..self.current_idx + num_values]
-                    .iter()
-                    .sum();
-
-                self.current_idx += num_values;
-                self.offset += next_offset as usize;
+                let mut skipped = 0;
+                while skipped < num_values {
+                    let window = lengths.peek(num_values - skipped)?;
+                    let count = window.len();
+                    let bytes: usize = window.iter().map(|length| *length as usize).sum();
+                    self.offset += bytes;
+                    lengths.consume(count);
+                    skipped += count;
+                }
 
                 self.num_values -= num_values;
                 Ok(num_values)
@@ -1168,12 +1397,8 @@ impl<T: DataType> Decoder<T> for DeltaLengthByteArrayDecoder<T> {
 /// See [`DeltaByteArrayEncoder`](crate::encoding::DeltaByteArrayEncoder) for more
 /// information.
 pub struct DeltaByteArrayDecoder<T: DataType> {
-    // Prefix lengths for each byte array
-    // TODO: add memory tracker to this
-    prefix_lengths: Vec<i32>,
-
-    // The current index into `prefix_lengths`,
-    current_idx: usize,
+    // Prefix lengths for each byte array, decoded a window at a time
+    prefix_lengths: Option<DeltaLengths>,
 
     // Decoder for all suffixes, the # of which should be the same as
     // `prefix_lengths.len()`
@@ -1200,8 +1425,7 @@ impl<T: DataType> DeltaByteArrayDecoder<T> {
     /// Creates new delta byte array decoder.
     pub fn new() -> Self {
         Self {
-            prefix_lengths: vec![],
-            current_idx: 0,
+            prefix_lengths: None,
             suffix_decoder: None,
             previous_value: Bytes::new(),
             num_values: 0,
@@ -1214,20 +1438,16 @@ impl<T: DataType> Decoder<T> for DeltaByteArrayDecoder<T> {
     fn set_data(&mut self, data: Bytes, num_values: usize) -> Result<()> {
         match T::get_physical_type() {
             Type::BYTE_ARRAY | Type::FIXED_LEN_BYTE_ARRAY => {
-                let mut prefix_len_decoder = DeltaBitPackDecoder::<Int32Type>::new();
-                prefix_len_decoder.set_data(data.clone(), num_values)?;
-                let num_prefixes = prefix_len_decoder.values_left();
-                self.prefix_lengths.resize(num_prefixes, 0);
-                prefix_len_decoder.get(&mut self.prefix_lengths[..])?;
+                let prefix_lengths =
+                    DeltaLengths::try_new(data.clone(), num_values, "DELTA_BYTE_ARRAY prefix")?;
+                let num_prefixes = prefix_lengths.remaining();
 
                 let mut suffix_decoder = DeltaLengthByteArrayDecoder::new();
-                suffix_decoder.set_data(
-                    slice_from(&data, prefix_len_decoder.get_offset())?,
-                    num_values,
-                )?;
+                suffix_decoder
+                    .set_data(slice_from(&data, prefix_lengths.end_offset())?, num_values)?;
                 self.suffix_decoder = Some(suffix_decoder);
+                self.prefix_lengths = Some(prefix_lengths);
                 self.num_values = num_prefixes;
-                self.current_idx = 0;
                 self.previous_value = Bytes::new();
                 Ok(())
             }
@@ -1252,14 +1472,16 @@ impl<T: DataType> Decoder<T> for DeltaByteArrayDecoder<T> {
                     suffix_decoder.get(&mut v[..])?;
                     let suffix = v[0].data();
 
-                    // Extract current prefix length, can be 0
-                    let prefix_len = usize::try_from(self.prefix_lengths[self.current_idx])
-                        .map_err(|_| {
-                            general_err!(
-                                "Invalid DELTA_BYTE_ARRAY prefix length {}",
-                                self.prefix_lengths[self.current_idx]
-                            )
-                        })?;
+                    // Extract current prefix length, can be 0. `DeltaLengths`
+                    // rejects a negative length.
+                    let prefix_lengths = self
+                        .prefix_lengths
+                        .as_mut()
+                        .expect("decoder not initialized");
+                    let prefix_len = *prefix_lengths.peek(1)?.first().ok_or_else(|| {
+                        general_err!("insufficient DELTA_BYTE_ARRAY prefix lengths")
+                    })? as usize;
+                    prefix_lengths.consume(1);
 
                     if prefix_len > self.previous_value.len() {
                         return Err(general_err!(
@@ -1278,7 +1500,6 @@ impl<T: DataType> Decoder<T> for DeltaByteArrayDecoder<T> {
                     item.set_from_bytes(data.clone());
 
                     self.previous_value = data;
-                    self.current_idx += 1;
                 }
 
                 self.num_values -= num_values;
@@ -1299,8 +1520,20 @@ impl<T: DataType> Decoder<T> for DeltaByteArrayDecoder<T> {
     }
 
     fn skip(&mut self, num_values: usize) -> Result<usize> {
-        let mut buffer = vec![T::T::default(); num_values];
-        self.get(&mut buffer)
+        // `get` reads at most the values that are left. Each value depends
+        // on the one before it, so skipping decodes them, a window at a time.
+        let to_skip = num_values.min(self.num_values);
+        let mut buffer = vec![T::T::default(); to_skip.min(LENGTH_WINDOW)];
+        let mut skipped = 0;
+        while skipped < to_skip {
+            let count = (to_skip - skipped).min(buffer.len());
+            let read = self.get(&mut buffer[..count])?;
+            if read == 0 {
+                break;
+            }
+            skipped += read;
+        }
+        Ok(skipped)
     }
 }
 
@@ -1467,17 +1700,21 @@ mod tests {
     fn test_delta_byte_array_negative_prefix_len_returns_error() {
         let col_descr = create_test_col_desc_ptr(-1, Type::BYTE_ARRAY);
 
-        let mut encoder =
-            get_encoder::<ByteArrayType>(Encoding::DELTA_BYTE_ARRAY, &col_descr).unwrap();
-        let input = vec![ByteArray::from("a"), ByteArray::from("ab")];
-        encoder.put(&input).unwrap();
-        let encoded = encoder.flush_buffer().unwrap();
+        let _ = col_descr;
+        let input = [ByteArray::from("a"), ByteArray::from("ab")];
+        // The prefix lengths -1 and 1, the suffix lengths 1 and 1, then "ab".
+        // The lengths are decoded as the values are read, so the negative
+        // prefix length is in the encoded stream.
+        let mut encoded = Vec::new();
+        for lengths in [[-1, 1], [1, 1]] {
+            let mut encoder = DeltaBitPackEncoder::<Int32Type>::new();
+            encoder.put(&lengths).unwrap();
+            encoded.extend_from_slice(&encoder.flush_buffer().unwrap());
+        }
+        encoded.extend_from_slice(b"ab");
 
         let mut decoder = DeltaByteArrayDecoder::<ByteArrayType>::new();
-        decoder.set_data(encoded, input.len()).unwrap();
-
-        // Force a negative prefix length after decoder initialization
-        decoder.prefix_lengths[0] = -1;
+        decoder.set_data(Bytes::from(encoded), input.len()).unwrap();
         let mut out = vec![ByteArray::new(); input.len()];
 
         let err = decoder.get(&mut out).unwrap_err();
@@ -2728,7 +2965,8 @@ mod invalid_input_tests {
     }
 
     /// The end of a length block is computed from the declared mini block
-    /// widths. It can be after the end of the page.
+    /// widths, from the block headers, when the page is set. It can be after
+    /// the end of the page.
     #[test]
     fn delta_lengths_block_end_past_data_fails() {
         // Two lengths. The mini block declares 32 values of 8 bits and holds one.
@@ -2739,14 +2977,272 @@ mod invalid_input_tests {
         let err = decoder.set_data(Bytes::from(data.clone()), 2).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "EOF: Not enough data after the encoded lengths"
+            "EOF: Not enough data to decode the delta blocks"
         );
 
         let mut decoder = DeltaByteArrayDecoder::<ByteArrayType>::new();
         let err = decoder.set_data(Bytes::from(data), 2).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "EOF: Not enough data after the encoded lengths"
+            "EOF: Not enough data to decode the delta blocks"
         );
+    }
+}
+
+#[cfg(test)]
+mod allocation_bound_tests {
+    use super::*;
+    use crate::encodings::encoding::{DeltaBitPackEncoder, Encoder};
+
+    fn varint(mut value: u64, out: &mut Vec<u8>) {
+        while value >= 0x80 {
+            out.push(value as u8 | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+
+    /// A DELTA_BINARY_PACKED header with the first value 0, then one block:
+    /// minimum delta 0 and a bit width of 0 for each mini block.
+    fn delta_data(block_size: u64, mini_blocks: u64, num_values: u64) -> Bytes {
+        let mut data = Vec::new();
+        varint(block_size, &mut data);
+        varint(mini_blocks, &mut data);
+        varint(num_values, &mut data);
+        data.push(0);
+        data.push(0);
+        data.extend(std::iter::repeat_n(0, mini_blocks as usize));
+        Bytes::from(data)
+    }
+
+    /// All lengths of a block, read through `DeltaLengths`.
+    fn read_all_lengths(lengths: &mut DeltaLengths) -> Result<Vec<i32>> {
+        let mut out = Vec::new();
+        while lengths.remaining() > 0 {
+            let window = lengths.peek(usize::MAX)?;
+            let count = window.len();
+            out.extend_from_slice(window);
+            lengths.consume(count);
+        }
+        Ok(out)
+    }
+
+    /// The header is a few bytes and declares 2^40 lengths. The decoders
+    /// allocated one length for each of them.
+    #[test]
+    fn length_count_above_the_page_values_fails() {
+        let err = DeltaLengths::try_new(delta_data(128, 4, 1 << 40), 4, "test")
+            .err()
+            .unwrap();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: test length block declares 1099511627776 values, but the page has 4"
+        );
+    }
+
+    /// The page declares as many values as the block, but one block of 128
+    /// values cannot hold them.
+    #[test]
+    fn length_count_above_the_page_bytes_fails() {
+        let err = DeltaLengths::try_new(delta_data(128, 4, 1_000_000), 1_000_000, "test")
+            .err()
+            .unwrap();
+        assert_eq!(
+            err.to_string(),
+            "EOF: test length block declares 1000000 values in blocks of 128, but the page has 5 bytes left"
+        );
+
+        // A block of no values holds none of the declared values.
+        let err = DeltaLengths::try_new(delta_data(0, 1, 5), 5, "test")
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("in blocks of 0"), "{err}");
+    }
+
+    /// The checks accept what the encoder writes, also when a block of equal
+    /// values needs no value bytes, and the end offset from the block headers
+    /// is where a full decode ends.
+    #[test]
+    fn valid_length_blocks_decode() {
+        let cases: [Vec<i32>; 6] = [
+            vec![],
+            vec![7],
+            vec![5; 129],
+            (0..1000).collect(),
+            (0..1000).map(|i| (i * 7919) % 1000).collect(),
+            (0..5000).map(|i| (i * 31) % 4099).collect(),
+        ];
+        for values in cases {
+            let mut encoder = DeltaBitPackEncoder::<Int32Type>::new();
+            encoder.put(&values).unwrap();
+            let data = encoder.flush_buffer().unwrap();
+
+            let mut lengths = DeltaLengths::try_new(data.clone(), values.len(), "test").unwrap();
+            assert_eq!(lengths.remaining(), values.len());
+            assert_eq!(read_all_lengths(&mut lengths).unwrap(), values);
+
+            let mut full = DeltaBitPackDecoder::<Int32Type>::new();
+            full.set_data(data.clone(), 0).unwrap();
+            let mut decoded = vec![0; values.len()];
+            full.get(&mut decoded).unwrap();
+            assert_eq!(
+                lengths.end_offset(),
+                full.get_offset(),
+                "{} values",
+                values.len()
+            );
+
+            if !values.is_empty() {
+                let err = DeltaLengths::try_new(data, values.len() - 1, "test")
+                    .err()
+                    .unwrap();
+                assert!(err.to_string().contains("but the page has"), "{err}");
+            }
+        }
+    }
+
+    /// A page of 2^31 - 1 empty strings is valid and needs ten bytes for its
+    /// lengths: one block of 2^30 values of bit width 0, twice. The lengths
+    /// are decoded a window at a time, so the decoder holds a window, not
+    /// 8 GiB, and the end offset comes from the block headers.
+    #[test]
+    fn zero_width_length_blocks_are_decoded_a_window_at_a_time() {
+        let count = (1_usize << 31) - 1;
+        let mut data = Vec::new();
+        varint(1 << 30, &mut data);
+        varint(4, &mut data);
+        varint(count as u64, &mut data);
+        data.push(0); // first value 0
+        for _ in 0..2 {
+            data.extend_from_slice(&[0, 0, 0, 0, 0]); // min delta 0, four widths 0
+        }
+        let data = Bytes::from(data);
+        let mut lengths = DeltaLengths::try_new(data.clone(), count, "test").unwrap();
+        assert_eq!(lengths.end_offset(), data.len());
+        assert_eq!(lengths.remaining(), count);
+        let window = lengths.peek(usize::MAX).unwrap();
+        assert_eq!(window.len(), LENGTH_WINDOW);
+        assert!(window.iter().all(|length| *length == 0));
+        lengths.consume(LENGTH_WINDOW);
+        assert_eq!(lengths.remaining(), count - LENGTH_WINDOW);
+        assert!(lengths.window.capacity() <= LENGTH_WINDOW);
+
+        // The generic decoder skips the page without holding its lengths.
+        let mut decoder = DeltaLengthByteArrayDecoder::<ByteArrayType>::new();
+        decoder.set_data(data, count).unwrap();
+        assert_eq!(decoder.skip(1 << 20).unwrap(), 1 << 20);
+        let mut out = vec![ByteArray::new(); 4];
+        assert_eq!(decoder.get(&mut out).unwrap(), 4);
+        assert!(out.iter().all(|value| value.is_empty()));
+    }
+
+    /// A header of 0 or 1 values is not checked against the page bytes, so
+    /// its block size and mini block count can be anything. The end offset
+    /// must not size anything by them: before, block size 2^61 with 2^56
+    /// mini blocks of 32 values requested a 64 PiB allocation.
+    #[test]
+    fn huge_mini_block_count_without_values_allocates_nothing() {
+        for count in [0, 1] {
+            let mut data = Vec::new();
+            varint(1 << 61, &mut data);
+            varint(1 << 56, &mut data);
+            varint(count, &mut data);
+            data.push(0); // first value 0
+            let lengths = DeltaLengths::try_new(Bytes::from(data.clone()), 1, "test").unwrap();
+            assert_eq!(lengths.remaining(), count as usize);
+            assert_eq!(lengths.end_offset(), data.len());
+        }
+    }
+
+    /// Block headers past the end of the page are an error when the page is
+    /// set, as the full decode of the lengths was before.
+    #[test]
+    fn length_block_past_the_page_fails() {
+        let mut encoder = DeltaBitPackEncoder::<Int32Type>::new();
+        encoder.put(&(0..1000).collect::<Vec<i32>>()).unwrap();
+        let data = encoder.flush_buffer().unwrap();
+        let short = data.slice(..data.len() - 1);
+        let err = DeltaLengths::try_new(short, 1000, "test").err().unwrap();
+        assert!(err.to_string().contains("EOF"), "{err}");
+    }
+
+    #[test]
+    fn delta_byte_array_decoders_check_the_length_count() {
+        let data = delta_data(128, 4, 1 << 40);
+
+        let mut decoder = DeltaLengthByteArrayDecoder::<ByteArrayType>::new();
+        let err = decoder.set_data(data.clone(), 4).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("DELTA_LENGTH_BYTE_ARRAY length block declares 1099511627776 values"),
+            "{err}"
+        );
+
+        let mut decoder = DeltaByteArrayDecoder::<ByteArrayType>::new();
+        let err = decoder.set_data(data, 4).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("DELTA_BYTE_ARRAY prefix length block declares 1099511627776 values"),
+            "{err}"
+        );
+    }
+
+    /// `skip` allocated one value for each value that the caller named, and
+    /// not for each value that is left.
+    #[test]
+    fn delta_byte_array_skip_is_limited_to_the_values_left() {
+        let mut data = Vec::new();
+        for lengths in [[0, 1], [1, 1]] {
+            let mut encoder = DeltaBitPackEncoder::<Int32Type>::new();
+            encoder.put(&lengths).unwrap();
+            data.extend_from_slice(&encoder.flush_buffer().unwrap());
+        }
+        data.extend_from_slice(b"ab");
+
+        let mut decoder = DeltaByteArrayDecoder::<ByteArrayType>::new();
+        decoder.set_data(Bytes::from(data), 2).unwrap();
+        assert_eq!(decoder.skip(usize::MAX / 64).unwrap(), 2);
+        assert_eq!(decoder.values_left(), 0);
+    }
+
+    fn dictionary<T: DataType>(
+        num_bytes: usize,
+        num_values: usize,
+        type_length: i32,
+    ) -> Result<()> {
+        DictDecoder::<T>::new().set_dict_from_page(
+            Bytes::from(vec![0; num_bytes]),
+            num_values,
+            type_length,
+        )
+    }
+
+    /// The dictionary decoder allocates one value for each declared entry
+    /// before it decodes the page.
+    #[test]
+    fn dictionary_count_above_the_page_bytes_fails() {
+        let err = dictionary::<Int96Type>(24, i32::MAX as usize, 0).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "EOF: Not enough bytes to decode dictionary: the page header declares 2147483647 values in 24 bytes"
+        );
+        dictionary::<Int96Type>(24, 2, 0).unwrap();
+
+        // One bit for each value.
+        dictionary::<BoolType>(1, 8, 0).unwrap();
+        dictionary::<BoolType>(1, 9, 0).unwrap_err();
+
+        // A four-byte length for each value; a length of zero is valid.
+        dictionary::<ByteArrayType>(8, 2, 0).unwrap();
+        dictionary::<ByteArrayType>(8, 3, 0).unwrap_err();
+
+        dictionary::<FixedLenByteArrayType>(8, 2, 4).unwrap();
+        dictionary::<FixedLenByteArrayType>(8, 3, 4).unwrap_err();
+        // The PLAIN decoder does not read values of length zero.
+        dictionary::<FixedLenByteArrayType>(8, 1, 0).unwrap_err();
+
+        // The primitive types of the borrowed dictionary keep their check.
+        dictionary::<Int32Type>(8, 3, 0).unwrap_err();
+        dictionary::<DoubleType>(8, 2, 0).unwrap_err();
     }
 }

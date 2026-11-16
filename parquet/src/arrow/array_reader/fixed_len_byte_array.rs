@@ -326,9 +326,14 @@ impl ValuesBuffer for FixedLenByteArrayBuffer {
 
     fn reserve_exact(&mut self, additional: usize) {
         match self.byte_length {
-            Some(byte_length) => self
-                .buffer
-                .reserve_exact(additional.saturating_mul(byte_length)),
+            // A hint. The type length is from the file schema and can be
+            // 2^31 - 1: if the product cannot be allocated, the buffer grows
+            // with the values that the pages hold.
+            Some(byte_length) => {
+                let _ = self
+                    .buffer
+                    .try_reserve_exact(additional.saturating_mul(byte_length));
+            }
             None => {
                 let capacity = self.values_capacity.get_or_insert(0);
                 *capacity = (*capacity).max(additional);
@@ -352,8 +357,24 @@ impl ValuesBuffer for FixedLenByteArrayBuffer {
                 self.buffer.len()
             ));
         }
-        self.buffer
-            .resize((read_offset + levels_read) * byte_length, 0);
+        // One slot of `byte_length` bytes for each level, NULL slots included.
+        // The type length is from the file schema: return an error, not an
+        // allocation failure, for a size that the host cannot provide.
+        let padded_len = (read_offset + levels_read)
+            .checked_mul(byte_length)
+            .filter(|len| {
+                self.buffer
+                    .try_reserve(len.saturating_sub(self.buffer.len()))
+                    .is_ok()
+            })
+            .ok_or_else(|| {
+                general_err!(
+                    "cannot allocate {} fixed length values of {} bytes",
+                    read_offset + levels_read,
+                    byte_length
+                )
+            })?;
+        self.buffer.resize(padded_len, 0);
 
         let values_range = read_offset..read_offset + values_read;
         // Move the bytes from value_pos to level_pos. For values of `byte_length` <= 4,
@@ -525,7 +546,7 @@ impl ColumnValueDecoder for ValueDecoder {
                 decoder: DictIndexDecoder::new(data, num_levels, num_values)?,
             },
             Encoding::DELTA_BYTE_ARRAY => Decoder::Delta {
-                decoder: DeltaByteArrayDecoder::new(data)?,
+                decoder: DeltaByteArrayDecoder::new(data, num_values.unwrap_or(num_levels))?,
             },
             Encoding::BYTE_STREAM_SPLIT => Decoder::ByteStreamSplit {
                 buf: data,
@@ -550,9 +571,10 @@ impl ColumnValueDecoder for ValueDecoder {
                     && let Some(values_capacity) = out.values_capacity.take()
                 {
                     // now that the byte length per output element is known,
-                    // allocate the actual needed space.
+                    // allocate the actual needed space. A hint, as in
+                    // `reserve_exact`: ignore a size that cannot be allocated.
                     let byte_capacity = values_capacity.saturating_mul(self.byte_length);
-                    out.buffer = Vec::with_capacity(byte_capacity);
+                    let _ = out.buffer.try_reserve_exact(byte_capacity);
                 }
             }
         }
@@ -738,5 +760,45 @@ mod invalid_input_tests {
             err.to_string(),
             "Parquet error: missing dictionary page for column"
         );
+    }
+}
+
+#[cfg(test)]
+mod allocation_bound_tests {
+    use super::*;
+
+    /// The type length is from the file schema. A capacity hint for values
+    /// of 2^31 - 1 bytes cannot be allocated; before, the failed allocation
+    /// ended the process.
+    #[test]
+    fn capacity_hints_of_a_long_type_are_dropped() {
+        let byte_length = i32::MAX as usize;
+        let mut buffer = FixedLenByteArrayBuffer {
+            buffer: Vec::new(),
+            byte_length: Some(byte_length),
+            values_capacity: None,
+        };
+        buffer.reserve_exact(1 << 30);
+        assert_eq!(buffer.buffer.capacity(), 0);
+
+        // Each NULL needs a slot of the type length.
+        let err = buffer.pad_nulls(0, 0, 1 << 30, &[]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: cannot allocate 1073741824 fixed length values of 2147483647 bytes"
+        );
+    }
+
+    #[test]
+    fn capacity_hints_of_a_short_type_are_kept() {
+        let mut buffer = FixedLenByteArrayBuffer {
+            buffer: Vec::new(),
+            byte_length: Some(16),
+            values_capacity: None,
+        };
+        buffer.reserve_exact(1024);
+        assert_eq!(buffer.buffer.capacity(), 16 * 1024);
+        buffer.pad_nulls(0, 0, 3, &[0]).unwrap();
+        assert_eq!(buffer.buffer, vec![0; 48]);
     }
 }

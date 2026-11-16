@@ -24,8 +24,7 @@ use crate::arrow::schema::parquet_to_arrow_field;
 use crate::basic::{ConvertedType, Encoding};
 use crate::column::page::PageIterator;
 use crate::column::reader::decoder::ColumnValueDecoder;
-use crate::data_type::Int32Type;
-use crate::encodings::decoding::{Decoder, DeltaBitPackDecoder};
+use crate::encodings::decoding::DeltaLengths;
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 use arrow_array::{
@@ -221,7 +220,8 @@ impl<I: OffsetSizeTrait> ColumnValueDecoder for ByteArrayColumnValueDecoder<I> {
             Some(num_values as usize),
             self.validate_utf8,
         );
-        decoder.read(&mut buffer, usize::MAX)?;
+        let read = decoder.read(&mut buffer, usize::MAX)?;
+        check_dictionary_len(read, num_values as usize)?;
         self.dict = Some(buffer);
         Ok(())
     }
@@ -262,6 +262,20 @@ impl<I: OffsetSizeTrait> ColumnValueDecoder for ByteArrayColumnValueDecoder<I> {
     }
 }
 
+/// The PLAIN decoder stops at the end of the page. A dictionary page that
+/// holds fewer values than its header declares is invalid: the indices of the
+/// data pages can refer to the missing values.
+pub(crate) fn check_dictionary_len(read: usize, declared: usize) -> Result<()> {
+    if read != declared {
+        return Err(general_err!(
+            "dictionary page declares {} values, but holds {}",
+            declared,
+            read
+        ));
+    }
+    Ok(())
+}
+
 /// A generic decoder from uncompressed parquet value data to [`OffsetBuffer`]
 pub enum ByteArrayDecoder {
     Plain(ByteArrayDecoderPlain),
@@ -288,12 +302,16 @@ impl ByteArrayDecoder {
             Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => ByteArrayDecoder::Dictionary(
                 ByteArrayDecoderDictionary::new(data, num_levels, num_values)?,
             ),
-            Encoding::DELTA_LENGTH_BYTE_ARRAY => ByteArrayDecoder::DeltaLength(
-                ByteArrayDecoderDeltaLength::new(data, validate_utf8)?,
-            ),
-            Encoding::DELTA_BYTE_ARRAY => {
-                ByteArrayDecoder::DeltaByteArray(ByteArrayDecoderDelta::new(data, validate_utf8)?)
+            Encoding::DELTA_LENGTH_BYTE_ARRAY => {
+                ByteArrayDecoder::DeltaLength(ByteArrayDecoderDeltaLength::new(
+                    data,
+                    num_values.unwrap_or(num_levels),
+                    validate_utf8,
+                )?)
             }
+            Encoding::DELTA_BYTE_ARRAY => ByteArrayDecoder::DeltaByteArray(
+                ByteArrayDecoderDelta::new(data, num_values.unwrap_or(num_levels), validate_utf8)?,
+            ),
             _ => {
                 return Err(general_err!(
                     "unsupported encoding for byte array: {}",
@@ -379,9 +397,11 @@ impl ByteArrayDecoderPlain {
         let initial_values_length = output.values.len();
 
         let to_read = len.min(self.max_remaining_values);
-        output.offsets.reserve(to_read);
-
         let remaining_bytes = self.buf.len() - self.offset;
+        // The value count is from the page header. Each value has a four-byte
+        // length, so the remaining bytes limit the values that can be read.
+        output.offsets.reserve(to_read.min(remaining_bytes / 4));
+
         // `to_read == 0` also covers a page that declares zero values but
         // has value bytes; the byte estimate below divides by that count.
         if remaining_bytes == 0 || to_read == 0 {
@@ -450,46 +470,40 @@ impl ByteArrayDecoderPlain {
 
 /// Decoder from [`Encoding::DELTA_LENGTH_BYTE_ARRAY`] data to [`OffsetBuffer`]
 pub struct ByteArrayDecoderDeltaLength {
-    lengths: Vec<i32>,
+    /// The lengths, decoded a window at a time. Boxed: the decoder enum
+    /// holds this beside much smaller decoders.
+    lengths: Box<DeltaLengths>,
     data: Bytes,
-    length_offset: usize,
     data_offset: usize,
     validate_utf8: bool,
 }
 
 impl ByteArrayDecoderDeltaLength {
-    fn new(data: Bytes, validate_utf8: bool) -> Result<Self> {
-        let mut len_decoder = DeltaBitPackDecoder::<Int32Type>::new();
-        len_decoder.set_data(data.clone(), 0)?;
-        let values = len_decoder.values_left();
-
-        let mut lengths = vec![0; values];
-        len_decoder.get(&mut lengths)?;
-
-        let mut total_bytes = 0;
-
-        for l in &lengths {
-            if *l < 0 {
-                return Err(ParquetError::General(
-                    "negative delta length byte array length".to_string(),
-                ));
-            }
-            total_bytes += *l as usize;
-        }
-
-        if total_bytes + len_decoder.get_offset() > data.len() {
-            return Err(ParquetError::General(
-                "Insufficient delta length byte array bytes".to_string(),
-            ));
-        }
-
+    /// `max_values` is the value count of the page; a length block that
+    /// declares more lengths is an error.
+    fn new(data: Bytes, max_values: usize, validate_utf8: bool) -> Result<Self> {
+        let lengths = Box::new(DeltaLengths::try_new(
+            data.clone(),
+            max_values,
+            "DELTA_LENGTH_BYTE_ARRAY",
+        )?);
         Ok(Self {
+            data_offset: lengths.end_offset(),
             lengths,
             data,
             validate_utf8,
-            length_offset: 0,
-            data_offset: len_decoder.get_offset(),
         })
+    }
+
+    /// The end of the data of the next `total_bytes` bytes, if the page holds
+    /// them.
+    fn data_end(&self, total_bytes: usize) -> Result<usize> {
+        self.data_offset
+            .checked_add(total_bytes)
+            .filter(|end| *end <= self.data.len())
+            .ok_or_else(|| {
+                ParquetError::General("Insufficient delta length byte array bytes".to_string())
+            })
     }
 
     fn read<I: OffsetSizeTrait>(
@@ -498,31 +512,39 @@ impl ByteArrayDecoderDeltaLength {
         len: usize,
     ) -> Result<usize> {
         let initial_values_length = output.values.len();
-
-        let to_read = len.min(self.lengths.len() - self.length_offset);
-        let src_lengths = &self.lengths[self.length_offset..self.length_offset + to_read];
-        let total_bytes: usize = src_lengths.iter().map(|x| *x as usize).sum();
-
-        // Reserve capacity for both offsets and values upfront
+        let to_read = len.min(self.lengths.remaining());
         output.offsets.reserve(to_read);
-        output.values.reserve(total_bytes);
 
-        // Delta length data is contiguous — copy all value bytes at once
-        let data_end = self.data_offset + total_bytes;
-        output
-            .values
-            .extend_from_slice(&self.data.as_ref()[self.data_offset..data_end]);
+        let mut read = 0;
+        while read < to_read {
+            let src_lengths = self.lengths.peek(to_read - read)?;
+            let count = src_lengths.len();
+            let total_bytes: usize = src_lengths.iter().map(|x| *x as usize).sum();
+            let data_end = self
+                .data_offset
+                .checked_add(total_bytes)
+                .filter(|end| *end <= self.data.len())
+                .ok_or_else(|| {
+                    ParquetError::General("Insufficient delta length byte array bytes".to_string())
+                })?;
 
-        // Compute and extend offsets in batch using extend
-        let base_offset = initial_values_length;
-        let mut running = base_offset;
-        output.offsets.extend(src_lengths.iter().map(|length| {
-            running += *length as usize;
-            I::from_usize(running).expect("index overflow decoding byte array")
-        }));
+            // Delta length data is contiguous — copy the bytes of the window at once
+            output.values.reserve(total_bytes);
+            let base_offset = output.values.len();
+            output
+                .values
+                .extend_from_slice(&self.data.as_ref()[self.data_offset..data_end]);
 
-        self.data_offset = data_end;
-        self.length_offset += to_read;
+            let mut running = base_offset;
+            output.offsets.extend(src_lengths.iter().map(|length| {
+                running += *length as usize;
+                I::from_usize(running).expect("index overflow decoding byte array")
+            }));
+
+            self.data_offset = data_end;
+            self.lengths.consume(count);
+            read += count;
+        }
 
         if self.validate_utf8 {
             output.check_valid_utf8(initial_values_length)?;
@@ -531,14 +553,16 @@ impl ByteArrayDecoderDeltaLength {
     }
 
     fn skip(&mut self, to_skip: usize) -> Result<usize> {
-        let remain_values = self.lengths.len() - self.length_offset;
-        let to_skip = remain_values.min(to_skip);
-
-        let src_lengths = &self.lengths[self.length_offset..self.length_offset + to_skip];
-        let total_bytes: usize = src_lengths.iter().map(|x| *x as usize).sum();
-
-        self.data_offset += total_bytes;
-        self.length_offset += to_skip;
+        let to_skip = self.lengths.remaining().min(to_skip);
+        let mut skipped = 0;
+        while skipped < to_skip {
+            let src_lengths = self.lengths.peek(to_skip - skipped)?;
+            let count = src_lengths.len();
+            let total_bytes: usize = src_lengths.iter().map(|x| *x as usize).sum();
+            self.data_offset = self.data_end(total_bytes)?;
+            self.lengths.consume(count);
+            skipped += count;
+        }
         Ok(to_skip)
     }
 }
@@ -550,9 +574,9 @@ pub struct ByteArrayDecoderDelta {
 }
 
 impl ByteArrayDecoderDelta {
-    fn new(data: Bytes, validate_utf8: bool) -> Result<Self> {
+    fn new(data: Bytes, max_values: usize, validate_utf8: bool) -> Result<Self> {
         Ok(Self {
-            decoder: DeltaByteArrayDecoder::new(data)?,
+            decoder: DeltaByteArrayDecoder::new(data, max_values)?,
             validate_utf8,
         })
     }
@@ -743,8 +767,13 @@ mod tests {
         let column_desc = utf8_column();
         let mut decoder = ByteArrayColumnValueDecoder::new(&column_desc);
 
+        // The dictionary page holds no values. Upstream declared 4 here; a
+        // dictionary page that holds fewer values than it declares is an
+        // error (`check_dictionary_len`), so the test declares the 0 values
+        // that the page holds. NULL reads, the subject of the test, do not
+        // change.
         decoder
-            .set_dict(encoded_dictionary, 4, Encoding::RLE_DICTIONARY, false)
+            .set_dict(encoded_dictionary, 0, Encoding::RLE_DICTIONARY, false)
             .unwrap();
 
         // test nulls read
@@ -808,5 +837,47 @@ mod invalid_input_tests {
         let mut decoder = ByteArrayDecoderPlain::new(truncated_value(), 2, Some(0), false);
         let mut output = OffsetBuffer::<i32>::with_capacity(0);
         assert_eq!(decoder.read(&mut output, 1).unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod allocation_bound_tests {
+    use super::*;
+    use crate::arrow::array_reader::test_util::utf8_column;
+
+    /// Two PLAIN values: "a" and "bc".
+    fn two_values() -> Bytes {
+        Bytes::from_static(b"\x01\0\0\0a\x02\0\0\0bc")
+    }
+
+    /// The reservation for the offsets followed the value count of the page
+    /// header: 2^40 offsets for a page of eleven bytes.
+    #[test]
+    fn plain_read_reserves_what_the_page_can_hold() {
+        let mut decoder = ByteArrayDecoderPlain::new(two_values(), 1 << 40, None, false);
+        let mut output = OffsetBuffer::<i32>::with_capacity(0);
+        assert_eq!(decoder.read(&mut output, usize::MAX).unwrap(), 2);
+        assert_eq!(output.len(), 2);
+        assert!(
+            output.offsets.capacity() <= 8,
+            "{}",
+            output.offsets.capacity()
+        );
+    }
+
+    /// The indices of the data pages can refer to each declared value.
+    #[test]
+    fn dictionary_with_fewer_values_than_declared_fails() {
+        let mut decoder = ByteArrayColumnValueDecoder::<i32>::new(&utf8_column());
+        decoder
+            .set_dict(two_values(), 2, Encoding::PLAIN, false)
+            .unwrap();
+        let err = decoder
+            .set_dict(two_values(), i32::MAX as u32, Encoding::PLAIN, false)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: dictionary page declares 2147483647 values, but holds 2"
+        );
     }
 }

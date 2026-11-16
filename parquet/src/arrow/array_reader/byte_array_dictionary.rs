@@ -27,7 +27,9 @@ use arrow_buffer::{ArrowNativeType, MutableBuffer};
 use arrow_schema::DataType as ArrowType;
 use bytes::Bytes;
 
-use crate::arrow::array_reader::byte_array::{ByteArrayDecoder, ByteArrayDecoderPlain};
+use crate::arrow::array_reader::byte_array::{
+    ByteArrayDecoder, ByteArrayDecoderPlain, check_dictionary_len,
+};
 use crate::arrow::array_reader::fixed_len_byte_array::ValueDecoder as FixedByteArrayDecoder;
 use crate::arrow::array_reader::{ArrayReader, read_records, skip_records};
 use crate::arrow::buffer::{dictionary_buffer::DictionaryBuffer, offset_buffer::OffsetBuffer};
@@ -372,8 +374,9 @@ where
                 ));
             }
         } else {
-            ByteArrayDecoderPlain::new(buf, len, Some(len), self.validate_utf8)
-                .read(&mut buffer, usize::MAX)?;
+            let mut decoder = ByteArrayDecoderPlain::new(buf, len, Some(len), self.validate_utf8);
+            let read = decoder.read(&mut buffer, usize::MAX)?;
+            check_dictionary_len(read, len)?;
         }
 
         let array = buffer.into_array(None, self.value_type.clone());
@@ -905,8 +908,13 @@ mod tests {
         let column_desc = utf8_column();
         let mut decoder = DictionaryDecoder::new(&column_desc);
 
+        // The dictionary page holds no values. Upstream declared 4 here; a
+        // dictionary page that holds fewer values than it declares is an
+        // error (`check_dictionary_len`), so the test declares the 0 values
+        // that the page holds. NULL reads, the subject of the test, do not
+        // change.
         decoder
-            .set_dict(encoded_dictionary, 4, Encoding::PLAIN_DICTIONARY, false)
+            .set_dict(encoded_dictionary, 0, Encoding::PLAIN_DICTIONARY, false)
             .unwrap();
 
         for (encoding, page) in pages.clone() {

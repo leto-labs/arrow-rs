@@ -461,7 +461,10 @@ pub(crate) fn decode_page(
                 return Err(general_err!("Invalid page header"));
             }
             let decompressed_size = uncompressed_page_size - offset;
-            let mut decompressed = Vec::with_capacity(uncompressed_page_size);
+            // The size is from the page header, so nothing is reserved here.
+            // Each codec reserves its output after it has compared the size
+            // with the compressed data, and limits its output to the size.
+            let mut decompressed = Vec::new();
             decompressed.extend_from_slice(&buffer[..offset]);
             // decompressed size of zero corresponds to a page with no non-null values
             // see https://github.com/apache/parquet-format/blob/master/README.md#data-pages
