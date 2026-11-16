@@ -450,6 +450,94 @@ fn pack_dictionary_impl<K: ArrowDictionaryKeyType, V: ArrowPrimitiveType>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exercise every integer value encoding through actual page and row-group
+    /// boundaries. The input arrays are the oracle, independent of the reader.
+    #[test]
+    fn test_random_primitive_encodings_pages_and_nulls() {
+        use crate::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
+        use crate::file::properties::{WriterProperties, WriterVersion};
+        use arrow_array::RecordBatch;
+        use bytes::Bytes;
+        use rand::{RngExt, SeedableRng};
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5a31_2026);
+        for version in [WriterVersion::PARQUET_1_0, WriterVersion::PARQUET_2_0] {
+            for encoding in [
+                Encoding::PLAIN,
+                Encoding::RLE_DICTIONARY,
+                Encoding::DELTA_BINARY_PACKED,
+                Encoding::BYTE_STREAM_SPLIT,
+            ] {
+                for pattern in 0..5 {
+                    let values: Vec<Option<i64>> = (0..2053)
+                        .map(|i| {
+                            let valid = match pattern {
+                                0 | 1 => true,
+                                2 => rng.random_bool(0.7),
+                                3 => false,
+                                _ => i % 2 == 0,
+                            };
+                            valid.then(|| rng.random_range(-131072..131072))
+                        })
+                        .collect();
+                    let nullable = pattern != 0;
+                    let schema = Arc::new(arrow_schema::Schema::new(vec![
+                        arrow_schema::Field::new("i64", ArrowType::Int64, nullable),
+                        arrow_schema::Field::new("i32", ArrowType::Int32, nullable),
+                    ]));
+                    let expected = RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(Int64Array::from(values.clone())),
+                            Arc::new(Int32Array::from(
+                                values
+                                    .iter()
+                                    .map(|v| v.map(|x| x as i32))
+                                    .collect::<Vec<_>>(),
+                            )),
+                        ],
+                    )
+                    .unwrap();
+                    let props = WriterProperties::builder()
+                        .set_writer_version(version)
+                        .set_dictionary_enabled(encoding == Encoding::RLE_DICTIONARY)
+                        .set_encoding(if encoding == Encoding::RLE_DICTIONARY {
+                            Encoding::PLAIN
+                        } else {
+                            encoding
+                        })
+                        .set_max_row_group_row_count(Some(513))
+                        .set_data_page_row_count_limit(67)
+                        .set_write_batch_size(37)
+                        .build();
+                    let mut bytes = Vec::new();
+                    let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(props)).unwrap();
+                    writer.write(&expected).unwrap();
+                    writer.close().unwrap();
+                    let bytes = Bytes::from(bytes);
+                    for batch_size in [1, 7, 31, 1023, 8192] {
+                        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
+                            .unwrap()
+                            .with_batch_size(batch_size)
+                            .build()
+                            .unwrap();
+                        let mut offset = 0;
+                        for actual in reader {
+                            let actual = actual.unwrap();
+                            assert_eq!(
+                                actual,
+                                expected.slice(offset, actual.num_rows()),
+                                "{version:?} {encoding:?} pattern={pattern} batch={batch_size}"
+                            );
+                            offset += actual.num_rows();
+                        }
+                        assert_eq!(offset, expected.num_rows());
+                    }
+                }
+            }
+        }
+    }
     use crate::arrow::array_reader::test_util::EmptyPageIterator;
     use crate::arrow::arrow_reader::DEFAULT_BATCH_SIZE;
     use crate::basic::Encoding;
