@@ -43,6 +43,7 @@ in `third_party/README.md` and `docs/UPSTREAM_MATRIX.toml`.
 | PCV | Verify page CRC-32 checksums by default with runtime checksum dispatch | PARQUET-INVALID-INPUT | KEEP |
 | PCW | Write opt-in page CRC-32 checksums over compressed data and dictionary pages | PARQUET-RESULT-INTEGRITY | UPSTREAMABLE |
 | PEH | Return errors for invalid page data instead of panics or loops; upstream owns two former checks | PARQUET-INVALID-INPUT | UPSTREAMABLE |
+| Q | Stream the runs of a mask-backed selection in the selector cursor and remember a partial run's end | NATIVE-PARQUET-SCAN | UPSTREAMABLE |
 | PIO | Append primitive dictionary values through spare capacity while preserving initialized-prefix and failed-state rules | NATIVE-PARQUET-DECODE | UPSTREAMABLE |
 | U | Enable runtime SIMD UTF-8 dispatch in portable builds with scalar-equivalence properties | STRING-UTF8-VALIDATION | UPSTREAMABLE |
 | Z1-A | Borrow aligned immutable primitive dictionary page bytes after fixed-length normalization | NATIVE-PARQUET-DECODE | UPSTREAMABLE |
@@ -87,8 +88,6 @@ used. See ADR 0053 (in the consuming Longbow repository).
   exemption is unnecessary.
 - V: upstream `ParquetPushDecoder::scan_plan()` replaces the advisory plan;
   the consuming engine owns read-ahead policy and reader advice.
-- Q: candidate only, awaiting measure-before-port task 3.6. No performance
-  equivalence or keep/drop conclusion is claimed.
 
 PEH uses upstream overflow and dictionary-width checks (#11517, #10725)
 instead of the two old hunks. The other invalid-input error paths remain.
@@ -346,3 +345,17 @@ clear. Unsupported handles return `None`, so native prefetch fetches bytes.
 Leasing records no access; decoder lookups count actual reads. Longbow uses
 this to retain pages from prefetch admission through queued units and decode
 without replacing a file's metadata or rebuilding its Arrow schema.
+
+### Q: mask-backed selector runs
+
+Q is an UPSTREAMABLE family for NATIVE-PARQUET-SCAN, kept by task 3.6 as a
+resource bound (lane leto-zca.22), not as a measured speed win. With the
+Selectors strategy, stock 60.1 expands a mask-backed `RowSelection` into a
+`VecDeque<RowSelector>` up front: 1,048,576 selector slots (16 MiB) for a
+1,048,576-row alternating mask, growing with the run count. Q streams runs from
+the bitmap with upstream's `MaskRunIter` and remembers the end of a run that a
+partial batch returned: 56 bytes and no queue, and a long run is discovered
+once across 128 partial batches. Both pass the same 2,646-case
+selector/queue/mask differential. Default SQL scans reach this cursor only when
+the Selectors strategy is chosen (`force_filter_selections` or a selector
+policy); no general speed claim is made.
