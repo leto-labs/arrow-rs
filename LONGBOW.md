@@ -27,6 +27,7 @@ in `third_party/README.md` and `docs/UPSTREAM_MATRIX.toml`.
 | Family | Purpose in this stack | Dependent feature | Classification |
 |---|---|---|---|
 | R | Push borrowed record-batch ranges beside upstream interleaving with equivalent bypass and view-GC policy | RX-REPARTITION | UPSTREAMABLE |
+| R follow-up | Gather indexed rows in place and compact sparse view payloads for task-local repartition staging | RX-REPARTITION | UPSTREAMABLE |
 
 ### parquet 60.1.0
 
