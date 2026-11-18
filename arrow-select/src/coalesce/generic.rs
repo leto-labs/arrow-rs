@@ -18,7 +18,8 @@
 use super::InProgressArray;
 use crate::concat::concat;
 use crate::filter::FilterPredicate;
-use arrow_array::{Array, ArrayRef};
+use crate::take::take;
+use arrow_array::{Array, ArrayRef, UInt32Array};
 use arrow_schema::ArrowError;
 
 /// Generic implementation for [`InProgressArray`] that works with any type of
@@ -76,6 +77,18 @@ impl InProgressArray for GenericInProgressArray {
         // since the data is shared with the `source` memory that is already counted
         self.source_data_referenced_in_buffers = true;
         let array = source.slice(offset, len);
+        self.buffered_arrays.push(array);
+        Ok(())
+    }
+
+    fn copy_rows_by_indices(&mut self, indices: &[u32]) -> Result<(), ArrowError> {
+        let source = self.source.as_ref().ok_or_else(|| {
+            ArrowError::InvalidArgumentError(
+                "Internal Error: GenericInProgressArray: source not set".to_string(),
+            )
+        })?;
+        let array = take(source.as_ref(), &UInt32Array::from(indices.to_vec()), None)?;
+        self.total_size_of_non_shared_buffers += array.get_array_memory_size();
         self.buffered_arrays.push(array);
         Ok(())
     }

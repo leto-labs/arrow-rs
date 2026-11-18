@@ -25,8 +25,13 @@
 use crate::filter::{FilterBuilder, FilterPredicate, FilterSelection};
 use crate::interleave::interleave_record_batch;
 use crate::take::take_record_batch;
-use arrow_array::types::{BinaryViewType, StringViewType};
-use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, downcast_primitive};
+use arrow_array::cast::AsArray;
+use arrow_array::types::{BinaryViewType, GenericBinaryType, GenericStringType, StringViewType};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, RecordBatch, UInt32Array, downcast_integer_array,
+    downcast_primitive,
+};
+use arrow_buffer::{ArrowNativeType, NullBuffer, NullBufferBuilder};
 use arrow_schema::{ArrowError, DataType, SchemaRef};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -34,11 +39,13 @@ use std::sync::Arc;
 // https://github.com/apache/datafusion/blob/9d2f04996604e709ee440b65f41e7b882f50b788/datafusion/physical-plan/src/coalesce/mod.rs#L26-L25
 
 mod byte_view;
+mod bytes;
 mod fixed_size_binary;
 mod generic;
 mod primitive;
 
 use byte_view::InProgressByteViewArray;
+use bytes::{InProgressBooleanArray, InProgressByteArray};
 use fixed_size_binary::InProgressFixedSizeBinaryArray;
 use generic::GenericInProgressArray;
 use primitive::InProgressPrimitiveArray;
@@ -338,9 +345,169 @@ impl BatchCoalescer {
         batch: RecordBatch,
         indices: &dyn Array,
     ) -> Result<(), ArrowError> {
-        // todo: optimize this to avoid materializing (copying the results of take indices to a new batch)
+        if indices.null_count() == 0 {
+            if let Some(indices) = indices.as_primitive_opt::<arrow_array::types::UInt32Type>() {
+                return self.push_batch_with_u32_indices(&batch, indices.values());
+            }
+
+            // Reuse the allocation-free UInt32 path for other integer index types
+            // when their values can be represented as u32.
+            let normalized = downcast_integer_array!(
+                indices => indices.values().iter().map(|i| {
+                    let i = i.to_usize()?;
+                    u32::try_from(i).ok()
+                }).collect::<Option<Vec<_>>>(),
+                _ => None
+            );
+            if let Some(indices) = normalized {
+                return self.push_batch_with_u32_indices(&batch, &indices);
+            }
+        }
+
+        // Keep the take kernel's handling of null indices and very large indices.
         let taken_batch = take_record_batch(&batch, indices)?;
         self.push_batch(taken_batch)
+    }
+
+    /// Append the selected rows from a borrowed batch in the order of `indices`.
+    ///
+    /// This is the allocation-free index-input form of
+    /// [`Self::push_batch_with_indices`]. An out-of-bounds index returns an
+    /// error before modifying the coalescer.
+    pub fn push_batch_with_u32_indices(
+        &mut self,
+        batch: &RecordBatch,
+        indices: &[u32],
+    ) -> Result<(), ArrowError> {
+        Self::validate_u32_indices(batch, indices)?;
+        if indices.is_empty() {
+            return Ok(());
+        }
+
+        if self.biggest_coalesce_batch_size.is_some_and(|limit| {
+            indices.len() > limit && (self.buffered_rows == 0 || self.buffered_rows > limit)
+        }) {
+            // The bypass emits the selected batch itself, with its original schema.
+            return self.push_batch(take_record_batch(
+                batch,
+                &UInt32Array::from(indices.to_vec()),
+            )?);
+        }
+
+        if self.target_batch_size == 0 {
+            return Err(ArrowError::InvalidArgumentError(
+                "BatchCoalescer target must be positive".into(),
+            ));
+        }
+        self.append_index_selection(batch, indices, self.target_batch_size, false)
+    }
+
+    /// Gather a selection as one batch with this coalescer's schema.
+    ///
+    /// Use an empty, task-local coalescer when a downstream coalescer is
+    /// shared between producers. The configured target is only a capacity
+    /// hint for this operation. Sparse view payloads are compacted to the
+    /// selected size so the next coalescer can reuse their buffers.
+    pub fn gather_batch_with_u32_indices(
+        &mut self,
+        batch: &RecordBatch,
+        indices: &[u32],
+    ) -> Result<RecordBatch, ArrowError> {
+        if !self.is_empty() {
+            return Err(ArrowError::InvalidArgumentError(
+                "An empty BatchCoalescer is required to gather a single batch".into(),
+            ));
+        }
+        if indices.is_empty() {
+            return Ok(RecordBatch::new_empty(Arc::clone(&self.schema)));
+        }
+        Self::validate_u32_indices(batch, indices)?;
+        if let Err(err) = self.append_index_selection(batch, indices, indices.len(), true) {
+            // No buffered rows or completed batches predate this gather.
+            *self = Self::new(Arc::clone(&self.schema), self.target_batch_size)
+                .with_biggest_coalesce_batch_size(self.biggest_coalesce_batch_size);
+            return Err(err);
+        }
+        Ok(self
+            .next_completed_batch()
+            .expect("gather completed one batch"))
+    }
+
+    fn validate_u32_indices(batch: &RecordBatch, indices: &[u32]) -> Result<(), ArrowError> {
+        let num_rows = batch.num_rows();
+        // Check once per input for all columns, including zero-column batches.
+        // The simple comparison loop can be vectorized.
+        if !indices
+            .iter()
+            .fold(true, |valid, &i| valid & ((i as usize) < num_rows))
+        {
+            let index = indices.iter().find(|&&i| i as usize >= num_rows).unwrap();
+            return Err(ArrowError::ComputeError(format!(
+                "Array index out of bounds, cannot get item at index {index} from {num_rows} entries"
+            )));
+        }
+        Ok(())
+    }
+
+    fn append_index_selection(
+        &mut self,
+        batch: &RecordBatch,
+        indices: &[u32],
+        target: usize,
+        compact_buffers: bool,
+    ) -> Result<(), ArrowError> {
+        if batch.num_columns() != self.in_progress_arrays.len() {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Batch has {} columns but BatchCoalescer expects {}",
+                batch.num_columns(),
+                self.in_progress_arrays.len()
+            )));
+        }
+        if batch.schema_ref().fields() != self.schema.fields()
+            && batch
+                .columns()
+                .iter()
+                .zip(self.schema.fields())
+                .any(|(a, f)| {
+                    a.data_type() != f.data_type()
+                        || (!f.is_nullable()
+                            && a.null_count() > 0
+                            && indices.iter().any(|&i| a.is_null(i as usize)))
+                })
+        {
+            return Err(ArrowError::InvalidArgumentError(
+                "Batch column types or nullability do not match the coalescer schema".into(),
+            ));
+        }
+
+        for (in_progress, array) in self.in_progress_arrays.iter_mut().zip(batch.columns()) {
+            in_progress.set_source_indices(Arc::clone(array), indices, compact_buffers);
+        }
+        let result = self.copy_source_indices(indices, target);
+        for in_progress in &mut self.in_progress_arrays {
+            in_progress.set_source(None);
+        }
+        result
+    }
+
+    fn copy_source_indices(
+        &mut self,
+        mut indices: &[u32],
+        target: usize,
+    ) -> Result<(), ArrowError> {
+        while !indices.is_empty() {
+            let len = indices.len().min(target - self.buffered_rows);
+            let (head, tail) = indices.split_at(len);
+            for in_progress in &mut self.in_progress_arrays {
+                in_progress.copy_rows_by_indices(head)?;
+            }
+            self.buffered_rows += len;
+            if self.buffered_rows == target {
+                self.finish_buffered_batch()?;
+            }
+            indices = tail;
+        }
+        Ok(())
     }
 
     /// Push rows gathered from multiple `batches` into the Coalescer.
@@ -808,6 +975,20 @@ impl BatchCoalescer {
     }
 }
 
+fn append_indexed_nulls(
+    output: &mut NullBufferBuilder,
+    source: Option<&NullBuffer>,
+    indices: &[u32],
+) {
+    if let Some(source) = source {
+        for &index in indices {
+            output.append(source.is_valid(index as usize));
+        }
+    } else {
+        output.append_n_non_nulls(indices.len());
+    }
+}
+
 /// Return a new `InProgressArray` for the given data type
 fn create_in_progress_array(data_type: &DataType, batch_size: usize) -> Box<dyn InProgressArray> {
     macro_rules! instantiate_primitive {
@@ -822,6 +1003,11 @@ fn create_in_progress_array(data_type: &DataType, batch_size: usize) -> Box<dyn 
     downcast_primitive! {
         // Instantiate InProgressPrimitiveArray for each primitive type
         data_type => (instantiate_primitive),
+        DataType::Boolean => Box::new(InProgressBooleanArray::new(batch_size)),
+        DataType::Utf8 => Box::new(InProgressByteArray::<GenericStringType<i32>>::new(batch_size)),
+        DataType::LargeUtf8 => Box::new(InProgressByteArray::<GenericStringType<i64>>::new(batch_size)),
+        DataType::Binary => Box::new(InProgressByteArray::<GenericBinaryType<i32>>::new(batch_size)),
+        DataType::LargeBinary => Box::new(InProgressByteArray::<GenericBinaryType<i64>>::new(batch_size)),
         DataType::Utf8View => Box::new(InProgressByteViewArray::<StringViewType>::new(batch_size)),
         DataType::BinaryView => {
             Box::new(InProgressByteViewArray::<BinaryViewType>::new(batch_size))
@@ -861,6 +1047,15 @@ trait InProgressArray: std::fmt::Debug + Send + Sync {
     ///
     /// Return an error if the source array is not set
     fn copy_rows(&mut self, offset: usize, len: usize) -> Result<(), ArrowError>;
+
+    /// Set the source for a validated selection. View arrays use the entire
+    /// selection to make the same compaction decision as take followed by push.
+    fn set_source_indices(&mut self, source: ArrayRef, _indices: &[u32], _compact_buffers: bool) {
+        self.set_source(Some(source));
+    }
+
+    /// Append rows from the current source in index order.
+    fn copy_rows_by_indices(&mut self, indices: &[u32]) -> Result<(), ArrowError>;
 
     /// Copy rows selected by `filter` from the current source array.
     ///
@@ -3041,3 +3236,6 @@ mod tests {
 
 #[cfg(test)]
 mod range_tests;
+
+#[cfg(test)]
+mod indices_tests;

@@ -65,6 +65,25 @@ impl InProgressArray for InProgressFixedSizeBinaryArray {
         Ok(())
     }
 
+    fn copy_rows_by_indices(&mut self, indices: &[u32]) -> Result<(), ArrowError> {
+        let source = self.source.clone().ok_or_else(|| {
+            ArrowError::InvalidArgumentError(
+                "Internal Error: InProgressFixedSizeBinaryArray: source not set".to_string(),
+            )
+        })?;
+        let source = source.as_fixed_size_binary();
+        let builder = self.ensure_builder();
+        for &index in indices {
+            let index = index as usize;
+            if source.is_null(index) {
+                builder.append_null();
+            } else {
+                builder.append_value(source.value(index))?;
+            }
+        }
+        Ok(())
+    }
+
     fn copy_rows_by_filter_from(
         &mut self,
         source: ArrayRef,

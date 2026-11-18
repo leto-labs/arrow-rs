@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::coalesce::InProgressArray;
+use crate::coalesce::{InProgressArray, append_indexed_nulls};
 use crate::filter::{FilterIndices, FilterPredicate, FilterSelection, FilterSlices};
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
@@ -168,6 +168,16 @@ impl<T: ArrowPrimitiveType + Debug> InProgressArray for InProgressPrimitiveArray
         self.current
             .extend_from_slice(unsafe { values.get_unchecked(offset..offset + len) });
 
+        Ok(())
+    }
+
+    fn copy_rows_by_indices(&mut self, indices: &[u32]) -> Result<(), ArrowError> {
+        self.ensure_capacity();
+        let source = primitive_source::<T>(self.source.as_ref())?;
+        append_indexed_nulls(&mut self.nulls, source.nulls(), indices);
+        let values = source.values();
+        self.current
+            .extend(indices.iter().map(|&index| values[index as usize]));
         Ok(())
     }
 
