@@ -24,6 +24,7 @@ use crate::arrow::arrow_reader::RowSelection;
 use crate::arrow::in_memory_row_group::{ColumnChunkData, FetchRanges, InMemoryRowGroup};
 use crate::errors::ParquetError;
 use crate::file::metadata::ParquetMetaData;
+use crate::file::page_cache::PageLease;
 use crate::file::reader::ChunkReader;
 use crate::util::push_buffers::PushBuffers;
 use bytes::Bytes;
@@ -142,6 +143,8 @@ pub(super) struct DataRequestBuilder<'a> {
     cache_projection: Option<&'a ProjectionMask>,
     /// Any previously read column chunks
     column_chunks: Option<Vec<Option<Arc<ColumnChunkData>>>>,
+    /// The caller's lease of the row group's pages, if any
+    page_lease: Option<&'a Arc<PageLease>>,
 }
 
 impl<'a> DataRequestBuilder<'a> {
@@ -161,6 +164,7 @@ impl<'a> DataRequestBuilder<'a> {
             selection: None,
             cache_projection: None,
             column_chunks: None,
+            page_lease: None,
         }
     }
 
@@ -188,6 +192,12 @@ impl<'a> DataRequestBuilder<'a> {
         self
     }
 
+    /// Take cached pages from the caller's lease instead of the cache
+    pub(super) fn with_page_lease(mut self, page_lease: Option<&'a Arc<PageLease>>) -> Self {
+        self.page_lease = page_lease;
+        self
+    }
+
     pub(crate) fn build(self) -> DataRequest {
         let Self {
             row_group_idx,
@@ -198,6 +208,7 @@ impl<'a> DataRequestBuilder<'a> {
             selection,
             cache_projection,
             column_chunks,
+            page_lease,
         } = self;
 
         let row_group_meta_data = parquet_metadata.row_group(row_group_idx);
@@ -229,7 +240,13 @@ impl<'a> DataRequestBuilder<'a> {
         let FetchRanges {
             ranges,
             page_start_offsets,
-        } = row_group.fetch_ranges(projection, selection, batch_size, cache_projection);
+        } = row_group.fetch_ranges(
+            projection,
+            selection,
+            batch_size,
+            cache_projection,
+            page_lease,
+        );
 
         DataRequest {
             // Save any previously read column chunks

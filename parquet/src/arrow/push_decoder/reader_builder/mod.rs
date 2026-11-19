@@ -37,6 +37,7 @@ use crate::arrow::schema::ParquetField;
 use crate::errors::ParquetError;
 use crate::file::metadata::page_index::RowGroupPageIndex;
 use crate::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
+use crate::file::page_cache::PageLease;
 use crate::util::push_buffers::PushBuffers;
 use bytes::Bytes;
 use data::DataRequest;
@@ -203,6 +204,10 @@ pub(crate) struct RowGroupReaderBuilder {
     /// The underlying data store
     buffers: PushBuffers,
 
+    /// The caller's lease of the pages of the row groups to read, if any.
+    /// Fetch planning takes cached pages from it instead of the cache.
+    page_lease: Option<Arc<PageLease>>,
+
     /// What each decoding stage fetches. Kept here because the filter is
     /// moved out of the builder while a row group is decoded.
     stages: Arc<StageSchedule>,
@@ -225,6 +230,8 @@ pub(crate) struct RowGroupReaderBuilderParts {
     /// Bytes already pushed into the decoder, carried across a rebuild so they
     /// are not re-requested.
     pub buffers: PushBuffers,
+    /// The caller's page lease, carried across a rebuild like the buffers.
+    pub page_lease: Option<Arc<PageLease>>,
 }
 
 impl RowGroupReaderBuilder {
@@ -270,8 +277,16 @@ impl RowGroupReaderBuilder {
             row_selection_policy,
             state: Some(RowGroupDecoderState::Finished),
             buffers,
+            page_lease: None,
             stages: Arc::new(stages),
         }
+    }
+
+    /// Plans with the caller's page lease (see
+    /// [`ParquetPushDecoderBuilder::with_page_lease`](crate::arrow::push_decoder::ParquetPushDecoderBuilder::with_page_lease)).
+    pub(crate) fn with_page_lease(mut self, page_lease: Option<Arc<PageLease>>) -> Self {
+        self.page_lease = page_lease;
+        self
     }
 
     /// Decompose into [`RowGroupReaderBuilderParts`] so the builder can be
@@ -291,6 +306,7 @@ impl RowGroupReaderBuilder {
             row_selection_policy,
             state: _,
             buffers,
+            page_lease,
             // Recomputed from `filter` when the builder is rebuilt.
             stages: _,
         } = self;
@@ -303,6 +319,7 @@ impl RowGroupReaderBuilder {
             metrics,
             row_selection_policy,
             buffers,
+            page_lease,
         }
     }
 
@@ -328,9 +345,11 @@ impl RowGroupReaderBuilder {
         self.buffers.buffered_bytes()
     }
 
-    /// Clear any staged ranges currently buffered for future decode work.
+    /// Clear any staged ranges currently buffered for future decode work, and
+    /// drop the caller's page lease.
     pub fn clear_all_ranges(&mut self) {
         self.buffers.clear_all_ranges();
+        self.page_lease = None;
     }
 
     /// take the current state, leaving None in its place.
@@ -515,6 +534,7 @@ impl RowGroupReaderBuilder {
                 // complete batch from the retained sparse column data.
                 .with_cache_projection(fetch.cache_projection)
                 .with_column_chunks(column_chunks)
+                .with_page_lease(self.page_lease.as_ref())
                 .build();
 
                 let row_group_info = RowGroupInfo {
@@ -683,6 +703,7 @@ impl RowGroupReaderBuilder {
                 )
                 .with_selection(plan_builder.selection())
                 .with_column_chunks(column_chunks)
+                .with_page_lease(self.page_lease.as_ref())
                 .with_cache_projection(fetch.cache_projection)
                 .build();
 

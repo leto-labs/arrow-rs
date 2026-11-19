@@ -255,11 +255,14 @@ and uses it in two places:
   before it reads, checks and decompresses it, and offers the decoded `Page`
   to the cache after a miss. `peek_next_page` and `skip_next_page` step over a
   resident page by its stored length, without its file bytes.
-- The push decoder's fetch planning (`InMemoryRowGroup::fetch_ranges`) pins
-  the pages that a row group read needs. A column chunk whose needed pages
-  are all resident is not fetched (`ColumnChunkData::Cached`). The reader
-  holds the pins, so an eviction between planning and decoding cannot remove
-  a page whose bytes were not fetched.
+- The push decoder's fetch planning (`InMemoryRowGroup::fetch_ranges`) leases
+  the pages that a row group read needs with one `PageCache::lease` call for
+  each decoding stage, or takes them from the caller's lease
+  (`ParquetPushDecoderBuilder::with_page_lease`) with no cache call. A column
+  chunk whose needed pages are all leased is not fetched
+  (`ColumnChunkData::Cached`). The reader holds the lease, so an eviction
+  between planning and decoding cannot remove a page whose bytes were not
+  fetched.
 
 The engine attaches one handle to the `ParquetMetaData` of a file generation
 (`ParquetMetaData::with_page_cache`), and owns the memory, the eviction and
@@ -278,8 +281,10 @@ Limits that the tests state:
   column chunk, fit in the chunk, offset-index length and page kind); see the
   module documentation of `parquet/src/file/page_cache.rs`. On 60.1 the
   family plans from `PageIndexProvider` and the push decoder's `scan_plan`.
-- Without an offset index, a column chunk is pinned only when the resident
-  pages cover it without a gap. After a selective read that stepped over
+- A lease set's pages cover its ranges without a gap, each followed to the
+  next by its stored length; with an offset index each range is one page
+  whose stored length is its location's. Without an offset index, a column
+  chunk is leased only when the resident pages cover it without a gap. After a selective read that stepped over
   pages, such a chunk is fetched again and its resident pages are still hits.
 - The synchronous `SerializedFileReader` row group reader does not pass the
   handle. Longbow's scans read through the push decoder.
@@ -338,13 +343,33 @@ definition-level decoder tests. The page-level characterization
 (repeated IDs in runs of 1 to 40, with and without NULL runs) to its widths
 1 to 32, V1/V2 pages and batch sizes.
 
-DPC follow-up (rle.34): `PageCache::pin` is an optional, nonwaiting atomic
-lease over page offsets. A supporting engine keeps the entries visible and
-charged until the last lease drops, including during pool reclamation or a
-clear. Unsupported handles return `None`, so native prefetch fetches bytes.
-Leasing records no access; decoder lookups count actual reads. Longbow uses
-this to retain pages from prefetch admission through queued units and decode
-without replacing a file's metadata or rebuilding its Arrow schema.
+DPC follow-up (rle.34): an optional, nonwaiting atomic lease over page
+offsets. A supporting engine keeps the entries visible and charged until the
+last lease drops, including during pool reclamation or a clear. Leasing
+records no access. Longbow uses this to retain pages from prefetch admission
+through queued units and decode without replacing a file's metadata or
+rebuilding its Arrow schema.
+
+DPC follow-up (rle.64, Longbow ADR 0063 decision 8): `PageCache::lease`
+replaces `pin` and `resident_offsets`. One call leases the pages of several
+sets of byte ranges (one set for each column chunk) and returns them in a
+`PageLease`: the pages themselves, sorted by offset, with a read mark on
+each. A set with a page missing leases nothing. Fetch planning marks the
+pages that it takes (one mark where a `get` counted one read before), and
+dropping the last reference hands the marks to the engine's `LeaseRelease`,
+which unpins the pages and records the reads under one more acquisition. A
+leased page that is not read records no read. The trait's default lease
+holds the pages without pins: it walks each set with `probe` and records the
+read of each page of a set that tiles with `get` at once
+(`PageLease::is_charged` is false). `PageCache::holds_leases` (default false)
+lets a prefetcher skip such a cache without counting reads. An engine that admits a row group before decoding it
+passes its lease to the decoder, and a cached row group takes the cache's
+lock twice instead of once for each page and column. `ParquetPushDecoder::
+clear_all_ranges` drops the decoder's reference to the caller's lease.
+Planning no longer looks a page up in a partially resident column chunk, so
+such a chunk no longer counts hits at planning for the pages before its
+first missing page and one miss for that page; its reader still counts one
+lookup for each page that it reads.
 
 ### Q: mask-backed selector runs
 

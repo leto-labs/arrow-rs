@@ -607,9 +607,18 @@ fn a_lease_keeps_pages_through_a_clear() {
     let cached = Arc::new(plain.as_ref().clone().with_page_cache(Some(handle.clone())));
     decode(&cached, &file, None);
     let offsets = cache.offsets();
-    let lease = handle.pin(&offsets).unwrap();
-    // A lease is all or nothing.
-    assert!(handle.pin(&[offsets[0], u64::MAX]).is_none());
+    let pages: Vec<_> = offsets
+        .iter()
+        .map(|offset| *offset..offset + handle.probe(*offset).unwrap().stored_len())
+        .collect();
+    // A set is all or nothing.
+    let mut missing = pages.clone();
+    missing.push(u64::MAX - 1..u64::MAX);
+    assert!(handle.lease(&[missing]).is_none());
+    assert_eq!(cache.leased_pages(), 0);
+    let lease = handle.lease(&[pages]).unwrap();
+    assert!(lease.is_leased(0) && lease.is_charged());
+    assert_eq!(lease.pages().len(), offsets.len());
     cache.clear();
     assert_eq!(cache.len(), offsets.len());
     let (_, fetched) = decode(&cached, &file, None);
@@ -682,7 +691,7 @@ fn a_deferred_dictionary_read_from_the_file_fills_the_cache() {
 /// errors, not wrong values or a panic.
 #[test]
 fn a_hit_repeats_the_checks_that_guard_decoding() {
-    use crate::file::page_cache::{CachedPage, PinnedPages};
+    use crate::file::page_cache::{CachedPage, PageLease, PinnedPages};
     for page_index in [false, true] {
         let file = file(WriterVersion::PARQUET_1_0, Compression::SNAPPY);
         let metadata = metadata(&file, page_index);
@@ -706,7 +715,15 @@ fn a_hit_repeats_the_checks_that_guard_decoding() {
         // A chunk whose pages fetch planning pinned: its bytes were not
         // fetched, so a page that fails a check is an error.
         let read_pinned = |cache: &MapPageCache, handle: Arc<dyn PageCache>| {
-            let pinned = PinnedPages::at_offsets(cache, &cache.offsets()).unwrap();
+            // The pages as stored, faulty ones included: a lease does not
+            // check them.
+            let pages = cache
+                .offsets()
+                .into_iter()
+                .map(|offset| (offset, cache.probe(offset).unwrap()))
+                .collect();
+            let lease = Arc::new(PageLease::new(vec![Some(pages)], None));
+            let pinned = PinnedPages::new(lease, start..start + length);
             let empty = Arc::new(NoBytes(file.len() as u64));
             let group = metadata.row_group(0);
             let locations = metadata
@@ -903,13 +920,11 @@ fn a_hit_after_a_peek_must_match_the_header() {
     }
 }
 
-/// A caller that fetches ahead from a `ScanPlan` skips the ranges that are
-/// resident with `resident_offsets` and leases them with `PageCache::pin`.
-/// After a warm scan every planned range is resident, and the decoder
-/// requests nothing.
+/// A caller that fetches ahead from a `ScanPlan` skips the ranges that the
+/// cache leases. After a warm scan every planned range is resident, and the
+/// decoder requests nothing.
 #[test]
 fn scan_plan_ranges_resolve_against_the_cache() {
-    use crate::file::page_cache::resident_offsets;
     for page_index in [false, true] {
         let file = file(WriterVersion::PARQUET_2_0, Compression::SNAPPY);
         let plain = Arc::new(metadata(&file, page_index));
@@ -928,29 +943,35 @@ fn scan_plan_ranges_resolve_against_the_cache() {
         assert!(
             plan()
                 .iter()
-                .all(|r| resident_offsets(handle.as_ref(), r.range.clone()).is_none())
+                .all(|r| handle.lease(&[vec![r.range.clone()]]).is_none())
         );
         decode(&cached, &file, None);
         let mut leases = vec![];
         for planned in plan() {
-            let offsets = resident_offsets(handle.as_ref(), planned.range.clone())
+            let lease = handle
+                .lease(&[vec![planned.range.clone()]])
                 .unwrap_or_else(|| panic!("{planned:?} is not resident"));
-            assert!(!offsets.is_empty());
-            assert_eq!(offsets[0], planned.range.start);
-            leases.push(handle.pin(&offsets).unwrap());
+            assert!(lease.is_charged());
+            assert_eq!(lease.pages()[0].offset(), planned.range.start);
+            leases.push(lease);
         }
         // The leases keep the pages through a clear: the scan reads nothing.
         cache.clear();
         let (_, fetched) = decode(&cached, &file, None);
         assert_eq!(fetched, vec![]);
+        let reads = cache.lease_reads.load(Ordering::Relaxed);
         drop(leases);
         assert_eq!(cache.leased_pages(), 0);
+        // Leases that the decoder did not read record no read.
+        assert_eq!(cache.lease_reads.load(Ordering::Relaxed), reads);
         // A range that does not start at a page header is not resident.
         let first = plan().remove(0);
         cache.clear();
         decode(&cached, &file, None);
         assert!(
-            resident_offsets(handle.as_ref(), first.range.start + 1..first.range.end).is_none()
+            handle
+                .lease(&[vec![first.range.start + 1..first.range.end]])
+                .is_none()
         );
     }
 }
@@ -1105,4 +1126,194 @@ fn an_encrypted_chunk_is_not_cached() {
             "{fetched:?}"
         );
     }
+}
+
+/// The column chunk ranges of row group `group`: one lease set for each
+/// column, as an engine that admits the whole row group asks.
+fn group_sets(metadata: &ParquetMetaData, group: usize) -> Vec<Vec<Range<u64>>> {
+    metadata
+        .row_group(group)
+        .columns()
+        .iter()
+        .map(|column| {
+            let (start, len) = column.byte_range();
+            vec![start..start + len]
+        })
+        .collect()
+}
+
+/// Decodes row group `group` with `lease`, and returns its batches and the
+/// ranges that the decoder requested.
+fn decode_with_lease(
+    metadata: &Arc<ParquetMetaData>,
+    file: &Bytes,
+    group: usize,
+    lease: Option<Arc<crate::file::page_cache::PageLease>>,
+) -> (Vec<RecordBatch>, Vec<Range<u64>>) {
+    let mut builder = ParquetPushDecoderBuilder::try_new_decoder(Arc::clone(metadata))
+        .unwrap()
+        .with_batch_size(1_024)
+        .with_row_groups(vec![group]);
+    if let Some(lease) = lease {
+        builder = builder.with_page_lease(lease);
+    }
+    let mut decoder = builder.build().unwrap();
+    let (mut batches, mut requested) = (vec![], vec![]);
+    loop {
+        match decoder.try_decode().unwrap() {
+            DecodeResult::NeedsData(ranges) => {
+                let data = ranges
+                    .iter()
+                    .map(|r| file.slice(r.start as usize..r.end as usize))
+                    .collect();
+                requested.extend(ranges.iter().cloned());
+                decoder.push_ranges(ranges, data).unwrap();
+            }
+            DecodeResult::Data(batch) => batches.push(batch),
+            DecodeResult::Finished => return (batches, requested),
+        }
+    }
+}
+
+/// A cached row group read with the caller's lease takes the cache's lock
+/// twice: the lease and its release. Planning makes no cache call, nothing
+/// is fetched, and the release records one read for each page that the
+/// decoder planned, as one `get` for each page did before.
+#[test]
+fn a_cached_row_group_takes_the_lock_twice() {
+    for page_index in [false, true] {
+        let file = file(WriterVersion::PARQUET_1_0, Compression::SNAPPY);
+        let plain = Arc::new(metadata(&file, page_index));
+        let cache = Arc::new(MapPageCache::with_leases());
+        let handle: Arc<dyn PageCache> = cache.clone();
+        let cached = Arc::new(plain.as_ref().clone().with_page_cache(Some(handle.clone())));
+        decode(&cached, &file, None);
+        for group in 0..plain.num_row_groups() {
+            let (expected, _) = decode_with_lease(&plain, &file, group, None);
+            let calls = cache.calls.load(Ordering::Relaxed);
+            let (hits, reads) = (
+                cache.hits.load(Ordering::Relaxed),
+                cache.lease_reads.load(Ordering::Relaxed),
+            );
+            let lease = handle.lease(&group_sets(&plain, group)).unwrap();
+            assert!((0..lease.sets()).all(|set| lease.is_leased(set)));
+            let pages = lease.pages().len();
+            let (batches, requested) =
+                decode_with_lease(&cached, &file, group, Some(Arc::new(lease)));
+            assert_eq!(batches, expected, "page index {page_index}");
+            assert_eq!(requested, vec![], "a leased row group fetches nothing");
+            assert_eq!(cache.leased_pages(), 0, "the lease ends with the read");
+            assert_eq!(cache.calls.load(Ordering::Relaxed) - calls, 2);
+            assert_eq!(cache.lease_reads.load(Ordering::Relaxed) - reads, pages);
+            assert_eq!(cache.hits.load(Ordering::Relaxed) - hits, pages);
+        }
+    }
+}
+
+/// A set with one page missing leases nothing, and the decoder fetches
+/// exactly that column chunk; the other chunks come from the lease. Without
+/// the caller's lease, the decoder's own planning takes one lease for the
+/// stage and counts the same reads.
+#[test]
+fn a_set_with_a_missing_page_leases_nothing() {
+    for page_index in [false, true] {
+        let file = file(WriterVersion::PARQUET_1_0, Compression::SNAPPY);
+        let plain = Arc::new(metadata(&file, page_index));
+        let (expected, _) = decode_with_lease(&plain, &file, 0, None);
+        let cache = Arc::new(MapPageCache::with_leases());
+        let handle: Arc<dyn PageCache> = cache.clone();
+        let cached = Arc::new(plain.as_ref().clone().with_page_cache(Some(handle.clone())));
+        decode(&cached, &file, None);
+        let sets = group_sets(&plain, 0);
+        // Remove the last page of column 1.
+        let missing = *cache
+            .offsets()
+            .iter()
+            .filter(|offset| sets[1][0].contains(offset))
+            .last()
+            .unwrap();
+        cache.remove(missing).unwrap();
+        let lease = handle.lease(&sets).unwrap();
+        assert!(!lease.is_leased(1));
+        assert!(lease.page(missing).is_none());
+        assert!(
+            lease
+                .pages()
+                .iter()
+                .all(|page| !sets[1][0].contains(&page.offset())),
+            "no page of the incomplete set is leased"
+        );
+        let leased = lease.pages().len();
+        let (batches, requested) = decode_with_lease(&cached, &file, 0, Some(Arc::new(lease)));
+        assert_eq!(batches, expected);
+        assert_eq!(requested, sets[1]);
+        assert_eq!(cache.leased_pages(), 0);
+        assert_eq!(cache.lease_reads.load(Ordering::Relaxed), leased);
+
+        // The read filled the missing page again.
+        cache.remove(missing).unwrap();
+        // The decoder's own planning: one lease call for the stage, then the
+        // page reader of column 1 looks up its pages (and fills the missing
+        // one).
+        let calls = cache.calls.load(Ordering::Relaxed);
+        let reads = cache.lease_reads.load(Ordering::Relaxed);
+        let (batches, requested) = decode_with_lease(&cached, &file, 0, None);
+        assert_eq!(batches, expected);
+        assert_eq!(requested, sets[1]);
+        assert_eq!(cache.lease_reads.load(Ordering::Relaxed) - reads, leased);
+        let column_pages = cache
+            .offsets()
+            .iter()
+            .filter(|offset| sets[1][0].contains(offset))
+            .count();
+        assert_eq!(
+            cache.calls.load(Ordering::Relaxed) - calls,
+            2 + column_pages,
+            "a lease, its release and one lookup for each page that was read"
+        );
+        assert!(cache.probe(missing).is_some(), "the read filled the page");
+    }
+}
+
+/// A lease that is dropped before a read records no read.
+#[test]
+fn an_unread_lease_records_no_read() {
+    let file = file(WriterVersion::PARQUET_1_0, Compression::SNAPPY);
+    let plain = Arc::new(metadata(&file, false));
+    let cache = Arc::new(MapPageCache::with_leases());
+    let handle: Arc<dyn PageCache> = cache.clone();
+    let cached = Arc::new(plain.as_ref().clone().with_page_cache(Some(handle.clone())));
+    decode(&cached, &file, None);
+    let hits = cache.hits.load(Ordering::Relaxed);
+    let lease = handle.lease(&group_sets(&plain, 0)).unwrap();
+    assert!(cache.leased_pages() > 0);
+    drop(lease);
+    assert_eq!(cache.leased_pages(), 0);
+    assert_eq!(cache.hits.load(Ordering::Relaxed), hits);
+    assert_eq!(cache.lease_reads.load(Ordering::Relaxed), 0);
+}
+
+/// A cache without lease support holds the pages without pins: the decoder
+/// still skips the bytes of a resident chunk, and each page's read is
+/// recorded when the lease is taken.
+#[test]
+fn the_default_lease_holds_pages_without_pins() {
+    let file = file(WriterVersion::PARQUET_1_0, Compression::SNAPPY);
+    let plain = Arc::new(metadata(&file, true));
+    let cache = Arc::new(MapPageCache::default());
+    let handle: Arc<dyn PageCache> = cache.clone();
+    let cached = Arc::new(plain.as_ref().clone().with_page_cache(Some(handle.clone())));
+    decode(&cached, &file, None);
+    let lease = handle.lease(&group_sets(&plain, 0)).unwrap();
+    assert!(!lease.is_charged());
+    let pages = lease.pages().len();
+    let hits = cache.hits.load(Ordering::Relaxed);
+    // The lease's pages stay readable after the cache drops them.
+    cache.clear();
+    let (expected, _) = decode_with_lease(&plain, &file, 0, None);
+    let (batches, requested) = decode_with_lease(&cached, &file, 0, Some(Arc::new(lease)));
+    assert_eq!(batches, expected);
+    assert_eq!(requested, vec![]);
+    assert!(pages > 0);
+    assert_eq!(cache.hits.load(Ordering::Relaxed), hits);
 }

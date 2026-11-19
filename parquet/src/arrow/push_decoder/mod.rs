@@ -29,6 +29,7 @@ use crate::arrow::arrow_reader::{
 };
 use crate::errors::ParquetError;
 use crate::file::metadata::ParquetMetaData;
+use crate::file::page_cache::PageLease;
 pub use crate::util::push_buffers::PushBuffers;
 use arrow_array::RecordBatch;
 use bytes::Bytes;
@@ -206,6 +207,9 @@ pub type ParquetPushDecoderBuilder = ArrowReaderBuilder<PushDecoderInput>;
 pub struct PushDecoderInput {
     /// Bytes pushed into the decoder, awaiting decode.
     buffers: PushBuffers,
+    /// The caller's lease of cached pages (see
+    /// [`ParquetPushDecoderBuilder::with_page_lease`]).
+    page_lease: Option<Arc<PageLease>>,
 }
 
 /// Methods for building a ParquetDecoder. See the base [`ArrowReaderBuilder`] for
@@ -250,11 +254,24 @@ impl ParquetPushDecoderBuilder {
     /// [`Self::build`] releases the bytes that the decoder does not read:
     /// the bytes outside the read column chunks of the row groups that the
     /// decoder reads.
-    pub fn with_buffers(self, buffers: PushBuffers) -> Self {
-        Self {
-            input: PushDecoderInput { buffers },
-            ..self
-        }
+    pub fn with_buffers(mut self, buffers: PushBuffers) -> Self {
+        self.input.buffers = buffers;
+        self
+    }
+
+    /// Provide a lease of the cached pages of the row groups to decode, taken
+    /// with [`PageCache::lease`](crate::file::page_cache::PageCache::lease)
+    /// from the page cache of this file's metadata.
+    ///
+    /// Fetch planning takes the pages of a column chunk from the lease when
+    /// the lease tiles the chunk's needed ranges, marks their reads in it,
+    /// and makes no cache call: the caller pushes the bytes of the other
+    /// chunks. The decoder's page readers hold the lease until they are
+    /// dropped; [`ParquetPushDecoder::clear_all_ranges`] drops the decoder's
+    /// own reference. Replaces an earlier lease.
+    pub fn with_page_lease(mut self, page_lease: Arc<PageLease>) -> Self {
+        self.input.page_lease = Some(page_lease);
+        self
     }
 
     /// Select row groups and rows using row-group-local coordinates.
@@ -312,7 +329,11 @@ impl ParquetPushDecoderBuilder {
     /// Create a [`ParquetPushDecoder`] with the configured options
     pub fn build(self) -> Result<ParquetPushDecoder, ParquetError> {
         let Self {
-            input: PushDecoderInput { buffers },
+            input:
+                PushDecoderInput {
+                    buffers,
+                    page_lease,
+                },
             metadata: parquet_metadata,
             schema,
             fields,
@@ -349,7 +370,8 @@ impl ParquetPushDecoderBuilder {
             max_predicate_cache_size,
             buffers,
             row_selection_policy,
-        );
+        )
+        .with_page_lease(page_lease);
 
         // Initialize the decoder with the configured options
         let mut remaining_row_groups = RemainingRowGroups::new(
@@ -395,10 +417,16 @@ fn builder_from_remaining(parts: RemainingRowGroupsParts) -> ParquetPushDecoderB
         metrics,
         row_selection_policy,
         buffers,
+        page_lease,
     } = reader_builder;
 
+    // Carry the decoder's already-fetched bytes and page lease across the
+    // rebuild so the new decoder does not re-request them.
     ArrowReaderBuilder {
-        input: PushDecoderInput::default(),
+        input: PushDecoderInput {
+            buffers,
+            page_lease,
+        },
         metadata,
         schema,
         fields,
@@ -412,9 +440,6 @@ fn builder_from_remaining(parts: RemainingRowGroupsParts) -> ParquetPushDecoderB
         metrics,
         max_predicate_cache_size,
     }
-    // Carry the decoder's already-fetched bytes across the rebuild so the new
-    // decoder does not re-request them.
-    .with_buffers(buffers)
 }
 
 /// A push based Parquet Decoder
@@ -589,8 +614,10 @@ impl ParquetPushDecoder {
     /// Clear any staged byte ranges currently buffered for future decode work.
     ///
     /// This clears byte ranges still owned by the decoder's internal
-    /// `PushBuffers`. It does not affect any data that has already been handed
-    /// off to an active [`ParquetRecordBatchReader`].
+    /// `PushBuffers` and drops the decoder's reference to the caller's page
+    /// lease ([`ParquetPushDecoderBuilder::with_page_lease`]). It does not
+    /// affect any data that has already been handed off to an active
+    /// [`ParquetRecordBatchReader`], whose page readers keep their lease.
     pub fn clear_all_ranges(&mut self) {
         self.state.clear_all_ranges();
     }

@@ -24,7 +24,7 @@ use crate::column::page::{PageIterator, PageReader};
 use crate::errors::ParquetError;
 use crate::file::metadata::page_index::RowGroupPageIndex;
 use crate::file::metadata::{ParquetMetaData, RowGroupMetaData};
-use crate::file::page_cache::{PageCache, PinnedPages, page_cache_applies};
+use crate::file::page_cache::{PageLease, PinnedPages, page_cache_applies};
 use crate::file::page_index::offset_index::PageLocation;
 use crate::file::properties::ReaderProperties;
 use crate::file::reader::{ChunkReader, Length, SerializedPageReader};
@@ -65,16 +65,21 @@ impl InMemoryRowGroup<'_> {
     /// The ranges of each column chunk come from [`ColumnFetch`].
     ///
     /// With a page cache in the metadata, a column chunk whose needed pages
-    /// (the pages of its [`ColumnFetch`]) are all resident is not fetched:
-    /// its pages are pinned in `column_chunks` as [`ColumnChunkData::Cached`],
-    /// where [`Self::fill_column_chunks`] skips it, and its page reader holds
-    /// them until it is dropped.
+    /// (the pages of its [`ColumnFetch`]) are all leased is not fetched: its
+    /// pages are in `column_chunks` as [`ColumnChunkData::Cached`], where
+    /// [`Self::fill_column_chunks`] skips it, and its page reader holds the
+    /// lease until it is dropped. The pages come from `lease`, the caller's
+    /// lease of the row group, when it has one: then planning makes no cache
+    /// call, and a chunk that the lease does not tile is fetched. Without it,
+    /// one [`PageCache::lease`](crate::file::page_cache::PageCache::lease) call takes the pages of every chunk of this
+    /// stage.
     pub(crate) fn fetch_ranges(
         &mut self,
         projection: &ProjectionMask,
         selection: Option<&RowSelection>,
         batch_size: usize,
         cache_mask: Option<&ProjectionMask>,
+        lease: Option<&Arc<PageLease>>,
     ) -> FetchRanges {
         let metadata = self.metadata.row_group(self.row_group_idx);
         // With a `RowSelection` and an `OffsetIndex`, only fetch the pages
@@ -93,6 +98,8 @@ impl InMemoryRowGroup<'_> {
         let columns = columns_to_fetch(projection, self.column_chunks.len(), |idx| {
             self.column_chunks[idx].is_some()
         });
+        let cache = self.metadata.page_cache();
+        let mut fetches = vec![];
         for idx in columns {
             let locations = page_index
                 .and_then(|page_index| page_index.offset_index(idx))
@@ -102,17 +109,35 @@ impl InMemoryRowGroup<'_> {
             let column = metadata.column(idx);
             let (start, len) = column.byte_range();
             let fetch = ColumnFetch::new(start..start + len, locations, column_selection);
-            if let Some(pages) = self
-                .metadata
-                .page_cache()
-                .filter(|_| page_cache_applies(column, read_page_stats))
-                .and_then(|cache| fetch.pin(cache.as_ref()))
-            {
+            let cacheable = cache.is_some() && page_cache_applies(column, read_page_stats);
+            fetches.push((idx, start..start + len, fetch, cacheable));
+        }
+        // One lease for the stage when the caller has none.
+        let own = match (lease, cache) {
+            (None, Some(cache)) => {
+                let sets: Vec<Vec<Range<u64>>> = fetches
+                    .iter()
+                    .filter(|(_, _, _, cacheable)| *cacheable)
+                    .map(|(_, _, fetch, _)| fetch.ranges().collect())
+                    .collect();
+                (!sets.is_empty())
+                    .then(|| cache.lease(&sets))
+                    .flatten()
+                    .map(Arc::new)
+            }
+            _ => None,
+        };
+        let lease = lease.or(own.as_ref());
+        for (idx, chunk, fetch, cacheable) in fetches {
+            // The sets of a lease are disjoint, so the lease tiles a chunk
+            // exactly when the chunk's set was leased.
+            if let Some(lease) = lease.filter(|lease| cacheable && lease.take(fetch.ranges())) {
+                let length = (chunk.end - chunk.start) as usize;
                 cached.push((
                     idx,
                     ColumnChunkData::Cached {
-                        length: len as usize,
-                        pages: Arc::new(pages),
+                        length,
+                        pages: Arc::new(PinnedPages::new(Arc::clone(lease), chunk)),
                     },
                 ));
                 continue;
@@ -291,21 +316,6 @@ impl<'a> ColumnFetch<'a> {
             dictionary: dictionary_range(chunk.start, locations),
             locations,
             pages,
-        }
-    }
-
-    /// Pins the pages of this fetch in `cache`: the pages of the dictionary
-    /// range and of the selected data pages, or the pages that cover the
-    /// whole column chunk. Returns `None` unless every one is resident.
-    fn pin(&self, cache: &dyn PageCache) -> Option<PinnedPages> {
-        match self {
-            Self::Chunk { range } => PinnedPages::contiguous(cache, range.start, range.end),
-            Self::Pages { .. } => {
-                // Each range of a page fetch is one page and starts at its
-                // header.
-                let offsets: Vec<u64> = self.ranges().map(|range| range.start).collect();
-                PinnedPages::at_offsets(cache, &offsets)
-            }
         }
     }
 

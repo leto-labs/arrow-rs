@@ -67,20 +67,32 @@
 //! # Planning reads with the cache
 //!
 //! The push decoder does not fetch a column chunk whose needed pages are all
-//! resident: its fetch planning pins them (see [`PageCache::pin`]) and the
-//! page reader holds the pins until it is dropped. A
-//! [`ScanPlan`](crate::arrow::push_decoder::ScanPlan) does not know the
+//! resident. Its fetch planning takes the pages of each decoding stage of a
+//! row group with one [`PageCache::lease`] call, for all the stage's column
+//! chunks; the page readers hold the lease until they are dropped, and its
+//! release records the reads.
+//!
+//! A caller that already holds a lease of a row group's pages (an engine that
+//! admits the row group before it decodes it) hands it to the decoder with
+//! [`ParquetPushDecoderBuilder::with_page_lease`](crate::arrow::push_decoder::ParquetPushDecoderBuilder::with_page_lease).
+//! The decoder then takes the pages of a column chunk from that lease when
+//! the lease tiles its needed ranges, and reads the bytes that the caller
+//! pushed for the other chunks: it makes no cache call of its own at
+//! planning. A cached row group then takes the cache's lock twice, for the
+//! lease and its release.
+//!
+//! A [`ScanPlan`](crate::arrow::push_decoder::ScanPlan) does not know the
 //! cache and lists every range. A caller that fetches ahead from a scan plan
-//! skips a resident range with [`resident_offsets`] and [`PageCache::pin`],
-//! and holds the lease until the decoder has read the row group.
+//! skips a range whose lease [`is_charged`](PageLease::is_charged), and holds
+//! the lease until the decoder has read the row group.
 
 use crate::basic::Compression;
 use crate::column::page::{Page, PageMetadata};
 use crate::file::metadata::ColumnChunkMetaData;
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// One decompressed page, the number of bytes it occupies in the file and
 /// the codec that it was decompressed with.
@@ -171,9 +183,185 @@ pub trait PageFill: Send {
     fn complete(self: Box<Self>, page: CachedPage);
 }
 
-/// A lease from [`PageCache::pin`]. The pages stay resident until the last
-/// clone is dropped.
-pub type PageLease = Arc<dyn Send + Sync>;
+/// The engine's side of a [`PageLease`]: it unpins the leased pages and
+/// records their reads.
+pub trait LeaseRelease: Send + Sync {
+    /// Called once, when the last holder drops the lease. `pages` lists every
+    /// page of the lease, in [`PageLease::pages`] order (by file offset), with
+    /// the reads that the decoder marked; a page with no read records no
+    /// access. One acquisition of the engine's lock should cover the call.
+    fn release(self: Box<Self>, pages: &[LeasedPage]);
+}
+
+/// One page that a [`PageLease`] holds, with the reads that the decoder
+/// marked on it.
+#[derive(Debug)]
+pub struct LeasedPage {
+    offset: u64,
+    page: CachedPage,
+    reads: AtomicU32,
+}
+
+impl LeasedPage {
+    /// The file offset of the page header.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// The page.
+    pub fn page(&self) -> &CachedPage {
+        &self.page
+    }
+
+    /// The reads that the decoder marked: one for each planning of a row
+    /// group read that takes this page, as a `get` counts one.
+    pub fn reads(&self) -> u32 {
+        self.reads.load(Ordering::Relaxed)
+    }
+
+    fn mark(&self) {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Pages that one call of [`PageCache::lease`] took from the cache, for the
+/// sets of ranges that it was given. The pages of a set are all there, or
+/// none are.
+///
+/// The lease holds the pages themselves, so a page stays readable through the
+/// lease whatever the cache does meanwhile. A cache that supports leases also
+/// keeps the pages resident and charged until the lease drops (see
+/// [`PageCache::lease`]). The decoder marks each page that it reads; dropping
+/// the lease hands the marks to the engine's [`LeaseRelease`].
+///
+/// Share a lease with [`Arc`]: the decoders of the slices of one row group
+/// can read from one lease, and it is released when the last one drops it.
+pub struct PageLease {
+    /// The pages, sorted by file offset.
+    pages: Vec<LeasedPage>,
+    /// Whether each requested set was leased.
+    leased: Vec<bool>,
+    release: Option<Box<dyn LeaseRelease>>,
+}
+
+impl Debug for PageLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageLease")
+            .field("pages", &self.pages.len())
+            .field("leased", &self.leased)
+            .field("charged", &self.release.is_some())
+            .finish()
+    }
+}
+
+impl PageLease {
+    /// A lease of `sets`: for each requested set, its pages (offset and
+    /// page) or `None` when the set was not leased. `release` is called when
+    /// the lease drops; `None` for a cache that keeps no pins.
+    pub fn new(
+        sets: Vec<Option<Vec<(u64, CachedPage)>>>,
+        release: Option<Box<dyn LeaseRelease>>,
+    ) -> Self {
+        let leased = sets.iter().map(Option::is_some).collect();
+        let mut pages: Vec<LeasedPage> = sets
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|(offset, page)| LeasedPage {
+                offset,
+                page,
+                reads: AtomicU32::new(0),
+            })
+            .collect();
+        // Stable: the engine can list its pins in the same order.
+        pages.sort_by_key(|page| page.offset);
+        Self {
+            pages,
+            leased,
+            release,
+        }
+    }
+
+    /// Whether the cache keeps the leased pages resident and charged until
+    /// the lease drops (a lease with a [`LeaseRelease`]).
+    pub fn is_charged(&self) -> bool {
+        self.release.is_some()
+    }
+
+    /// Whether set `set` of the request was leased.
+    pub fn is_leased(&self, set: usize) -> bool {
+        self.leased.get(set).copied().unwrap_or(false)
+    }
+
+    /// The number of sets of the request.
+    pub fn sets(&self) -> usize {
+        self.leased.len()
+    }
+
+    /// Every leased page, by file offset.
+    pub fn pages(&self) -> &[LeasedPage] {
+        &self.pages
+    }
+
+    /// The leased page that starts at `offset`.
+    pub fn page(&self, offset: u64) -> Option<&LeasedPage> {
+        self.pages
+            .binary_search_by_key(&offset, |page| page.offset)
+            .ok()
+            .map(|index| &self.pages[index])
+    }
+
+    /// Whether the leased pages tile every range of `ranges` (see
+    /// [`PageCache::lease`]). Marks a read on each of these pages when they
+    /// do; marks nothing when they do not.
+    pub(crate) fn take(&self, ranges: impl Iterator<Item = Range<u64>>) -> bool {
+        let mut taken = vec![];
+        for range in ranges {
+            let tiled = tile(range, &mut taken, |offset| {
+                let page = self.page(offset)?;
+                Some((page, page.page.stored_len()))
+            });
+            if !tiled {
+                return false;
+            }
+        }
+        taken.iter().for_each(|page| page.mark());
+        true
+    }
+}
+
+impl Drop for PageLease {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release.release(&self.pages);
+        }
+    }
+}
+
+/// Follows the pages that cover `range` without a gap from its start, each
+/// to the next by its stored length, and appends them to `pages`. Returns
+/// `false` (with `pages` in an unspecified state) when a page is missing,
+/// has a stored length of zero, or the pages do not end exactly at
+/// `range.end`. `page_at` gives the page that starts at an offset and its
+/// stored length.
+fn tile<P>(
+    range: Range<u64>,
+    pages: &mut Vec<P>,
+    mut page_at: impl FnMut(u64) -> Option<(P, u64)>,
+) -> bool {
+    let mut offset = range.start;
+    while offset < range.end {
+        let Some((page, len)) = page_at(offset) else {
+            return false;
+        };
+        match offset.checked_add(len) {
+            Some(next) if next > offset && next <= range.end => offset = next,
+            _ => return false,
+        }
+        pages.push(page);
+    }
+    true
+}
 
 /// Decompressed pages of one file generation, keyed by the file offset of the
 /// page header.
@@ -194,18 +382,62 @@ pub trait PageCache: Debug + Send + Sync {
     /// recording an access. Used to step over a page that is not read.
     fn probe(&self, offset: u64) -> Option<CachedPage>;
 
-    /// Atomically leases all named pages, or returns `None` without a lease.
-    /// Until the last lease is dropped, `get` and `probe` must still find these
-    /// pages, including after reclamation or a clear. The embedding engine
-    /// retains their memory charge. Acquiring a lease records no page access;
-    /// the decoder's later `get` records its read. This method never waits.
+    /// Leases the pages of each set of byte ranges whose pages are all
+    /// resident, and nothing of a set that has a page missing. Returns `None`
+    /// when no set is leased. This method never waits.
     ///
-    /// The default does not support leases. An external prefetcher must then
-    /// fetch the encoded bytes instead of relying on residency probes alone.
-    /// The decoder's own planning does not need leases: it holds the pages
-    /// that it found.
-    fn pin(&self, _offsets: &[u64]) -> Option<PageLease> {
-        None
+    /// Each range is a column chunk, a page or a run of pages and starts at
+    /// a page header. Its pages are the resident pages that cover it without
+    /// a gap, each followed to the next by its stored length; they must end
+    /// exactly at the end of the range. A range from an offset index (one
+    /// page) is one lookup, and the stored length of its page must be the
+    /// length of its location.
+    ///
+    /// A cache that supports leases takes every set under one acquisition of
+    /// its lock and gives the lease a [`LeaseRelease`]. Until the lease drops,
+    /// `get` and `probe` must still find its pages, including after
+    /// reclamation or a clear, and the engine keeps their memory charge.
+    /// Taking the lease records no access: the release records the reads
+    /// that the decoder marked, so a leased page that is not read (a unit
+    /// that a filter removed, a cancelled scan) records none.
+    ///
+    /// The default holds the pages without pins. It walks each set with
+    /// `probe`, which records nothing, and records the read of each page of
+    /// a set that tiles with one `get` at once; the cache can evict a page
+    /// that the lease holds. An external prefetcher must then fetch the
+    /// encoded bytes instead: it asks [`Self::holds_leases`] first.
+    fn lease(&self, sets: &[Vec<Range<u64>>]) -> Option<PageLease> {
+        let mut any = false;
+        let sets = sets
+            .iter()
+            .map(|ranges| {
+                let mut pages = vec![];
+                let tiled = ranges.iter().all(|range| {
+                    tile(range.clone(), &mut pages, |offset| {
+                        let page = self.probe(offset)?;
+                        let len = page.stored_len();
+                        Some(((offset, page), len))
+                    })
+                });
+                if !tiled {
+                    return None;
+                }
+                for (offset, _) in &pages {
+                    let _ = self.get(*offset, false);
+                }
+                any = true;
+                Some(pages)
+            })
+            .collect();
+        any.then(|| PageLease::new(sets, None))
+    }
+
+    /// Whether [`Self::lease`] keeps its pages resident and charged and
+    /// records their reads at release ([`PageLease::is_charged`]). A
+    /// prefetcher that skips the bytes of a resident range asks this before
+    /// it leases, so that a cache without lease support counts no read.
+    fn holds_leases(&self) -> bool {
+        false
     }
 }
 
@@ -226,92 +458,37 @@ pub(crate) fn page_cache_applies(column: &ColumnChunkMetaData, read_page_stats: 
     column.compression() != Compression::UNCOMPRESSED && !read_page_stats
 }
 
-/// The file offsets of the resident pages that cover the byte range `range`
-/// of a column chunk without a gap, following each page's stored length to
-/// the next one. Returns `None` if a page in the range is not resident or the
-/// pages do not end exactly at `range.end`.
-///
-/// `range` is a column chunk, a page, or a run of pages, for example the
-/// range of a [`PlannedRange`](crate::arrow::push_decoder::PlannedRange). It
-/// must start at a page header. This records no access and holds no page:
-/// pass the offsets to [`PageCache::pin`] to keep the pages resident.
-pub fn resident_offsets(cache: &dyn PageCache, range: Range<u64>) -> Option<Vec<u64>> {
-    let mut offsets = vec![];
-    let mut offset = range.start;
-    while offset < range.end {
-        let page = cache.probe(offset)?;
-        let next = offset
-            .checked_add(page.stored_len())
-            .filter(|next| *next > offset && *next <= range.end)?;
-        offsets.push(offset);
-        offset = next;
-    }
-    Some(offsets)
-}
-
-/// Pages of one column chunk that fetch planning took from the cache, by the
-/// file offset of the page. The reader of the chunk holds them, so an eviction
+/// The pages of one column chunk that fetch planning took from a
+/// [`PageLease`]. The reader of the chunk holds the lease, so an eviction
 /// between planning and decoding cannot remove a page whose bytes were not
 /// fetched.
-#[derive(Default)]
 pub(crate) struct PinnedPages {
-    pages: HashMap<u64, CachedPage>,
-    /// The engine's lease of these pages, if it supports leases: it keeps
-    /// their memory charged while the reader holds them.
-    lease: Option<PageLease>,
+    lease: Arc<PageLease>,
+    /// The byte range of the column chunk: the pages of the lease in it.
+    chunk: Range<u64>,
 }
 
 impl Debug for PinnedPages {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PinnedPages")
-            .field("pages", &self.pages.len())
-            .field("leased", &self.lease.is_some())
+            .field("chunk", &self.chunk)
+            .field("lease", &self.lease)
             .finish()
     }
 }
 
 impl PinnedPages {
+    /// The pages of `lease` in the column chunk at byte range `chunk`.
+    #[cfg(feature = "arrow")]
+    pub(crate) fn new(lease: Arc<PageLease>, chunk: Range<u64>) -> Self {
+        Self { lease, chunk }
+    }
+
     pub(crate) fn get(&self, offset: u64) -> Option<&CachedPage> {
-        self.pages.get(&offset)
-    }
-
-    /// Pins the pages that start at `offsets`. Returns `None` unless every
-    /// one is resident.
-    ///
-    /// A lease, if the cache gives one, is taken first, so that no page can
-    /// leave the cache between the lookups of one chunk. Each lookup records
-    /// one access: the read of the page that the plan stands for.
-    #[cfg(feature = "arrow")]
-    pub(crate) fn at_offsets(cache: &dyn PageCache, offsets: &[u64]) -> Option<Self> {
-        let lease = cache.pin(offsets);
-        let mut pages = HashMap::with_capacity(offsets.len());
-        for &offset in offsets {
-            match cache.get(offset, false) {
-                PageLookup::Hit(page) => pages.insert(offset, page),
-                PageLookup::Miss(_) => return None,
-            };
+        if !self.chunk.contains(&offset) {
+            return None;
         }
-        Some(Self { pages, lease })
-    }
-
-    /// Pins every page of the byte range `start..end` of a column chunk that
-    /// has no offset index (see [`resident_offsets`]). Returns `None` unless
-    /// the resident pages cover the range exactly.
-    #[cfg(feature = "arrow")]
-    pub(crate) fn contiguous(cache: &dyn PageCache, start: u64, end: u64) -> Option<Self> {
-        let offsets = resident_offsets(cache, start..end)?;
-        let pinned = Self::at_offsets(cache, &offsets)?;
-        // A page can have been replaced between the probe and the pin: the
-        // pinned pages must still cover the range.
-        let mut offset = start;
-        for &page_start in &offsets {
-            let page = pinned.get(page_start)?;
-            if page_start != offset {
-                return None;
-            }
-            offset = page_start.checked_add(page.stored_len())?;
-        }
-        (offset == end).then_some(pinned)
+        self.lease.page(offset).map(LeasedPage::page)
     }
 }
 
@@ -319,19 +496,27 @@ impl PinnedPages {
 pub(crate) mod testing {
     //! An unbounded map that counts its calls, for the tests of this crate.
     use super::*;
+    use std::collections::HashMap;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
 
     #[derive(Debug, Default)]
     pub(crate) struct MapPageCache {
         pages: Arc<Mutex<HashMap<u64, CachedPage>>>,
-        pub(crate) hits: AtomicUsize,
+        pub(crate) hits: Arc<AtomicUsize>,
         pub(crate) misses: AtomicUsize,
         pub(crate) fills: Arc<AtomicUsize>,
-        /// With leases, `pin` returns a lease, and `remove` and `clear` keep
-        /// the leased pages until the last lease is dropped.
+        /// With leases, `lease` pins its pages, and `remove` and `clear` keep
+        /// the leased pages until the last lease is dropped. Without, `lease`
+        /// holds the pages as the trait's default does.
         pub(crate) leases: Option<Arc<Mutex<HashMap<u64, usize>>>>,
+        /// Leases that pinned pages.
         pub(crate) pins: AtomicUsize,
+        /// Reads that released leases recorded.
+        pub(crate) lease_reads: Arc<AtomicUsize>,
+        /// Acquisitions of the map's lock by `get`, `probe`, `lease` and a
+        /// lease's release: what an engine's lock would see.
+        pub(crate) calls: Arc<AtomicUsize>,
     }
 
     impl MapPageCache {
@@ -391,26 +576,34 @@ pub(crate) mod testing {
         }
     }
 
-    struct Lease {
-        offsets: Vec<u64>,
+    struct Release {
         leases: Arc<Mutex<HashMap<u64, usize>>>,
+        hits: Arc<AtomicUsize>,
+        reads: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
     }
 
-    impl Drop for Lease {
-        fn drop(&mut self) {
+    impl LeaseRelease for Release {
+        fn release(self: Box<Self>, pages: &[LeasedPage]) {
+            self.calls.fetch_add(1, Ordering::Relaxed);
             let mut leases = self.leases.lock().unwrap();
-            for offset in &self.offsets {
-                let count = leases.get_mut(offset).unwrap();
+            for page in pages {
+                let count = leases.get_mut(&page.offset()).unwrap();
                 *count -= 1;
                 if *count == 0 {
-                    leases.remove(offset);
+                    leases.remove(&page.offset());
                 }
+                self.reads
+                    .fetch_add(page.reads() as usize, Ordering::Relaxed);
+                self.hits
+                    .fetch_add(page.reads() as usize, Ordering::Relaxed);
             }
         }
     }
 
     impl PageCache for MapPageCache {
         fn get(&self, offset: u64, fill: bool) -> PageLookup {
+            self.calls.fetch_add(1, Ordering::Relaxed);
             if let Some(page) = self.pages.lock().unwrap().get(&offset) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 return PageLookup::Hit(page.clone());
@@ -426,24 +619,80 @@ pub(crate) mod testing {
         }
 
         fn probe(&self, offset: u64) -> Option<CachedPage> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
             self.pages.lock().unwrap().get(&offset).cloned()
         }
 
-        fn pin(&self, offsets: &[u64]) -> Option<PageLease> {
-            let leases = self.leases.as_ref()?;
+        fn holds_leases(&self) -> bool {
+            self.leases.is_some()
+        }
+
+        /// One lock for the request; a lease records its reads when it
+        /// drops (counted in `hits` and `lease_reads`).
+        fn lease(&self, sets: &[Vec<Range<u64>>]) -> Option<PageLease> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let Some(leases) = self.leases.as_ref() else {
+                // As the default: hold the pages, recording each read of a
+                // set that tiles now.
+                let pages = self.pages.lock().unwrap();
+                let sets: Vec<_> = sets
+                    .iter()
+                    .map(|ranges| {
+                        let mut taken = vec![];
+                        ranges
+                            .iter()
+                            .all(|range| {
+                                tile(range.clone(), &mut taken, |offset| {
+                                    let page = pages.get(&offset)?.clone();
+                                    let len = page.stored_len();
+                                    Some(((offset, page), len))
+                                })
+                            })
+                            .then_some(taken)
+                    })
+                    .collect();
+                let reads = sets.iter().flatten().map(Vec::len).sum::<usize>();
+                self.hits.fetch_add(reads, Ordering::Relaxed);
+                return sets
+                    .iter()
+                    .any(Option::is_some)
+                    .then(|| PageLease::new(sets, None));
+            };
             let pages = self.pages.lock().unwrap();
-            if !offsets.iter().all(|offset| pages.contains_key(offset)) {
+            let mut counts = leases.lock().unwrap();
+            let sets: Vec<_> = sets
+                .iter()
+                .map(|ranges| {
+                    let mut taken = vec![];
+                    let tiled = ranges.iter().all(|range| {
+                        tile(range.clone(), &mut taken, |offset| {
+                            let page = pages.get(&offset)?.clone();
+                            let len = page.stored_len();
+                            Some(((offset, page), len))
+                        })
+                    });
+                    if !tiled {
+                        return None;
+                    }
+                    for (offset, _) in &taken {
+                        *counts.entry(*offset).or_default() += 1;
+                    }
+                    Some(taken)
+                })
+                .collect();
+            if sets.iter().all(Option::is_none) {
                 return None;
             }
-            let mut counts = leases.lock().unwrap();
-            for offset in offsets {
-                *counts.entry(*offset).or_default() += 1;
-            }
             self.pins.fetch_add(1, Ordering::Relaxed);
-            Some(Arc::new(Lease {
-                offsets: offsets.to_vec(),
-                leases: Arc::clone(leases),
-            }))
+            Some(PageLease::new(
+                sets,
+                Some(Box::new(Release {
+                    leases: Arc::clone(leases),
+                    hits: Arc::clone(&self.hits),
+                    reads: Arc::clone(&self.lease_reads),
+                    calls: Arc::clone(&self.calls),
+                })),
+            ))
         }
     }
 }
