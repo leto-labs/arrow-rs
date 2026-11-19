@@ -131,7 +131,7 @@ impl InMemoryRowGroup<'_> {
         for (idx, chunk, fetch, cacheable) in fetches {
             // The sets of a lease are disjoint, so the lease tiles a chunk
             // exactly when the chunk's set was leased.
-            if let Some(lease) = lease.filter(|lease| cacheable && lease.take(fetch.ranges())) {
+            if let Some(lease) = lease.filter(|lease| cacheable && lease.covers(fetch.ranges())) {
                 let length = (chunk.end - chunk.start) as usize;
                 cached.push((
                     idx,

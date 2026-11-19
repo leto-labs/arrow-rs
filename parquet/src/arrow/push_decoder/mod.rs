@@ -264,9 +264,11 @@ impl ParquetPushDecoderBuilder {
     /// from the page cache of this file's metadata.
     ///
     /// Fetch planning takes the pages of a column chunk from the lease when
-    /// the lease tiles the chunk's needed ranges, marks their reads in it,
-    /// and makes no cache call: the caller pushes the bytes of the other
-    /// chunks. The decoder's page readers hold the lease until they are
+    /// the lease tiles the chunk's needed ranges and makes no cache call:
+    /// the caller pushes the bytes of the other chunks. Each page reader
+    /// marks a read in the lease when it reads a page; a page that is not
+    /// read (the decoder is dropped first, or the selection skips it) is
+    /// not marked. The decoder's page readers hold the lease until they are
     /// dropped; [`ParquetPushDecoder::clear_all_ranges`] drops the decoder's
     /// own reference. Replaces an earlier lease.
     pub fn with_page_lease(mut self, page_lease: Arc<PageLease>) -> Self {

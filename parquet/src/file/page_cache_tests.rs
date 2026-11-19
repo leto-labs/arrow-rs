@@ -1317,3 +1317,122 @@ fn the_default_lease_holds_pages_without_pins() {
     assert!(pages > 0);
     assert_eq!(cache.hits.load(Ordering::Relaxed), hits);
 }
+
+#[test]
+fn dropping_a_request_waiting_for_bytes_does_not_count_unread_pages() {
+    let file = file(WriterVersion::PARQUET_1_0, Compression::SNAPPY);
+    let plain = Arc::new(metadata(&file, true));
+    let cache = Arc::new(MapPageCache::with_leases());
+    let handle: Arc<dyn PageCache> = cache.clone();
+    let cached = Arc::new(plain.as_ref().clone().with_page_cache(Some(handle.clone())));
+    decode(&cached, &file, None);
+    let sets = group_sets(&plain, 0);
+    for offset in cache.offsets() {
+        if sets[1][0].contains(&offset) {
+            cache.remove(offset).unwrap();
+        }
+    }
+    let lease = handle.lease(&sets).unwrap();
+    assert!(lease.is_leased(0) && !lease.is_leased(1));
+    let before = cache.hits.load(Ordering::Relaxed);
+    let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(cached)
+        .unwrap()
+        .with_row_groups(vec![0])
+        .with_page_lease(Arc::new(lease))
+        .build()
+        .unwrap();
+
+    // Planning succeeded for the cached column, but no page reader exists.
+    assert!(matches!(
+        decoder.try_decode().unwrap(),
+        DecodeResult::NeedsData(_)
+    ));
+    drop(decoder);
+    assert_eq!(cache.leased_pages(), 0);
+    assert_eq!(cache.hits.load(Ordering::Relaxed), before);
+}
+
+#[test]
+fn an_accounting_miss_does_not_make_a_default_lease_hit() {
+    use crate::file::page_cache::{CachedPage, PageLookup};
+
+    #[derive(Debug)]
+    struct EvictedBetweenCalls(CachedPage);
+
+    impl PageCache for EvictedBetweenCalls {
+        fn get(&self, _offset: u64, _fill: bool) -> PageLookup {
+            // This is the result after eviction between probe and get.
+            PageLookup::Miss(None)
+        }
+
+        fn probe(&self, offset: u64) -> Option<CachedPage> {
+            (offset == 0).then(|| self.0.clone())
+        }
+    }
+
+    let cache = EvictedBetweenCalls(CachedPage::new(
+        Page::DictionaryPage {
+            buf: Bytes::from_static(b"page"),
+            num_values: 1,
+            encoding: crate::basic::Encoding::PLAIN,
+            is_sorted: false,
+        },
+        4,
+        Compression::SNAPPY,
+    ));
+    let ranges = std::iter::once(0..4).collect();
+    assert!(cache.lease(&[ranges]).is_none());
+}
+
+/// A decoder that reads part of a leased row group marks only the pages that
+/// its page readers read: the pages that the selection skips record no hit,
+/// and the hits that the release records equal the marks.
+#[test]
+fn a_partial_read_of_a_lease_records_only_the_pages_read() {
+    let file = file(WriterVersion::PARQUET_1_0, Compression::SNAPPY);
+    let plain = Arc::new(metadata(&file, true));
+    let cache = Arc::new(MapPageCache::with_leases());
+    let handle: Arc<dyn PageCache> = cache.clone();
+    let cached = Arc::new(plain.as_ref().clone().with_page_cache(Some(handle.clone())));
+    decode(&cached, &file, None);
+    let lease = Arc::new(handle.lease(&group_sets(&plain, 0)).unwrap());
+    let leased = lease.pages().len();
+    let rows = plain.row_group(0).num_rows() as usize;
+    let first = RowSelection::from(vec![RowSelector::select(10), RowSelector::skip(rows - 10)]);
+    let hits = cache.hits.load(Ordering::Relaxed);
+    let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(Arc::clone(&cached))
+        .unwrap()
+        .with_row_groups(vec![0])
+        .with_row_selection(first)
+        .with_page_lease(Arc::clone(&lease))
+        .build()
+        .unwrap();
+    let mut read = 0;
+    loop {
+        match decoder.try_decode().unwrap() {
+            DecodeResult::NeedsData(ranges) => panic!("a leased row group fetched {ranges:?}"),
+            DecodeResult::Data(batch) => read += batch.num_rows(),
+            DecodeResult::Finished => break,
+        }
+    }
+    assert_eq!(read, 10);
+    drop(decoder);
+    let marked: u32 = lease.pages().iter().map(|page| page.reads()).sum();
+    let unread = lease
+        .pages()
+        .iter()
+        .filter(|page| page.reads() == 0)
+        .count();
+    assert!(marked > 0, "the first pages were read");
+    assert!(
+        unread > 0 && unread < leased,
+        "{unread} of {leased} leased pages unread"
+    );
+    drop(lease);
+    assert_eq!(cache.leased_pages(), 0);
+    assert_eq!(
+        cache.hits.load(Ordering::Relaxed) - hits,
+        marked as usize,
+        "the release records one hit for each read and none for unread pages"
+    );
+}

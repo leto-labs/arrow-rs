@@ -213,8 +213,10 @@ impl LeasedPage {
         &self.page
     }
 
-    /// The reads that the decoder marked: one for each planning of a row
-    /// group read that takes this page, as a `get` counts one.
+    /// The reads that page readers marked: one each time a reader reads
+    /// this page (not a peek or a skip), as a `get` counts one. A page that
+    /// planning took but no reader read (a cancelled or dropped request, a
+    /// page skipped by the selection) has none.
     pub fn reads(&self) -> u32 {
         self.reads.load(Ordering::Relaxed)
     }
@@ -231,8 +233,8 @@ impl LeasedPage {
 /// The lease holds the pages themselves, so a page stays readable through the
 /// lease whatever the cache does meanwhile. A cache that supports leases also
 /// keeps the pages resident and charged until the lease drops (see
-/// [`PageCache::lease`]). The decoder marks each page that it reads; dropping
-/// the lease hands the marks to the engine's [`LeaseRelease`].
+/// [`PageCache::lease`]). A page reader marks each page that it reads;
+/// dropping the lease hands the marks to the engine's [`LeaseRelease`].
 ///
 /// Share a lease with [`Arc`]: the decoders of the slices of one row group
 /// can read from one lease, and it is released when the last one drops it.
@@ -312,21 +314,16 @@ impl PageLease {
     }
 
     /// Whether the leased pages tile every range of `ranges` (see
-    /// [`PageCache::lease`]). Marks a read on each of these pages when they
-    /// do; marks nothing when they do not.
-    pub(crate) fn take(&self, ranges: impl Iterator<Item = Range<u64>>) -> bool {
-        let mut taken = vec![];
-        for range in ranges {
-            let tiled = tile(range, &mut taken, |offset| {
+    /// [`PageCache::lease`]). Marks nothing: a page's read is marked when a
+    /// page reader reads it.
+    pub(crate) fn covers(&self, ranges: impl Iterator<Item = Range<u64>>) -> bool {
+        let mut pages = vec![];
+        ranges.into_iter().all(|range| {
+            tile(range, &mut pages, |offset| {
                 let page = self.page(offset)?;
-                Some((page, page.page.stored_len()))
-            });
-            if !tiled {
-                return false;
-            }
-        }
-        taken.iter().for_each(|page| page.mark());
-        true
+                Some(((), page.page.stored_len()))
+            })
+        })
     }
 }
 
@@ -398,33 +395,40 @@ pub trait PageCache: Debug + Send + Sync {
     /// `get` and `probe` must still find its pages, including after
     /// reclamation or a clear, and the engine keeps their memory charge.
     /// Taking the lease records no access: the release records the reads
-    /// that the decoder marked, so a leased page that is not read (a unit
-    /// that a filter removed, a cancelled scan) records none.
+    /// that page readers marked, so a leased page that is not read (a unit
+    /// that a filter removed, a cancelled or dropped request, a page that the
+    /// selection skips) records none.
     ///
     /// The default holds the pages without pins. It walks each set with
-    /// `probe`, which records nothing, and records the read of each page of
-    /// a set that tiles with one `get` at once; the cache can evict a page
-    /// that the lease holds. An external prefetcher must then fetch the
-    /// encoded bytes instead: it asks [`Self::holds_leases`] first.
+    /// `probe`, which records nothing, then takes each page of a set that
+    /// tiles with one `get`, which records its read at once (best effort:
+    /// the read of a page that is not then read by a decoder is counted). A
+    /// set whose page `get` misses is not leased: it supplies only pages
+    /// that the accounting lookup returned. The cache can evict a page that
+    /// the lease holds. An external prefetcher must then fetch the encoded
+    /// bytes instead: it asks [`Self::holds_leases`] first.
     fn lease(&self, sets: &[Vec<Range<u64>>]) -> Option<PageLease> {
         let mut any = false;
         let sets = sets
             .iter()
             .map(|ranges| {
-                let mut pages = vec![];
+                let mut offsets = vec![];
                 let tiled = ranges.iter().all(|range| {
-                    tile(range.clone(), &mut pages, |offset| {
-                        let page = self.probe(offset)?;
-                        let len = page.stored_len();
-                        Some(((offset, page), len))
+                    tile(range.clone(), &mut offsets, |offset| {
+                        let len = self.probe(offset)?.stored_len();
+                        Some((offset, len))
                     })
                 });
                 if !tiled {
                     return None;
                 }
-                for (offset, _) in &pages {
-                    let _ = self.get(*offset, false);
-                }
+                let pages = offsets
+                    .into_iter()
+                    .map(|offset| match self.get(offset, false) {
+                        PageLookup::Hit(page) => Some((offset, page)),
+                        PageLookup::Miss(_) => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?;
                 any = true;
                 Some(pages)
             })
@@ -484,11 +488,25 @@ impl PinnedPages {
         Self { lease, chunk }
     }
 
+    /// The leased page at `offset`, without marking a read (a peek, a skip
+    /// or a check).
     pub(crate) fn get(&self, offset: u64) -> Option<&CachedPage> {
+        self.leased(offset).map(LeasedPage::page)
+    }
+
+    /// The leased page at `offset` for a read: marks one read in the lease,
+    /// which its release records.
+    pub(crate) fn read(&self, offset: u64) -> Option<&CachedPage> {
+        let page = self.leased(offset)?;
+        page.mark();
+        Some(page.page())
+    }
+
+    fn leased(&self, offset: u64) -> Option<&LeasedPage> {
         if !self.chunk.contains(&offset) {
             return None;
         }
-        self.lease.page(offset).map(LeasedPage::page)
+        self.lease.page(offset)
     }
 }
 

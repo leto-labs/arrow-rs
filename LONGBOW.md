@@ -354,14 +354,17 @@ DPC follow-up (rle.64, Longbow ADR 0063 decision 8): `PageCache::lease`
 replaces `pin` and `resident_offsets`. One call leases the pages of several
 sets of byte ranges (one set for each column chunk) and returns them in a
 `PageLease`: the pages themselves, sorted by offset, with a read mark on
-each. A set with a page missing leases nothing. Fetch planning marks the
-pages that it takes (one mark where a `get` counted one read before), and
-dropping the last reference hands the marks to the engine's `LeaseRelease`,
-which unpins the pages and records the reads under one more acquisition. A
-leased page that is not read records no read. The trait's default lease
-holds the pages without pins: it walks each set with `probe` and records the
-read of each page of a set that tiles with `get` at once
-(`PageLease::is_charged` is false). `PageCache::holds_leases` (default false)
+each. A set with a page missing leases nothing. A page reader marks a page
+when it reads it (`get_next_page`, `take_deferred_dictionary`; not a peek or
+a skip), one mark where a `get` counted one read before, and dropping the
+last reference hands the marks to the engine's `LeaseRelease`, which unpins
+the pages and records the reads under one more acquisition. A leased page
+that is not read records no read, also when a decoder is dropped after
+planning (review of rle.64, finding 1). The trait's default lease holds the
+pages without pins: it walks each set with `probe`, takes each page of a set
+that tiles with `get`, which records its read at once (best effort), and
+leases a set only when every such `get` hits (`PageLease::is_charged` is
+false). `PageCache::holds_leases` (default false)
 lets a prefetcher skip such a cache without counting reads. An engine that admits a row group before decoding it
 passes its lease to the decoder, and a cached row group takes the cache's
 lock twice instead of once for each page and column. `ParquetPushDecoder::

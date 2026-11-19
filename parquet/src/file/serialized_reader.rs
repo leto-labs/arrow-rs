@@ -681,7 +681,9 @@ struct PageCacheReader {
 impl PageCacheReader {
     /// The page that starts at `offset`, or the ticket to publish it.
     fn get(&self, offset: u64) -> PageLookup {
-        if let Some(page) = self.pinned.as_ref().and_then(|pinned| pinned.get(offset)) {
+        // A read of a leased page marks it in the lease (the release records
+        // it); peeks and skips use `probe`.
+        if let Some(page) = self.pinned.as_ref().and_then(|pinned| pinned.read(offset)) {
             return PageLookup::Hit(page.clone());
         }
         self.cache.get(offset, true)
