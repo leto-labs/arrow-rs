@@ -1,0 +1,21 @@
+[package]
+name = "parquet-code-cursor-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+parquet = { path = "../../../..", default-features = false, features = ["experimental"] }
+
+[workspace]
+
+[[bin]]
+name = "code_cursor"
+path = "fuzz_targets/code_cursor.rs"
+test = false
+doc = false
+bench = false

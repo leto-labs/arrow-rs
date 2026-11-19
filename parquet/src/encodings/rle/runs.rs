@@ -33,7 +33,7 @@ const SHORT: usize = 16;
 
 #[cold]
 #[inline(never)]
-fn out_of_bounds(dict_len: usize, id: u64) -> ParquetError {
+pub(super) fn out_of_bounds(dict_len: usize, id: u64) -> ParquetError {
     general_err!(
         "dictionary index out of bounds: the len is {} but the index is {}",
         dict_len,
@@ -44,7 +44,7 @@ fn out_of_bounds(dict_len: usize, id: u64) -> ParquetError {
 /// Unsigned LEB128 run header at `pos`: its value and its length in bytes.
 /// `None` when the slice ends first or the header is longer than ten bytes.
 #[inline(always)]
-fn header(data: &[u8], pos: usize) -> Option<(u64, usize)> {
+pub(super) fn header(data: &[u8], pos: usize) -> Option<(u64, usize)> {
     let first = *data.get(pos)?;
     if first < 0x80 {
         return Some((first as u64, 1));
@@ -63,7 +63,7 @@ fn header(data: &[u8], pos: usize) -> Option<(u64, usize)> {
 /// Little-endian value of `bytes` (at most four) bytes at `pos`, which the
 /// caller has checked against the slice.
 #[inline(always)]
-fn repeated_id(data: &[u8], pos: usize, bytes: usize) -> u64 {
+pub(super) fn repeated_id(data: &[u8], pos: usize, bytes: usize) -> u64 {
     debug_assert!(bytes <= 4 && pos + bytes <= data.len());
     if bytes == 0 {
         0
