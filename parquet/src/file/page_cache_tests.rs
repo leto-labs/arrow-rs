@@ -1625,6 +1625,11 @@ fn nearly_unique_numeric_chunks_use_plain_cached_pages() {
                 assert_eq!(dictionary.buffer_len(), 0);
                 let data = cache.probe(column.data_page_offset() as u64).unwrap();
                 assert_eq!(data.page().encoding(), crate::basic::Encoding::PLAIN);
+                if column.column_descr().max_def_level() == 1 {
+                    assert!(data.buffer_len() >= data.page().buffer().len() + 125);
+                } else {
+                    assert_eq!(data.buffer_len(), data.page().buffer().len());
+                }
             }
             for selection in [None, Some(selection())] {
                 let (expected, _) = decode(&plain, &file, selection.clone());

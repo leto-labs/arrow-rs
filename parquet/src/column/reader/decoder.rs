@@ -67,6 +67,16 @@ pub trait RepetitionLevelDecoder: ColumnLevelDecoder {
 }
 
 pub trait DefinitionLevelDecoder: ColumnLevelDecoder {
+    /// Sets the page's encoded levels and optional predecoded flat validity.
+    fn set_data_with_validity(
+        &mut self,
+        encoding: Encoding,
+        data: Bytes,
+        _validity: Option<std::sync::Arc<crate::file::page_cache::CachedValidity>>,
+    ) -> Result<()> {
+        self.set_data(encoding, data)
+    }
+
     /// Read up to `num_levels` definition levels into `out`.
     ///
     /// Returns the number of values read, and the number of levels read.

@@ -91,10 +91,32 @@ pub(crate) mod plain;
 use crate::basic::Compression;
 use crate::column::page::{Page, PageMetadata};
 use crate::file::metadata::ColumnChunkMetaData;
+use bytes::Bytes;
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+
+/// The definition levels of a flat nullable data page, in Arrow bit order.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct CachedValidity {
+    pub(crate) bits: Bytes,
+    #[cfg(feature = "arrow")]
+    pub(crate) len: usize,
+    #[cfg(feature = "arrow")]
+    pub(crate) nulls: usize,
+}
+
+/// A decompressed page and its optional cached validity.
+#[doc(hidden)]
+pub type PageWithValidity = (Page, Option<Arc<CachedValidity>>);
+
+impl CachedValidity {
+    fn buffer_len(&self) -> usize {
+        self.bits.len() + std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>()
+    }
+}
 
 /// One decompressed page, the number of bytes it occupies in the file and
 /// the codec that it was decompressed with.
@@ -104,6 +126,7 @@ pub struct CachedPage {
     stored_len: u64,
     codec: Compression,
     dictionary_marker: bool,
+    validity: Option<Arc<CachedValidity>>,
 }
 
 impl CachedPage {
@@ -117,7 +140,27 @@ impl CachedPage {
             stored_len,
             codec,
             dictionary_marker: false,
+            validity: None,
         }
+    }
+
+    #[cfg(feature = "arrow")]
+    pub(crate) fn with_flat_validity(mut self, flat_nullable: bool) -> Self {
+        if flat_nullable {
+            self.validity =
+                crate::arrow::record_reader::definition_levels::cache_validity(&self.page)
+                    .map(Arc::new);
+        }
+        self
+    }
+
+    #[cfg(not(feature = "arrow"))]
+    pub(crate) fn with_flat_validity(self, _flat_nullable: bool) -> Self {
+        self
+    }
+
+    pub(crate) fn into_page_with_validity(self) -> PageWithValidity {
+        (self.page, self.validity)
     }
 
     /// Retains the dictionary's file range for lease tiling without keeping its values.
@@ -150,9 +193,13 @@ impl CachedPage {
         self.codec
     }
 
-    /// Bytes that this entry keeps alive: the decompressed buffer.
+    /// Bytes retained by the decompressed buffer and optional validity sidecar.
     pub fn buffer_len(&self) -> usize {
         self.page.buffer().len()
+            + self
+                .validity
+                .as_deref()
+                .map_or(0, CachedValidity::buffer_len)
     }
 
     /// What `peek_next_page` reports for this page when the column chunk has
