@@ -392,7 +392,22 @@ pub trait PageCache: Debug + Send + Sync {
     /// reader that already holds the ticket of this page, so that one reader
     /// decompresses a page and the others share the result. Without `fill`
     /// the call neither waits nor returns a ticket.
-    fn get(&self, offset: u64, fill: bool) -> PageLookup;
+    fn get(&self, offset: u64, fill: bool) -> PageLookup {
+        self.get_with_accounting(offset, fill, |page| !page.is_dictionary_marker())
+    }
+
+    /// Looks up a resident entry and records a read only if `count_read`
+    /// accepts that same entry. Apply the predicate and accounting together,
+    /// before a concurrent fill or eviction can replace the entry.
+    ///
+    /// A rejected read still returns the resident entry. In particular, a
+    /// dictionary marker can cover its file range without counting as a read.
+    fn get_with_accounting(
+        &self,
+        offset: u64,
+        fill: bool,
+        count_read: fn(&CachedPage) -> bool,
+    ) -> PageLookup;
 
     /// Returns the page that starts at `offset` if it is resident, without
     /// recording an access. Used to step over a page that is not read.
@@ -420,7 +435,7 @@ pub trait PageCache: Debug + Send + Sync {
     ///
     /// The default holds the pages without pins. It walks each set with
     /// `probe`, which records nothing, then takes each page of a set that
-    /// tiles with one `get`, which records its read at once (best effort:
+    /// tiles with one `get`, which records reads of payload pages at once (best effort:
     /// the read of a page that is not then read by a decoder is counted). A
     /// set whose page `get` misses is not leased: it supplies only pages
     /// that the accounting lookup returned. The cache can evict a page that
@@ -639,10 +654,17 @@ pub(crate) mod testing {
     }
 
     impl PageCache for MapPageCache {
-        fn get(&self, offset: u64, fill: bool) -> PageLookup {
+        fn get_with_accounting(
+            &self,
+            offset: u64,
+            fill: bool,
+            count_read: fn(&CachedPage) -> bool,
+        ) -> PageLookup {
             self.calls.fetch_add(1, Ordering::Relaxed);
             if let Some(page) = self.pages.lock().unwrap().get(&offset) {
-                self.hits.fetch_add(1, Ordering::Relaxed);
+                if count_read(page) {
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                }
                 return PageLookup::Hit(page.clone());
             }
             self.misses.fetch_add(1, Ordering::Relaxed);
@@ -688,7 +710,12 @@ pub(crate) mod testing {
                             .then_some(taken)
                     })
                     .collect();
-                let reads = sets.iter().flatten().map(Vec::len).sum::<usize>();
+                let reads = sets
+                    .iter()
+                    .flatten()
+                    .flatten()
+                    .filter(|(_, page)| !page.is_dictionary_marker())
+                    .count();
                 self.hits.fetch_add(reads, Ordering::Relaxed);
                 return sets
                     .iter()

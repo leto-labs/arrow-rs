@@ -1360,7 +1360,12 @@ fn an_accounting_miss_does_not_make_a_default_lease_hit() {
     struct EvictedBetweenCalls(CachedPage);
 
     impl PageCache for EvictedBetweenCalls {
-        fn get(&self, _offset: u64, _fill: bool) -> PageLookup {
+        fn get_with_accounting(
+            &self,
+            _offset: u64,
+            _fill: bool,
+            _: fn(&CachedPage) -> bool,
+        ) -> PageLookup {
             // This is the result after eviction between probe and get.
             PageLookup::Miss(None)
         }
@@ -1635,3 +1640,5 @@ fn nearly_unique_numeric_chunks_use_plain_cached_pages() {
         }
     }
 }
+
+mod marker_accounting;
