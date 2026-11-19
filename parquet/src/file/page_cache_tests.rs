@@ -1436,3 +1436,129 @@ fn a_partial_read_of_a_lease_records_only_the_pages_read() {
         "the release records one hit for each read and none for unread pages"
     );
 }
+
+#[test]
+fn rereview_deferred_dictionary_lease_accounting() {
+    use crate::file::page_cache::PinnedPages;
+    for page_index in [true, false] {
+        let file = file(WriterVersion::PARQUET_1_0, Compression::SNAPPY);
+        let metadata = metadata(&file, page_index);
+        let cache = Arc::new(MapPageCache::with_leases());
+        let handle: Arc<dyn PageCache> = cache.clone();
+        pages(reader(
+            Arc::new(file.clone()),
+            &metadata,
+            0,
+            1,
+            Some(handle.clone()),
+        ));
+        let group = metadata.row_group(0);
+        let (start, len) = group.column(1).byte_range();
+        let range = start..start + len;
+        let lease = Arc::new(handle.lease(&[vec![range.clone()]]).unwrap());
+        let locations = metadata
+            .page_index()
+            .filter(|index| index.has_offset_indexes())
+            .and_then(|_| {
+                metadata
+                    .page_index_for_row_group(0)
+                    .page_locations(1)
+                    .cloned()
+            });
+        let mut reader = SerializedPageReader::new(
+            Arc::new(NoBytes(file.len() as u64)),
+            group.column(1),
+            group.num_rows() as usize,
+            locations,
+        )
+        .unwrap()
+        .with_page_cache(
+            Some(handle),
+            Some(Arc::new(PinnedPages::new(lease.clone(), range))),
+        );
+        assert!(reader.peek_next_page().unwrap().unwrap().is_dict);
+        reader.skip_next_page().unwrap();
+        let dictionary = lease
+            .pages()
+            .iter()
+            .find(|page| page.offset() == start)
+            .unwrap();
+        assert_eq!(dictionary.reads(), 0);
+        assert!(
+            reader
+                .take_deferred_dictionary()
+                .unwrap()
+                .unwrap()
+                .is_dictionary_page()
+        );
+        assert!(reader.take_deferred_dictionary().unwrap().is_none());
+        assert_eq!(dictionary.reads(), 1, "offset index: {page_index}");
+    }
+}
+
+/// A leased page that fails the checks of its read (here a dictionary page
+/// that was decompressed with another codec) makes the read an error, and
+/// records no read in the lease: a page counts as read only once it passed
+/// its checks.
+#[test]
+fn a_rejected_leased_page_records_no_read() {
+    use crate::file::page_cache::{CachedPage, PageLease, PinnedPages};
+    for page_index in [false, true] {
+        let file = file(WriterVersion::PARQUET_1_0, Compression::SNAPPY);
+        let metadata = metadata(&file, page_index);
+        let (start, length) = metadata.row_group(0).column(1).byte_range();
+        let cache = Arc::new(MapPageCache::default());
+        let handle: Arc<dyn PageCache> = cache.clone();
+        pages(reader(
+            Arc::new(file.clone()),
+            &metadata,
+            0,
+            1,
+            Some(handle.clone()),
+        ));
+        let mut leased: Vec<(u64, CachedPage)> = cache
+            .offsets()
+            .into_iter()
+            .map(|offset| (offset, cache.probe(offset).unwrap()))
+            .collect();
+        assert_eq!(leased[0].0, start, "the dictionary page comes first");
+        let dictionary = leased[0].1.clone();
+        leased[0].1 = CachedPage::new(
+            dictionary.page().clone(),
+            dictionary.stored_len(),
+            Compression::UNCOMPRESSED,
+        );
+        let lease = Arc::new(PageLease::new(vec![Some(leased)], None));
+        let group = metadata.row_group(0);
+        let locations = metadata
+            .page_index()
+            .filter(|index| index.has_offset_indexes())
+            .and_then(|_| {
+                metadata
+                    .page_index_for_row_group(0)
+                    .page_locations(1)
+                    .cloned()
+            });
+        let mut reader = SerializedPageReader::new(
+            Arc::new(NoBytes(file.len() as u64)),
+            group.column(1),
+            group.num_rows() as usize,
+            locations,
+        )
+        .unwrap()
+        .with_page_cache(
+            Some(handle),
+            Some(Arc::new(PinnedPages::new(
+                Arc::clone(&lease),
+                start..start + length,
+            ))),
+        );
+        let err = reader.get_next_page().unwrap_err().to_string();
+        assert!(err.contains("decompressed with"), "{err}");
+        assert_eq!(
+            lease.page(start).unwrap().reads(),
+            0,
+            "page index {page_index}"
+        );
+    }
+}

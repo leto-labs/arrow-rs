@@ -355,8 +355,10 @@ replaces `pin` and `resident_offsets`. One call leases the pages of several
 sets of byte ranges (one set for each column chunk) and returns them in a
 `PageLease`: the pages themselves, sorted by offset, with a read mark on
 each. A set with a page missing leases nothing. A page reader marks a page
-when it reads it (`get_next_page`, `take_deferred_dictionary`; not a peek or
-a skip), one mark where a `get` counted one read before, and dropping the
+when it reads it and the page passed its checks (`get_next_page`,
+`take_deferred_dictionary`, including a dictionary that a skip stepped over
+without an offset index; not a peek, a skip or a rejected page), one mark
+where a `get` counted one read before, and dropping the
 last reference hands the marks to the engine's `LeaseRelease`, which unpins
 the pages and records the reads under one more acquisition. A leased page
 that is not read records no read, also when a decoder is dropped after

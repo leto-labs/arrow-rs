@@ -590,8 +590,14 @@ enum DeferredDictionaryPage {
     /// `Pages` state: the offset index records the page location; header and
     /// body are both still unread.
     Location(PageLocation),
-    /// A resident page of the page cache, stepped over without file bytes.
-    Cached(Page),
+    /// A resident page of the page cache, stepped over without file bytes,
+    /// and the file offset of its header: taking it marks the read of a
+    /// leased page.
+    Cached {
+        /// File offset of the page header.
+        offset: u64,
+        page: Page,
+    },
 }
 
 enum SerializedPageReaderState {
@@ -679,14 +685,24 @@ struct PageCacheReader {
 }
 
 impl PageCacheReader {
-    /// The page that starts at `offset`, or the ticket to publish it.
-    fn get(&self, offset: u64) -> PageLookup {
-        // A read of a leased page marks it in the lease (the release records
-        // it); peeks and skips use `probe`.
-        if let Some(page) = self.pinned.as_ref().and_then(|pinned| pinned.read(offset)) {
-            return PageLookup::Hit(page.clone());
+    /// The page that starts at `offset`, or the ticket to publish it, and
+    /// whether it is a leased page. A leased page is not marked here: the
+    /// caller marks it with [`Self::mark_read`] once the page passed its
+    /// checks.
+    fn get(&self, offset: u64) -> (PageLookup, bool) {
+        if let Some(page) = self.pinned.as_ref().and_then(|pinned| pinned.get(offset)) {
+            return (PageLookup::Hit(page.clone()), true);
         }
-        self.cache.get(offset, true)
+        (self.cache.get(offset, true), false)
+    }
+
+    /// Records a read of the leased page at `offset` in its lease (the
+    /// release records it). Nothing for a page that is not leased: its
+    /// lookup in the cache counted the read.
+    fn mark_read(&self, offset: u64) {
+        if let Some(pinned) = &self.pinned {
+            pinned.read(offset);
+        }
     }
 
     /// The page that starts at `offset` if it is resident; records no access.
@@ -725,14 +741,21 @@ impl PageCacheReader {
         check: impl FnOnce(&CachedPage) -> Result<T>,
     ) -> Result<Lookup<T>> {
         match self.get(offset) {
-            PageLookup::Hit(cached) => {
+            (PageLookup::Hit(cached), leased) => {
                 let checked = check(&cached);
                 Ok(match self.on_failed_check(offset, checked)? {
-                    Some(value) => Ok((cached, value)),
+                    Some(value) => {
+                        // A leased page counts as read only once it passed
+                        // its checks: a rejected page records no read.
+                        if leased {
+                            self.mark_read(offset);
+                        }
+                        Ok((cached, value))
+                    }
                     None => Err(None),
                 })
             }
-            PageLookup::Miss(ticket) => Ok(Err(ticket)),
+            (PageLookup::Miss(ticket), _) => Ok(Err(ticket)),
         }
     }
 
@@ -1557,7 +1580,10 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                     // `take_deferred_dictionary`.
                     let stored_len = cached.stored_len();
                     if cached.page().is_dictionary_page() {
-                        deferred = Some(DeferredDictionaryPage::Cached(cached.page().clone()));
+                        deferred = Some(DeferredDictionaryPage::Cached {
+                            offset: *offset,
+                            page: cached.page().clone(),
+                        });
                     }
                     *offset += stored_len;
                     *remaining_bytes -= stored_len;
@@ -1712,7 +1738,15 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                 publish_page(fill, cacheable, &page, page_len as u64, codec);
                 page
             }
-            DeferredDictionaryPage::Cached(page) => page,
+            DeferredDictionaryPage::Cached { offset, page } => {
+                // The skip stepped over this page without a read; taking it
+                // is the read (of a leased page; a page of the cache without
+                // a lease counted no read on the skip, as before leases).
+                if let Some(cache) = &self.page_cache {
+                    cache.mark_read(offset);
+                }
+                page
+            }
         };
         Ok(Some(page))
     }
