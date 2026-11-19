@@ -111,6 +111,30 @@ fn invalid(dict_len: usize, index: u32) -> ParquetError {
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+/// Byte permutations and shifts for AVX2 blocks of eight IDs.
+#[cfg(target_arch = "x86_64")]
+static AVX2_UNPACK: [([u8; 32], [i32; 8]); 25] = {
+    let mut tables = [([0; 32], [0; 8]); 25];
+    let mut width = 1;
+    while width < tables.len() {
+        let (shuffle, shifts) = &mut tables[width];
+        let mut lane = 0;
+        while lane < 8 {
+            let bit = lane * width;
+            let window = if lane >= 4 { width / 2 } else { 0 };
+            shifts[lane] = (bit % 8) as i32;
+            let mut byte = 0;
+            while byte < 4 {
+                shuffle[lane * 4 + byte] = (bit / 8 - window + byte) as u8;
+                byte += 1;
+            }
+            lane += 1;
+        }
+        width += 1;
+    }
+    tables
+};
+
 /// # Safety
 /// AVX2 must be available. T must be i32/i64/f32/f64. Width is 1..=24,
 /// output length is a multiple of eight, and data has width bytes per eight
@@ -120,15 +144,7 @@ use std::arch::x86_64::*;
 unsafe fn avx2<T>(data: &[u8], width: u8, dict: &[T], out: &mut [MaybeUninit<T>]) -> Result<usize> {
     debug_assert!(matches!(size_of::<T>(), 4 | 8));
     let w = width as usize;
-    let mut shuffle = [0u8; 32];
-    let mut shifts = [0i32; 8];
-    for lane in 0..8 {
-        let bit = lane * w;
-        shifts[lane] = (bit % 8) as i32;
-        for byte in 0..4 {
-            shuffle[lane * 4 + byte] = (bit / 8 - if lane >= 4 { w / 2 } else { 0 } + byte) as u8;
-        }
-    }
+    let (shuffle, shifts) = &AVX2_UNPACK[w];
     // SAFETY: shuffle and shifts each contain exactly 32 readable bytes.
     let (shuffle, shifts) = unsafe {
         (
@@ -186,9 +202,49 @@ unsafe fn avx2<T>(data: &[u8], width: u8, dict: &[T], out: &mut [MaybeUninit<T>]
 /// pairs of 64-byte tables. An 8-byte dictionary has half as many.
 const SMALL_ENTRIES: usize = 128;
 
-/// Byte permutation and shifts that unpack sixteen `width`-bit IDs into
-/// 32-bit lanes, and the masks of a block. An ID of more than 24 bits can
-/// span five bytes: those widths unpack each half into 64-bit lanes.
+/// AVX-512 permutations and shifts for sixteen IDs. IDs wider than 24
+/// bits can span five bytes. Those widths use two sets of eight 64-bit
+/// lanes. The narrower widths use one set of sixteen 32-bit lanes.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+struct UnpackTable {
+    shuffle: [[u8; 64]; 2],
+    shifts: [[u32; 16]; 2],
+}
+
+#[cfg(target_arch = "x86_64")]
+static AVX512_UNPACK: [UnpackTable; 33] = {
+    let mut tables = [UnpackTable {
+        shuffle: [[0; 64]; 2],
+        shifts: [[0; 16]; 2],
+    }; 33];
+    let mut width = 1;
+    while width < tables.len() {
+        let table = &mut tables[width];
+        let lane_bytes = if width <= 24 { 4 } else { 8 };
+        let lanes_per_vector = 64 / lane_bytes;
+        let mut lane = 0;
+        while lane < 16 {
+            let bit = lane * width;
+            let half = lane / lanes_per_vector;
+            let index = lane % lanes_per_vector;
+            // Each shift fits in the low u32 of its little-endian lane.
+            table.shifts[half][index * (lane_bytes / 4)] = (bit % 8) as u32;
+            let mut byte = 0;
+            while byte < lane_bytes {
+                let source = bit / 8 + byte;
+                // Bytes past the fifth do not contribute to a wide ID.
+                table.shuffle[half][index * lane_bytes + byte] =
+                    if source < 64 { source as u8 } else { 63 };
+                byte += 1;
+            }
+            lane += 1;
+        }
+        width += 1;
+    }
+    tables
+};
+
 #[cfg(target_arch = "x86_64")]
 struct Unpack {
     shuffle: [__m512i; 2],
@@ -199,50 +255,6 @@ struct Unpack {
 
 #[cfg(target_arch = "x86_64")]
 impl Unpack {
-    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
-    fn new(width: u8) -> Self {
-        let w = width as usize;
-        let mut shuffle = [[0u8; 64]; 2];
-        let mut shifts = [[0u64; 8]; 2];
-        if w <= 24 {
-            let shifts = shifts.as_mut_ptr().cast::<i32>();
-            for lane in 0..16 {
-                // SAFETY: 16 four-byte lanes fill the first 64-byte array.
-                unsafe { shifts.add(lane).write((lane * w % 8) as i32) };
-                for byte in 0..4 {
-                    shuffle[0][lane * 4 + byte] = (lane * w / 8 + byte) as u8;
-                }
-            }
-        } else {
-            for half in 0..2 {
-                for lane in 0..8 {
-                    let bit = (half * 8 + lane) * w;
-                    shifts[half][lane] = (bit % 8) as u64;
-                    // Bytes past the fifth are masked off below; clamping
-                    // keeps the byte index inside the 64-byte register.
-                    for byte in 0..8 {
-                        shuffle[half][lane * 8 + byte] = (bit / 8 + byte).min(63) as u8;
-                    }
-                }
-            }
-        }
-        // SAFETY: every array contains exactly 64 readable bytes.
-        let load = |p: *const u8| unsafe { _mm512_loadu_si512(p.cast()) };
-        Self {
-            shuffle: [load(shuffle[0].as_ptr()), load(shuffle[1].as_ptr())],
-            shifts: [
-                load(shifts[0].as_ptr().cast()),
-                load(shifts[1].as_ptr().cast()),
-            ],
-            mask: if w <= 24 {
-                _mm512_set1_epi32(((1u32 << width) - 1) as i32)
-            } else {
-                _mm512_set1_epi64(((1u64 << width) - 1) as i64)
-            },
-            w,
-        }
-    }
-
     /// The IDs of `lanes` (8 or 16) values packed at `data[start..]`.
     ///
     /// # Safety
@@ -324,9 +336,28 @@ unsafe fn blocks_of<T, const WIDE: bool>(
     mut lookup: impl FnMut(__m512i, *mut MaybeUninit<T>, u16),
 ) -> Result<usize> {
     debug_assert!(matches!(size_of::<T>(), 4 | 8) && out.len().is_multiple_of(8));
-    let unpack = Unpack::new(width);
+    let w = width as usize;
+    let table = &AVX512_UNPACK[w];
+    // SAFETY: each shuffle and shifts array contains 64 readable bytes.
+    let unpack = unsafe {
+        Unpack {
+            shuffle: [
+                _mm512_loadu_si512(table.shuffle[0].as_ptr().cast()),
+                _mm512_loadu_si512(table.shuffle[1].as_ptr().cast()),
+            ],
+            shifts: [
+                _mm512_loadu_si512(table.shifts[0].as_ptr().cast()),
+                _mm512_loadu_si512(table.shifts[1].as_ptr().cast()),
+            ],
+            mask: if WIDE {
+                _mm512_set1_epi64(((1u64 << width) - 1) as i64)
+            } else {
+                _mm512_set1_epi32(((1u32 << width) - 1) as i32)
+            },
+            w,
+        }
+    };
     let bound = _mm512_set1_epi32(dict.len() as i32);
-    let w = unpack.w;
     let base = out.as_mut_ptr();
     let mut block = |written: usize, lanes: usize, active: u16| -> Result<()> {
         // SAFETY: eight outputs consume `width` bytes, which the caller checked.
@@ -480,6 +511,7 @@ unsafe fn avx512_small<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::bit_util::BitReader;
 
     // Independent little-endian bit writer, including the full unsigned range.
     fn packed(ids: &[u32], width: usize) -> Vec<u8> {
@@ -490,6 +522,42 @@ mod tests {
             }
         }
         data
+    }
+
+    #[test]
+    fn test_zero_width_dictionary_uses_scalar_decoder() {
+        use super::super::{RleDecoder, RleEncoder};
+        use bytes::Bytes;
+
+        crate::util::native::dispatch::for_each_tier(|| {
+            let mut encoder = RleEncoder::new(0, 128);
+            for _ in 0..33 {
+                encoder.put(0);
+            }
+            let data = Bytes::from(encoder.consume());
+            let mut scalar = RleDecoder::new(0);
+            scalar.set_data(data.clone()).unwrap();
+            let mut ids = [u32::MAX; 33];
+            assert_eq!(scalar.get_batch(&mut ids).unwrap(), ids.len());
+            assert_eq!(ids, [0; 33]);
+
+            let mut decoder = RleDecoder::new(0);
+            decoder.set_data(data).unwrap();
+            let dict = [42i64];
+            let mut actual = Vec::new();
+            assert_eq!(
+                decoder
+                    .append_dictionary(&dict, &mut actual, ids.len())
+                    .unwrap(),
+                ids.len()
+            );
+            assert!(
+                actual
+                    .iter()
+                    .zip(ids)
+                    .all(|(&value, id)| value == dict[id as usize])
+            );
+        });
     }
 
     #[test]
@@ -530,9 +598,11 @@ mod tests {
                         if let Some(result) = decode(data, width as u8, &dict, &mut out[..len]) {
                             let n = result.unwrap();
                             assert!(n <= len && n * width <= data.len() * 8);
-                            for i in 0..n {
+                            let mut scalar = BitReader::new(bytes::Bytes::copy_from_slice(data));
+                            for value in &out[..n] {
+                                let id = scalar.get_value::<u32>(width).unwrap();
                                 // SAFETY: successful decode initializes exactly this prefix.
-                                assert_eq!(unsafe { out[i].assume_init() }, dict[ids[i] as usize]);
+                                assert_eq!(unsafe { value.assume_init() }, dict[id as usize]);
                             }
                         }
                         for slot in &out[len..] {
