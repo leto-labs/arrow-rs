@@ -1562,3 +1562,76 @@ fn a_rejected_leased_page_records_no_read() {
         );
     }
 }
+
+#[test]
+fn nearly_unique_numeric_chunks_use_plain_cached_pages() {
+    use arrow_array::{Float32Array, Float64Array};
+
+    for version in [WriterVersion::PARQUET_1_0, WriterVersion::PARQUET_2_0] {
+        let batch = RecordBatch::try_from_iter([
+            (
+                "i32",
+                Arc::new(Int32Array::from_iter(
+                    (0..ROWS as i32).map(|i| (i % 7 != 0).then_some(i - 10_000)),
+                )) as ArrayRef,
+            ),
+            (
+                "i64",
+                Arc::new(Int64Array::from_iter_values(
+                    (0..ROWS as i64).map(|i| i << 38),
+                )) as ArrayRef,
+            ),
+            (
+                "f32",
+                Arc::new(Float32Array::from_iter_values(
+                    (0..ROWS).map(|i| i as f32 / 3.0),
+                )) as ArrayRef,
+            ),
+            (
+                "f64",
+                Arc::new(Float64Array::from_iter(
+                    (0..ROWS).map(|i| (i % 11 != 0).then_some(i as f64 / -7.0)),
+                )) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_writer_version(version)
+            .set_compression(Compression::SNAPPY)
+            .set_data_page_row_count_limit(1_000)
+            .set_write_batch_size(250)
+            .build();
+        let mut writer = ArrowWriter::try_new(Vec::new(), batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        let file = Bytes::from(writer.into_inner().unwrap());
+        for page_index in [false, true] {
+            let plain = Arc::new(metadata(&file, page_index));
+            let cache = Arc::new(MapPageCache::with_leases());
+            let handle: Arc<dyn PageCache> = cache.clone();
+            let cached = Arc::new(plain.as_ref().clone().with_page_cache(Some(handle)));
+            assert_eq!(
+                decode(&plain, &file, None).0,
+                decode(&cached, &file, None).0
+            );
+            for column in plain.row_group(0).columns() {
+                let dictionary = cache
+                    .probe(column.dictionary_page_offset().unwrap() as u64)
+                    .unwrap();
+                assert_eq!(dictionary.buffer_len(), 0);
+                let data = cache.probe(column.data_page_offset() as u64).unwrap();
+                assert_eq!(data.page().encoding(), crate::basic::Encoding::PLAIN);
+            }
+            for selection in [None, Some(selection())] {
+                let (expected, _) = decode(&plain, &file, selection.clone());
+                let (warm, requests) = decode(&cached, &file, selection.clone());
+                assert_eq!(warm, expected);
+                assert!(requests.is_empty());
+                // An evicted page makes the whole lease set unavailable.
+                let offset = plain.row_group(0).column(0).data_page_offset() as u64;
+                let page = cache.remove(offset).unwrap();
+                assert_eq!(decode(&cached, &file, selection).0, expected);
+                cache.insert(offset, page);
+            }
+        }
+    }
+}

@@ -86,6 +86,8 @@
 //! skips a range whose lease [`is_charged`](PageLease::is_charged), and holds
 //! the lease until the decoder has read the row group.
 
+pub(crate) mod plain;
+
 use crate::basic::Compression;
 use crate::column::page::{Page, PageMetadata};
 use crate::file::metadata::ColumnChunkMetaData;
@@ -101,6 +103,7 @@ pub struct CachedPage {
     page: Page,
     stored_len: u64,
     codec: Compression,
+    dictionary_marker: bool,
 }
 
 impl CachedPage {
@@ -113,7 +116,23 @@ impl CachedPage {
             page,
             stored_len,
             codec,
+            dictionary_marker: false,
         }
+    }
+
+    /// Retains the dictionary's file range for lease tiling without keeping its values.
+    pub(crate) fn dictionary_marker(page: &Page, stored_len: u64, codec: Compression) -> Self {
+        let mut page = page.clone();
+        if let Page::DictionaryPage { buf, .. } = &mut page {
+            *buf = Default::default();
+        }
+        let mut cached = Self::new(page, stored_len, codec);
+        cached.dictionary_marker = true;
+        cached
+    }
+
+    pub(crate) fn is_dictionary_marker(&self) -> bool {
+        self.dictionary_marker
     }
 
     /// The decompressed page.
