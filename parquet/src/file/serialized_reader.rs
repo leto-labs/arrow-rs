@@ -31,7 +31,7 @@ use crate::file::metadata::page_index::RowGroupPageIndex;
 use crate::file::metadata::thrift::PageHeader;
 use crate::file::page_cache::plain::{PlainChunk, is_dictionary_encoded};
 use crate::file::page_cache::{
-    CachedPage, PageCache, PageFill, PageLookup, PinnedPages, page_cache_applies,
+    CachedPage, PageCache, PageFill, PageLookup, PageWithValidity, PinnedPages, page_cache_applies,
 };
 use crate::file::page_index::offset_index::PageLocation;
 use crate::file::statistics;
@@ -671,6 +671,7 @@ pub struct SerializedPageReader<R: ChunkReader> {
     page_cache_codec: Option<Compression>,
 
     plain_chunk: Option<PlainChunk>,
+    flat_nullable: bool,
 }
 
 /// The result of [`PageCacheReader::lookup`]: a hit that passed its check,
@@ -800,6 +801,7 @@ fn publish_page(
     stored_len: u64,
     codec: Compression,
     plain_chunk: Option<&mut PlainChunk>,
+    flat_nullable: bool,
 ) -> Page {
     if let Some(chunk) = plain_chunk {
         if page.is_dictionary_page() {
@@ -812,7 +814,10 @@ fn publish_page(
             }
         } else if let Some(fill) = fill {
             if let Some(stored) = chunk.data_page(&page, owns_buffer) {
-                fill.complete(CachedPage::new(stored.clone(), stored_len, codec));
+                fill.complete(
+                    CachedPage::new(stored.clone(), stored_len, codec)
+                        .with_flat_validity(flat_nullable),
+                );
                 return stored;
             }
             return page;
@@ -821,7 +826,9 @@ fn publish_page(
     if let Some(fill) = fill
         && owns_buffer
     {
-        fill.complete(CachedPage::new(page.clone(), stored_len, codec));
+        fill.complete(
+            CachedPage::new(page.clone(), stored_len, codec).with_flat_validity(flat_nullable),
+        );
     }
     page
 }
@@ -1021,6 +1028,9 @@ impl<R: ChunkReader> SerializedPageReader<R> {
             context,
             page_cache: None,
             plain_chunk: PlainChunk::new(meta),
+            flat_nullable: meta.column_descr().max_rep_level() == 0
+                && meta.column_descr().max_def_level() == 1
+                && meta.column_descr().path().parts().len() == 1,
             page_cache_codec: page_cache_applies(meta, props.read_page_stats())
                 .then(|| meta.compression()),
         })
@@ -1314,6 +1324,11 @@ pub(crate) fn verify_page_size(
 
 impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
     fn get_next_page(&mut self) -> Result<Option<Page>> {
+        self.get_next_page_with_validity()
+            .map(|page| page.map(|(page, _)| page))
+    }
+
+    fn get_next_page_with_validity(&mut self) -> Result<Option<PageWithValidity>> {
         let codec = self.cache_codec();
         loop {
             let (page, fill, owns_buffer, stored_len) = match &mut self.state {
@@ -1351,13 +1366,14 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                                 *next_page_header = None;
                                 *offset += rest;
                                 *remaining -= rest;
-                                let page = cached.page().clone();
+                                let dictionary_marker = cached.is_dictionary_marker();
+                                let (page, validity) = cached.into_page_with_validity();
                                 if page.is_data_page() {
                                     *page_index += 1;
                                 } else if page.is_dictionary_page() {
                                     *require_dictionary = false;
                                 }
-                                if cached.is_dictionary_marker() {
+                                if dictionary_marker {
                                     continue;
                                 }
                                 if page.is_dictionary_page()
@@ -1365,7 +1381,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                                 {
                                     chunk.observe_dictionary(&page);
                                 }
-                                return Ok(Some(page));
+                                return Ok(Some((page, validity)));
                             }
                             Err(ticket) => fill = ticket,
                         }
@@ -1450,7 +1466,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                                 if is_dictionary_page && let Some(chunk) = &mut self.plain_chunk {
                                     chunk.observe_dictionary(cached.page());
                                 }
-                                return Ok(Some(cached.page().clone()));
+                                return Ok(Some(cached.into_page_with_validity()));
                             }
                             Err(ticket) => fill = ticket,
                         }
@@ -1498,14 +1514,16 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
             {
                 self.deferred_dictionary = Some(DeferredDictionaryPage::Decoded(dictionary));
             }
-            return Ok(Some(publish_page(
+            let page = publish_page(
                 fill,
                 owns_buffer,
                 page,
                 stored_len,
                 codec,
                 self.plain_chunk.as_mut(),
-            )));
+                self.flat_nullable,
+            );
+            return Ok(Some((page, None)));
         }
     }
 
@@ -1791,6 +1809,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                     stored_len,
                     codec,
                     self.plain_chunk.as_mut(),
+                    false,
                 )
             }
             DeferredDictionaryPage::Location(front) => {
@@ -1836,6 +1855,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                     page_len as u64,
                     codec,
                     self.plain_chunk.as_mut(),
+                    false,
                 )
             }
             DeferredDictionaryPage::Cached { offset, page } => {

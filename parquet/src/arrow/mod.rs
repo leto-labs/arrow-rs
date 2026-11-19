@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -203,7 +205,7 @@ pub mod async_writer;
 pub mod push_decoder;
 
 mod in_memory_row_group;
-mod record_reader;
+pub(crate) mod record_reader;
 
 #[cfg(feature = "experimental")]
 #[doc(hidden)]

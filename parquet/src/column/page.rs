@@ -26,6 +26,7 @@ use crate::errors::{ParquetError, Result};
 use crate::file::metadata::thrift::{
     DataPageHeader, DataPageHeaderV2, DictionaryPageHeader, PageHeader,
 };
+use crate::file::page_cache::PageWithValidity;
 use crate::file::statistics::{Statistics, page_stats_to_thrift};
 
 /// Parquet Page definition.
@@ -416,6 +417,13 @@ pub trait PageReader: Iterator<Item = Result<Page>> + Send {
     /// Gets the next page in the column chunk associated with this reader.
     /// Returns `None` if there are no pages left.
     fn get_next_page(&mut self) -> Result<Option<Page>>;
+
+    /// Gets the next page and its cached validity, when available.
+    #[doc(hidden)]
+    fn get_next_page_with_validity(&mut self) -> Result<Option<PageWithValidity>> {
+        self.get_next_page()
+            .map(|page| page.map(|page| (page, None)))
+    }
 
     /// Gets metadata about the next page, returns an error if no
     /// column index information

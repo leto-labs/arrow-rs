@@ -22,14 +22,18 @@ use arrow_buffer::Buffer;
 use arrow_buffer::bit_chunk_iterator::UnalignedBitChunk;
 use arrow_buffer::bit_util::compress;
 use bytes::Bytes;
+use std::sync::Arc;
 
 use crate::arrow::buffer::bit_util::count_set_bits;
 use crate::basic::Encoding;
+use crate::column::page::Page;
 use crate::column::reader::decoder::{
     ColumnLevelDecoder, DefinitionLevelDecoder, DefinitionLevelDecoderImpl,
 };
+use crate::column::reader::parse_v1_level;
 use crate::encodings::rle::run_len;
 use crate::errors::{ParquetError, Result};
+use crate::file::page_cache::CachedValidity;
 use crate::schema::types::ColumnDescPtr;
 
 enum BufferInner {
@@ -207,7 +211,91 @@ pub(crate) fn build_filtered_validity_bitmap(
     item_count
 }
 
+/// Materialize the exact number of levels declared by an eligible page.
+pub(crate) fn cache_validity(page: &Page) -> Option<CachedValidity> {
+    let (data, len, header_nulls) = match page {
+        Page::DataPage {
+            buf,
+            num_values,
+            def_level_encoding: Encoding::RLE,
+            ..
+        } => {
+            let (_, data) = parse_v1_level(1, *num_values, Encoding::RLE, buf.clone()).ok()?;
+            (data, *num_values as usize, None)
+        }
+        Page::DataPageV2 {
+            buf,
+            num_values,
+            num_nulls,
+            def_levels_byte_len,
+            rep_levels_byte_len: 0,
+            ..
+        } if *def_levels_byte_len as usize <= buf.len() => (
+            buf.slice(..*def_levels_byte_len as usize),
+            *num_values as usize,
+            Some(*num_nulls as usize),
+        ),
+        _ => return None,
+    };
+
+    let mut decoder = PackedDecoder::new();
+    decoder.set_data(Encoding::RLE, data);
+    // A short or malformed stream must not allocate from its declared count.
+    const CHUNK: usize = 65_536;
+    let mut bitmap = BooleanBufferBuilder::new(len.min(CHUNK));
+    let mut valid = 0;
+    while bitmap.len() < len {
+        let n = (len - bitmap.len()).min(CHUNK);
+        let (read, count) = decoder.read(&mut bitmap, n).ok()?;
+        if read != n {
+            return None;
+        }
+        valid += count;
+    }
+    let nulls = len - valid;
+    if header_nulls.is_some_and(|count| count != nulls) {
+        return None;
+    }
+    Some(CachedValidity {
+        bits: Bytes::from(bitmap.as_slice().to_vec()),
+        len,
+        nulls,
+    })
+}
+
+struct ValidityCursor {
+    data: Arc<CachedValidity>,
+    offset: usize,
+    remaining_valid: usize,
+}
+
+impl ValidityCursor {
+    fn consume(&mut self, len: usize, output: Option<&mut BooleanBufferBuilder>) -> (usize, usize) {
+        let remaining = self.data.len - self.offset;
+        let len = len.min(remaining);
+        let range = self.offset..self.offset + len;
+        let valid = if len == remaining {
+            self.remaining_valid
+        } else if self.remaining_valid == 0 || self.remaining_valid == remaining {
+            len.min(self.remaining_valid)
+        } else {
+            UnalignedBitChunk::new(&self.data.bits, range.start, len).count_ones()
+        };
+        if let Some(output) = output {
+            if valid == len || valid == 0 {
+                output.append_n(len, valid != 0);
+            } else {
+                output.append_packed_range(range, &self.data.bits);
+            }
+        }
+        self.offset += len;
+        self.remaining_valid -= valid;
+        (valid, len)
+    }
+}
+
 enum MaybePacked {
+    Cached(ValidityCursor),
     Packed(PackedDecoder),
     Fallback(DefinitionLevelDecoderImpl),
 }
@@ -233,6 +321,11 @@ impl ColumnLevelDecoder for DefinitionLevelBufferDecoder {
 
     fn set_data(&mut self, encoding: Encoding, data: Bytes) -> Result<()> {
         match &mut self.decoder {
+            MaybePacked::Cached(_) => {
+                let mut decoder = PackedDecoder::new();
+                decoder.set_data(encoding, data);
+                self.decoder = MaybePacked::Packed(decoder);
+            }
             MaybePacked::Packed(d) => d.set_data(encoding, data),
             MaybePacked::Fallback(d) => d.set_data(encoding, data)?,
         }
@@ -241,6 +334,26 @@ impl ColumnLevelDecoder for DefinitionLevelBufferDecoder {
 }
 
 impl DefinitionLevelDecoder for DefinitionLevelBufferDecoder {
+    fn set_data_with_validity(
+        &mut self,
+        encoding: Encoding,
+        data: Bytes,
+        validity: Option<Arc<CachedValidity>>,
+    ) -> Result<()> {
+        if let Some(data) = validity
+            && self.max_level == 1
+            && !matches!(self.decoder, MaybePacked::Fallback(_))
+        {
+            self.decoder = MaybePacked::Cached(ValidityCursor {
+                offset: 0,
+                remaining_valid: data.len - data.nulls,
+                data,
+            });
+            return Ok(());
+        }
+        self.set_data(encoding, data)
+    }
+
     fn read_def_levels(
         &mut self,
         writer: &mut Self::Buffer,
@@ -277,6 +390,9 @@ impl DefinitionLevelDecoder for DefinitionLevelBufferDecoder {
 
                 Ok((values_read, levels_read))
             }
+            (BufferInner::Mask { nulls }, MaybePacked::Cached(cursor)) => {
+                Ok(cursor.consume(num_levels, Some(nulls)))
+            }
             (BufferInner::Mask { nulls }, MaybePacked::Packed(decoder)) => {
                 assert_eq!(self.max_level, 1);
 
@@ -304,6 +420,7 @@ impl DefinitionLevelDecoder for DefinitionLevelBufferDecoder {
 
     fn skip_def_levels(&mut self, num_levels: usize) -> Result<(usize, usize)> {
         match &mut self.decoder {
+            MaybePacked::Cached(cursor) => Ok(cursor.consume(num_levels, None)),
             MaybePacked::Fallback(decoder) => decoder.skip_def_levels(num_levels),
             MaybePacked::Packed(decoder) => decoder.skip(num_levels),
         }
@@ -799,6 +916,84 @@ mod tests {
                 );
             }
             assert!(bits[pos.div_ceil(8) + 8..].iter().all(|&b| b == 0));
+        }
+    }
+
+    #[test]
+    fn cached_validity_matches_every_batch_boundary_and_skip() {
+        let len = 193;
+        for (pattern, bits) in [
+            ("all-valid", vec![true; len]),
+            ("all-null", vec![false; len]),
+            (
+                "mixed",
+                (0..len).map(|i| i % 53 < 17 || i % 7 == 0).collect(),
+            ),
+        ] {
+            let mut encoder = RleEncoder::new(1, len);
+            for &bit in &bits {
+                encoder.put(bit as u64);
+            }
+            let data = Bytes::from(encoder.consume());
+            let page = Page::DataPageV2 {
+                buf: data.clone(),
+                num_values: len as u32,
+                encoding: Encoding::PLAIN,
+                num_nulls: bits.iter().filter(|&&bit| !bit).count() as u32,
+                num_rows: len as u32,
+                def_levels_byte_len: data.len() as u32,
+                rep_levels_byte_len: 0,
+                is_compressed: false,
+                statistics: None,
+            };
+            let validity = Arc::new(cache_validity(&page).unwrap());
+            let mut cached = DefinitionLevelBufferDecoder::new(1, true);
+            for split in 0..=len {
+                for skip_first in [false, true] {
+                    cached
+                        .set_data_with_validity(Encoding::RLE, data.clone(), Some(validity.clone()))
+                        .unwrap();
+                    let mut output = DefinitionLevelBuffer {
+                        inner: BufferInner::Mask {
+                            nulls: BooleanBufferBuilder::new(0),
+                        },
+                        len: 0,
+                    };
+                    let expected = |range: std::ops::Range<usize>| {
+                        (
+                            bits[range.clone()].iter().filter(|&&bit| bit).count(),
+                            range.len(),
+                        )
+                    };
+                    if skip_first {
+                        assert_eq!(cached.skip_def_levels(split).unwrap(), expected(0..split));
+                    } else {
+                        assert_eq!(
+                            cached.read_def_levels(&mut output, split).unwrap(),
+                            expected(0..split)
+                        );
+                    }
+                    assert_eq!(
+                        cached.read_def_levels(&mut output, len).unwrap(),
+                        expected(split..len)
+                    );
+                    assert_eq!(cached.skip_def_levels(1).unwrap(), (0, 0));
+                    let BufferInner::Mask { nulls } = output.inner else {
+                        unreachable!()
+                    };
+                    let begin = if skip_first { split } else { 0 };
+                    assert_eq!(nulls.len(), len - begin);
+                    for (i, &bit) in bits[begin..].iter().enumerate() {
+                        assert_eq!(nulls.get_bit(i), bit, "{pattern}: split {split}, bit {i}");
+                    }
+                }
+            }
+
+            cached.set_data(Encoding::RLE, data).unwrap();
+            assert_eq!(
+                cached.skip_def_levels(len).unwrap(),
+                (len - validity.nulls, len)
+            );
         }
     }
 

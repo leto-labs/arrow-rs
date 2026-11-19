@@ -516,10 +516,10 @@ where
     /// Returns false if there's no page left.
     fn read_new_page(&mut self) -> Result<bool> {
         loop {
-            match self.page_reader.get_next_page()? {
+            match self.page_reader.get_next_page_with_validity()? {
                 // No more page to read
                 None => return Ok(false),
-                Some(current_page) => {
+                Some((current_page, validity)) => {
                     match current_page {
                         // 1. Dictionary page: configure dictionary for this page.
                         Page::DictionaryPage {
@@ -609,7 +609,11 @@ where
                                 self.def_level_decoder
                                     .as_mut()
                                     .unwrap()
-                                    .set_data(def_level_encoding, level_data)?;
+                                    .set_data_with_validity(
+                                        def_level_encoding,
+                                        level_data,
+                                        validity,
+                                    )?;
                             }
                             self.values_decoder.set_data(
                                 encoding,
@@ -683,10 +687,14 @@ where
                             // DataPage v2 only supports RLE encoding for definition
                             // levels
                             if self.descr.max_def_level() > 0 {
-                                self.def_level_decoder.as_mut().unwrap().set_data(
-                                    Encoding::RLE,
-                                    buf.slice(rep_levels_byte_len as usize..levels_byte_len),
-                                )?;
+                                self.def_level_decoder
+                                    .as_mut()
+                                    .unwrap()
+                                    .set_data_with_validity(
+                                        Encoding::RLE,
+                                        buf.slice(rep_levels_byte_len as usize..levels_byte_len),
+                                        validity,
+                                    )?;
                             }
 
                             let data = buf.slice(levels_byte_len..);
@@ -750,7 +758,7 @@ fn check_partial_record_fits(records_read: usize, remaining_records: usize) -> R
     Ok(())
 }
 
-fn parse_v1_level(
+pub(crate) fn parse_v1_level(
     max_level: i16,
     num_buffered_values: u32,
     encoding: Encoding,
