@@ -412,6 +412,8 @@ impl RleEncoder {
 }
 
 mod fused;
+#[cfg(feature = "arrow")]
+pub(crate) use fused::append_widened_dictionary;
 mod runs;
 
 /// Size, in number of `i32s` of buffer to use for RLE batch reading

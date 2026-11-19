@@ -21,6 +21,10 @@ use bytes::Bytes;
 
 use crate::basic::{Encoding, EncodingMask, Type};
 use crate::data_type::DataType;
+#[cfg(feature = "arrow")]
+use crate::data_type::Int32Type;
+#[cfg(feature = "arrow")]
+use crate::encodings::rle::{MAX_RLE_DICTIONARY_BIT_WIDTH, append_widened_dictionary};
 use crate::encodings::{
     decoding::{Decoder, DictDecoder, get_decoder},
     rle::RleDecoder,
@@ -461,6 +465,194 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
             .unwrap_or_else(|| panic!("decoder for encoding {encoding} should be set"));
 
         current_decoder.skip(num_values)
+    }
+}
+
+/// Read physical INT32 pages into a final 64-bit Arrow value buffer.
+#[cfg(feature = "arrow")]
+pub(crate) struct WideningInt32Decoder<const MULTIPLIER: i64> {
+    physical: ColumnValueDecoderImpl<Int32Type>,
+    dictionary: Option<Bytes>,
+    dictionary_page: Option<(RleDecoder, usize)>,
+    plain: WideningPlainInt32<MULTIPLIER>,
+    encoding: Option<Encoding>,
+    scratch: Vec<i32>,
+}
+
+#[cfg(feature = "arrow")]
+impl<const MULTIPLIER: i64> ColumnValueDecoder for WideningInt32Decoder<MULTIPLIER> {
+    type Buffer = Vec<i64>;
+
+    fn new(descr: &ColumnDescPtr) -> Self {
+        Self {
+            physical: ColumnValueDecoderImpl::new(descr),
+            dictionary: None,
+            dictionary_page: None,
+            plain: WideningPlainInt32::default(),
+            encoding: None,
+            scratch: Vec::new(),
+        }
+    }
+
+    fn set_dict(
+        &mut self,
+        buf: Bytes,
+        num_values: u32,
+        encoding: Encoding,
+        _is_sorted: bool,
+    ) -> Result<()> {
+        if !matches!(
+            encoding,
+            Encoding::PLAIN | Encoding::PLAIN_DICTIONARY | Encoding::RLE_DICTIONARY
+        ) {
+            return Err(nyi_err!(
+                "Invalid/Unsupported encoding type for dictionary: {encoding}"
+            ));
+        }
+        if self.dictionary.is_some() {
+            return Err(general_err!("Column cannot have more than one dictionary"));
+        }
+        let count = num_values as usize;
+        if count > buf.len() / size_of::<i32>() {
+            return Err(eof_err!("Not enough bytes to decode dictionary"));
+        }
+        self.dictionary = Some(buf.slice(..count * 4));
+        Ok(())
+    }
+
+    fn set_data(
+        &mut self,
+        encoding: Encoding,
+        data: Bytes,
+        num_levels: usize,
+        num_values: Option<usize>,
+    ) -> Result<()> {
+        let count = num_values.unwrap_or(num_levels);
+        match encoding {
+            Encoding::PLAIN => self.plain.set_data(data, count)?,
+            Encoding::PLAIN_DICTIONARY | Encoding::RLE_DICTIONARY => {
+                if self.dictionary.is_none() {
+                    return Err(general_err!("missing dictionary page for column"));
+                }
+                let &width = data
+                    .first()
+                    .ok_or_else(|| eof_err!("Not enough bytes to decode bit_width"))?;
+                if width > MAX_RLE_DICTIONARY_BIT_WIDTH {
+                    return Err(general_err!(
+                        "Invalid or corrupted RLE bit width {width}. Max allowed is {MAX_RLE_DICTIONARY_BIT_WIDTH}"
+                    ));
+                }
+                let mut decoder = RleDecoder::new(width);
+                decoder.set_data(data.slice(1..))?;
+                self.dictionary_page = Some((decoder, count));
+            }
+            _ => self
+                .physical
+                .set_data(encoding, data, num_levels, num_values)?,
+        }
+        self.encoding = Some(encoding);
+        Ok(())
+    }
+
+    fn read(&mut self, out: &mut Vec<i64>, count: usize) -> Result<usize> {
+        match self.encoding.expect("encoding should be set") {
+            Encoding::PLAIN => self.plain.get_to_vec(out, count),
+            Encoding::PLAIN_DICTIONARY | Encoding::RLE_DICTIONARY => {
+                let (decoder, remaining) = self.dictionary_page.as_mut().unwrap();
+                let dictionary = self.dictionary.as_deref().unwrap().as_chunks::<4>().0;
+                let result = append_widened_dictionary::<MULTIPLIER>(
+                    decoder,
+                    dictionary,
+                    out,
+                    count.min(*remaining),
+                )?;
+                *remaining -= result;
+                Ok(result)
+            }
+            _ => {
+                self.scratch.clear();
+                let read = self.physical.read(&mut self.scratch, count)?;
+                out.extend(self.scratch.iter().map(|&v| i64::from(v) * MULTIPLIER));
+                Ok(read)
+            }
+        }
+    }
+
+    fn can_read_spaced() -> bool {
+        true
+    }
+
+    fn read_spaced(
+        &mut self,
+        out: &mut Vec<i64>,
+        num_values: usize,
+        num_levels: usize,
+        validity: &[u8],
+        offset: usize,
+    ) -> Result<usize> {
+        super::spaced::read(
+            out,
+            num_values,
+            num_levels,
+            validity,
+            offset,
+            |out, count| self.read(out, count),
+        )
+    }
+
+    fn skip_values(&mut self, count: usize) -> Result<usize> {
+        match self.encoding.expect("encoding should be set") {
+            Encoding::PLAIN => self.plain.skip(count),
+            Encoding::PLAIN_DICTIONARY | Encoding::RLE_DICTIONARY => {
+                let (decoder, remaining) = self.dictionary_page.as_mut().unwrap();
+                let skipped = decoder.skip(count.min(*remaining))?;
+                *remaining -= skipped;
+                Ok(skipped)
+            }
+            _ => self.physical.skip_values(count),
+        }
+    }
+}
+
+#[cfg(feature = "arrow")]
+#[derive(Default)]
+struct WideningPlainInt32<const MULTIPLIER: i64> {
+    data: Bytes,
+    offset: usize,
+    remaining: usize,
+}
+
+#[cfg(feature = "arrow")]
+impl<const MULTIPLIER: i64> WideningPlainInt32<MULTIPLIER> {
+    fn take(&mut self, count: usize) -> Result<&[[u8; 4]]> {
+        let count = count.min(self.remaining);
+        if count > (self.data.len() - self.offset) / 4 {
+            return Err(eof_err!("Not enough bytes to decode INT32 values"));
+        }
+        let start = self.offset;
+        self.offset += count * 4;
+        self.remaining -= count;
+        Ok(self.data[start..self.offset].as_chunks::<4>().0)
+    }
+    fn set_data(&mut self, data: Bytes, num_values: usize) -> Result<()> {
+        self.data = data;
+        self.offset = 0;
+        self.remaining = num_values;
+        Ok(())
+    }
+
+    fn get_to_vec(&mut self, out: &mut Vec<i64>, count: usize) -> Result<usize> {
+        let bytes = self.take(count)?;
+        out.extend(
+            bytes
+                .iter()
+                .map(|&bytes| i64::from(i32::from_le_bytes(bytes)) * MULTIPLIER),
+        );
+        Ok(bytes.len())
+    }
+
+    fn skip(&mut self, count: usize) -> Result<usize> {
+        Ok(self.take(count)?.len())
     }
 }
 

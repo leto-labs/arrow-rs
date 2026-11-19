@@ -36,6 +36,7 @@ in `third_party/README.md` and `docs/UPSTREAM_MATRIX.toml`.
 | Family | Purpose in this stack | Dependent feature | Classification |
 |---|---|---|---|
 | DPC | Hook decompressed page caching and atomic page leases into PageIndexProvider and shared fetch planning | SCAN-PAGE-CACHE | UPSTREAMABLE |
+| DTT | Decode INT32 pages into Arrow 64-bit value buffers and construct Decimal64 directly for INT64 | NATIVE-PARQUET-DECODE, NARROW-DECIMALS | UPSTREAMABLE |
 | DRL | Decode dictionary runs and definition levels with register cursors, SIMD lookup and in-place NULL expansion | NATIVE-PARQUET-DECODE | UPSTREAMABLE |
 | FUG | Fuse primitive dictionary unpack and gather with runtime AVX2 and AVX-512 dispatch | NATIVE-PARQUET-DECODE | UPSTREAMABLE |
 | NEX | Decode flat nullable primitives into logical output slots with zero-filled NULL slots | NATIVE-PARQUET-DECODE | UPSTREAMABLE |
@@ -61,6 +62,14 @@ word-wise definition levels and in-place NULL expansion. See the historical
 decode-floor report (in the consuming Longbow repository) and
 dictionary report (in the consuming Longbow repository) for the original
 screens; they are not measurements of the new stack.
+
+DTT retains the compact INT32 dictionary page and widens at the output store.
+The Arrow column decoder uses the forwarding re-export in `encodings/rle.rs`
+to reach the widened store in `encodings/rle/fused.rs`. Lane 5.11a should
+preserve that entry point when changing dictionary dispatch. PLAIN pages widen
+at the store. Date64 converts days to milliseconds at the same point. Other
+page encodings retain their physical decoders, and other Arrow targets retain
+their coercions.
 
 PEH returns errors for invalid encodings, PAB bounds allocations and decompression
 by available input, PCV verifies supplied checksums by default, and PCW writes

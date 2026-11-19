@@ -18,10 +18,11 @@
 // under the License.
 
 use crate::arrow::array_reader::{ArrayReader, read_records, skip_records};
-use crate::arrow::record_reader::RecordReader;
+use crate::arrow::record_reader::{GenericRecordReader, RecordReader};
 use crate::arrow::schema::parquet_to_arrow_field;
 use crate::basic::Type as PhysicalType;
 use crate::column::page::PageIterator;
+use crate::column::reader::decoder::WideningInt32Decoder;
 use crate::data_type::{DataType, Int96};
 use crate::errors::Result;
 use crate::schema::types::ColumnDescPtr;
@@ -84,6 +85,26 @@ impl IntoBuffer for Vec<Int96> {
     }
 }
 
+const MILLIS_PER_DAY: i64 = 86_400_000;
+
+enum PrimitiveRecordReader<T: DataType> {
+    Physical(RecordReader<T>),
+    Widened(GenericRecordReader<Vec<i64>, WideningInt32Decoder<1>>),
+    Date64(GenericRecordReader<Vec<i64>, WideningInt32Decoder<MILLIS_PER_DAY>>),
+}
+
+// The record readers share all record, level, and padding operations. Only
+// consuming the value buffer depends on the physical or widened value type.
+macro_rules! with_record_reader {
+    ($reader:expr, |$inner:ident| $operation:expr) => {
+        match $reader {
+            PrimitiveRecordReader::Physical($inner) => $operation,
+            PrimitiveRecordReader::Widened($inner) => $operation,
+            PrimitiveRecordReader::Date64($inner) => $operation,
+        }
+    };
+}
+
 /// Primitive array readers are leaves of array reader tree. They accept page iterator
 /// and read them into primitive arrays.
 pub struct PrimitiveArrayReader<T>
@@ -96,7 +117,7 @@ where
     pages: Box<dyn PageIterator>,
     def_levels_buffer: Option<Vec<i16>>,
     rep_levels_buffer: Option<Vec<i16>>,
-    record_reader: RecordReader<T>,
+    record_reader: PrimitiveRecordReader<T>,
 }
 
 impl<T> PrimitiveArrayReader<T>
@@ -126,9 +147,19 @@ where
                 .clone(),
         };
 
-        let mut record_reader = RecordReader::<T>::new(column_desc, batch_size);
+        let mut record_reader = match (T::get_physical_type(), &data_type) {
+            (PhysicalType::INT32, ArrowType::Date64) => {
+                PrimitiveRecordReader::Date64(GenericRecordReader::new(column_desc, batch_size))
+            }
+            (
+                PhysicalType::INT32,
+                ArrowType::Decimal64(..) | ArrowType::Timestamp(..) | ArrowType::Int64,
+            ) => PrimitiveRecordReader::Widened(GenericRecordReader::new(column_desc, batch_size)),
+            _ => PrimitiveRecordReader::Physical(RecordReader::new(column_desc, batch_size)),
+        };
         if let Some(threshold) = padding_threshold {
-            record_reader.set_padding_threshold(threshold);
+            with_record_reader!(&mut record_reader, |reader| reader
+                .set_padding_threshold(threshold));
         }
 
         Ok(Self {
@@ -158,7 +189,11 @@ where
     }
 
     fn read_records(&mut self, batch_size: usize) -> Result<usize> {
-        read_records(&mut self.record_reader, self.pages.as_mut(), batch_size)
+        with_record_reader!(&mut self.record_reader, |reader| read_records(
+            reader,
+            self.pages.as_mut(),
+            batch_size
+        ))
     }
 
     fn consume_batch(&mut self) -> Result<ArrayRef> {
@@ -166,60 +201,45 @@ where
 
         // Convert physical data to equivalent arrow type, and then perform
         // coercion as needed
-        let len = self.record_reader.values_written();
-
-        let record_data = self
-            .record_reader
-            .consume_record_data()
-            .into_buffer(target_type);
-
-        let nulls = self
-            .record_reader
-            .consume_compact_bitmap()
-            .and_then(|b| NullBuffer::from_unsliced_buffer(b, len));
-
-        let array: ArrayRef = match T::get_physical_type() {
-            PhysicalType::BOOLEAN => Arc::new(BooleanArray::new(
-                BooleanBuffer::new(record_data, 0, len),
-                nulls,
-            )),
-            PhysicalType::INT32 => Arc::new(Int32Array::new(
-                ScalarBuffer::new(record_data, 0, len),
-                nulls,
-            )),
-            PhysicalType::INT64 => Arc::new(Int64Array::new(
-                ScalarBuffer::new(record_data, 0, len),
-                nulls,
-            )),
-            PhysicalType::FLOAT => Arc::new(Float32Array::new(
-                ScalarBuffer::new(record_data, 0, len),
-                nulls,
-            )),
-            PhysicalType::DOUBLE => Arc::new(Float64Array::new(
-                ScalarBuffer::new(record_data, 0, len),
-                nulls,
-            )),
-            PhysicalType::INT96 => Arc::new(Int64Array::new(
-                ScalarBuffer::new(record_data, 0, len),
-                nulls,
-            )),
-            PhysicalType::BYTE_ARRAY | PhysicalType::FIXED_LEN_BYTE_ARRAY => {
-                unreachable!("PrimitiveArrayReaders don't support complex physical types");
+        let len = with_record_reader!(&self.record_reader, |reader| reader.values_written());
+        let nulls = with_record_reader!(&mut self.record_reader, |reader| reader
+            .consume_compact_bitmap())
+        .and_then(|b| NullBuffer::from_unsliced_buffer(b, len));
+        let (record_data, widened) = match &mut self.record_reader {
+            PrimitiveRecordReader::Physical(reader) => {
+                (reader.consume_record_data().into_buffer(target_type), false)
+            }
+            PrimitiveRecordReader::Widened(reader) => {
+                (Buffer::from_vec(reader.consume_record_data()), true)
+            }
+            PrimitiveRecordReader::Date64(reader) => {
+                (Buffer::from_vec(reader.consume_record_data()), true)
             }
         };
 
-        // Coerce the arrow type to the desired array type
-        let array = coerce_array(array, target_type)?;
+        let array = if widened
+            || (T::get_physical_type() == PhysicalType::INT64
+                && matches!(target_type, ArrowType::Decimal64(..)))
+        {
+            array_from_i64(ScalarBuffer::new(record_data, 0, len), nulls, target_type)?
+        } else {
+            physical_array::<T>(record_data, len, nulls, target_type)?
+        };
 
-        // save definition and repetition buffers
-        self.def_levels_buffer = self.record_reader.consume_def_levels();
-        self.rep_levels_buffer = self.record_reader.consume_rep_levels();
-        self.record_reader.reset();
+        self.def_levels_buffer = with_record_reader!(&mut self.record_reader, |reader| reader
+            .consume_def_levels());
+        self.rep_levels_buffer = with_record_reader!(&mut self.record_reader, |reader| reader
+            .consume_rep_levels());
+        with_record_reader!(&mut self.record_reader, |reader| reader.reset());
         Ok(array)
     }
 
     fn skip_records(&mut self, num_records: usize) -> Result<usize> {
-        skip_records(&mut self.record_reader, self.pages.as_mut(), num_records)
+        with_record_reader!(&mut self.record_reader, |reader| skip_records(
+            reader,
+            self.pages.as_mut(),
+            num_records
+        ))
     }
 
     fn get_def_levels(&self) -> Option<&[i16]> {
@@ -231,8 +251,76 @@ where
     }
 
     fn max_def_level(&self) -> i16 {
-        self.record_reader.max_def_level()
+        with_record_reader!(&self.record_reader, |reader| reader.max_def_level())
     }
+}
+
+fn array_from_i64(
+    values: ScalarBuffer<i64>,
+    nulls: Option<NullBuffer>,
+    target: &ArrowType,
+) -> Result<ArrayRef> {
+    Ok(match target {
+        ArrowType::Int64 => Arc::new(Int64Array::new(values, nulls)),
+        ArrowType::Date64 => Arc::new(Date64Array::new(values, nulls)),
+        ArrowType::Decimal64(precision, scale) => Arc::new(
+            Decimal64Array::new(values, nulls).with_precision_and_scale(*precision, *scale)?,
+        ),
+        ArrowType::Timestamp(unit, timezone) => match unit {
+            TimeUnit::Second => Arc::new(
+                TimestampSecondArray::new(values, nulls).with_timezone_opt(timezone.clone()),
+            ),
+            TimeUnit::Millisecond => Arc::new(
+                TimestampMillisecondArray::new(values, nulls).with_timezone_opt(timezone.clone()),
+            ),
+            TimeUnit::Microsecond => Arc::new(
+                TimestampMicrosecondArray::new(values, nulls).with_timezone_opt(timezone.clone()),
+            ),
+            TimeUnit::Nanosecond => Arc::new(
+                TimestampNanosecondArray::new(values, nulls).with_timezone_opt(timezone.clone()),
+            ),
+        },
+        _ => unreachable!("Invalid 64-bit Arrow type: {target}"),
+    })
+}
+
+fn physical_array<T: DataType>(
+    record_data: Buffer,
+    len: usize,
+    nulls: Option<NullBuffer>,
+    target_type: &ArrowType,
+) -> Result<ArrayRef> {
+    let array: ArrayRef = match T::get_physical_type() {
+        PhysicalType::BOOLEAN => Arc::new(BooleanArray::new(
+            BooleanBuffer::new(record_data, 0, len),
+            nulls,
+        )),
+        PhysicalType::INT32 => Arc::new(Int32Array::new(
+            ScalarBuffer::new(record_data, 0, len),
+            nulls,
+        )),
+        PhysicalType::INT64 => Arc::new(Int64Array::new(
+            ScalarBuffer::new(record_data, 0, len),
+            nulls,
+        )),
+        PhysicalType::FLOAT => Arc::new(Float32Array::new(
+            ScalarBuffer::new(record_data, 0, len),
+            nulls,
+        )),
+        PhysicalType::DOUBLE => Arc::new(Float64Array::new(
+            ScalarBuffer::new(record_data, 0, len),
+            nulls,
+        )),
+        PhysicalType::INT96 => Arc::new(Int64Array::new(
+            ScalarBuffer::new(record_data, 0, len),
+            nulls,
+        )),
+        PhysicalType::BYTE_ARRAY | PhysicalType::FIXED_LEN_BYTE_ARRAY => {
+            unreachable!("PrimitiveArrayReaders don't support complex physical types");
+        }
+    };
+
+    coerce_array(array, target_type)
 }
 
 /// Coerce the parquet physical type array to the target type
@@ -457,24 +545,36 @@ mod tests {
     /// row groups, partial output batches, and five definition-level patterns.
     #[test]
     fn test_fused_dictionary_widths_pages_and_nulls() {
-        crate::util::native::dispatch::for_each_tier(|| {
+        let check = |widen| {
             use crate::encodings::rle::{RleDecoder, RleEncoder};
             use bytes::Bytes;
             use rand::{RngExt, SeedableRng};
             let mut rng = rand::rngs::StdRng::seed_from_u64(0x5232_2026);
             for width in 1u8..=32 {
-                let dictionary: Vec<i64> = (0..if (18..=24).contains(&width) && !cfg!(miri) {
-                    1usize << width
-                } else {
-                    (1usize << width.min(7)).min(67)
-                })
-                    .map(|i| (i as i64).wrapping_mul(i64::MIN + 123))
-                    .collect();
+                // Widened coverage spans small tables, AVX2 gathers, and AVX-512
+                // narrow/wide gathers without duplicating the largest allocations.
+                if widen && ![1, 5, 7, 8, 16, 17, 24, 25, 32].contains(&width) {
+                    continue;
+                }
+                let dictionary: Vec<i64> =
+                    (0..if !widen && (18..=24).contains(&width) && !cfg!(miri) {
+                        1usize << width
+                    } else {
+                        (1usize << width.min(7)).min(67)
+                    })
+                        .map(|i| {
+                            if widen {
+                                i64::from((i as i32).wrapping_mul(i32::MIN + 123))
+                            } else {
+                                (i as i64).wrapping_mul(i64::MIN + 123)
+                            }
+                        })
+                        .collect();
                 // Built once per width: dictionaries reach 2^24 entries.
                 let dictionary_page = Bytes::from(
                     dictionary
                         .iter()
-                        .flat_map(|v| v.to_le_bytes())
+                        .flat_map(|v| v.to_le_bytes().into_iter().take(if widen { 4 } else { 8 }))
                         .collect::<Vec<_>>(),
                 );
                 for v2 in [false, true] {
@@ -484,11 +584,11 @@ mod tests {
                     for pattern in 0..7 {
                         let nullable = pattern != 0 && pattern != 6;
                         let (mut run_left, mut run_id, mut null_left) = (0usize, 0usize, 0usize);
-                        let schema = parse_message_type(if nullable {
-                            "message test { OPTIONAL INT64 value; }"
-                        } else {
-                            "message test { REQUIRED INT64 value; }"
-                        })
+                        let repetition = if nullable { "OPTIONAL" } else { "REQUIRED" };
+                        let physical = if widen { "INT32" } else { "INT64" };
+                        let schema = parse_message_type(&format!(
+                            "message test {{ {repetition} {physical} value; }}"
+                        ))
                         .unwrap();
                         let desc = SchemaDescriptor::new(Arc::new(schema)).column(0);
                         let mut groups = Vec::new();
@@ -597,14 +697,30 @@ mod tests {
                         }
                         let expected = Int64Array::from(expected);
                         for batch in [1, 7, 31, 1023, 1024, 1025, 8192] {
-                            let mut reader = PrimitiveArrayReader::<Int64Type>::new(
-                                Box::new(InMemoryPageIterator::new(groups.clone())),
-                                desc.clone(),
-                                None,
-                                batch,
-                                None,
-                            )
-                            .unwrap();
+                            let pages = Box::new(InMemoryPageIterator::new(groups.clone()));
+                            let mut reader: Box<dyn ArrayReader> = if widen {
+                                Box::new(
+                                    PrimitiveArrayReader::<Int32Type>::new(
+                                        pages,
+                                        desc.clone(),
+                                        Some(ArrowType::Int64),
+                                        batch,
+                                        None,
+                                    )
+                                    .unwrap(),
+                                )
+                            } else {
+                                Box::new(
+                                    PrimitiveArrayReader::<Int64Type>::new(
+                                        pages,
+                                        desc.clone(),
+                                        None,
+                                        batch,
+                                        None,
+                                    )
+                                    .unwrap(),
+                                )
+                            };
                             let mut offset = 0;
                             loop {
                                 let actual = reader.next_batch(batch).unwrap();
@@ -624,13 +740,69 @@ mod tests {
                     }
                 }
             }
+        };
+        crate::util::native::dispatch::for_each_tier(|| {
+            check(false);
+            check(true);
         });
+    }
+
+    #[test]
+    fn test_widened_temporal_types_and_skips() {
+        let schema = parse_message_type("message test { REQUIRED INT32 value; }").unwrap();
+        let desc = SchemaDescriptor::new(Arc::new(schema)).column(0);
+        let values = [i32::MIN, -1, 0, i32::MAX];
+        let page = Page::DataPage {
+            buf: values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>()
+                .into(),
+            num_values: values.len() as u32,
+            encoding: Encoding::PLAIN,
+            def_level_encoding: Encoding::RLE,
+            rep_level_encoding: Encoding::RLE,
+            statistics: None,
+        };
+        let dates = values[1..]
+            .iter()
+            .map(|&v| i64::from(v) * MILLIS_PER_DAY)
+            .collect::<Vec<_>>();
+        let timestamps = values[1..]
+            .iter()
+            .map(|&v| i64::from(v))
+            .collect::<Vec<_>>();
+        let expected: [ArrayRef; 5] = [
+            Arc::new(Date64Array::from(dates)),
+            Arc::new(TimestampSecondArray::from(timestamps.clone()).with_timezone("UTC")),
+            Arc::new(TimestampMillisecondArray::from(timestamps.clone()).with_timezone("UTC")),
+            Arc::new(TimestampMicrosecondArray::from(timestamps.clone()).with_timezone("UTC")),
+            Arc::new(TimestampNanosecondArray::from(timestamps).with_timezone("UTC")),
+        ];
+        for expected in expected {
+            let mut reader = PrimitiveArrayReader::<Int32Type>::new(
+                Box::new(InMemoryPageIterator::new(vec![vec![page.clone()]])),
+                desc.clone(),
+                Some(expected.data_type().clone()),
+                3,
+                None,
+            )
+            .unwrap();
+            assert_eq!(reader.skip_records(1).unwrap(), 1);
+            assert_eq!(reader.next_batch(3).unwrap().as_ref(), expected.as_ref());
+        }
     }
 
     /// Exercise every integer value encoding through actual page and row-group
     /// boundaries. The input arrays are the oracle, independent of the reader.
     #[test]
     fn test_random_primitive_encodings_pages_and_nulls() {
+        crate::util::native::dispatch::for_each_tier(
+            check_random_primitive_encodings_pages_and_nulls,
+        );
+    }
+
+    fn check_random_primitive_encodings_pages_and_nulls() {
         use crate::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
         use crate::file::properties::{WriterProperties, WriterVersion};
         use arrow_array::RecordBatch;
@@ -661,6 +833,16 @@ mod tests {
                     let schema = Arc::new(arrow_schema::Schema::new(vec![
                         arrow_schema::Field::new("i64", ArrowType::Int64, nullable),
                         arrow_schema::Field::new("i32", ArrowType::Int32, nullable),
+                        arrow_schema::Field::new(
+                            "narrow_decimal",
+                            ArrowType::Decimal64(9, 2),
+                            nullable,
+                        ),
+                        arrow_schema::Field::new(
+                            "wide_decimal",
+                            ArrowType::Decimal64(18, 2),
+                            nullable,
+                        ),
                     ]));
                     let expected = RecordBatch::try_new(
                         schema.clone(),
@@ -672,6 +854,16 @@ mod tests {
                                     .map(|v| v.map(|x| x as i32))
                                     .collect::<Vec<_>>(),
                             )),
+                            Arc::new(
+                                Decimal64Array::from(values.clone())
+                                    .with_precision_and_scale(9, 2)
+                                    .unwrap(),
+                            ),
+                            Arc::new(
+                                Decimal64Array::from(values.clone())
+                                    .with_precision_and_scale(18, 2)
+                                    .unwrap(),
+                            ),
                         ],
                     )
                     .unwrap();
@@ -692,6 +884,15 @@ mod tests {
                     writer.write(&expected).unwrap();
                     writer.close().unwrap();
                     let bytes = Bytes::from(bytes);
+                    let metadata = ParquetRecordBatchReaderBuilder::try_new(bytes.clone()).unwrap();
+                    assert_eq!(
+                        metadata.parquet_schema().column(2).physical_type(),
+                        PhysicalType::INT32
+                    );
+                    assert_eq!(
+                        metadata.parquet_schema().column(3).physical_type(),
+                        PhysicalType::INT64
+                    );
                     for batch_size in [1, 7, 31, 1023, 1024, 1025, 8192] {
                         let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
                             .unwrap()

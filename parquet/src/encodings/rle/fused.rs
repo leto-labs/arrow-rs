@@ -21,7 +21,7 @@
 pub(super) use crate::util::native::native;
 use std::mem::MaybeUninit;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", feature = "arrow"))]
 use crate::errors::ParquetError;
 use crate::errors::Result;
 
@@ -34,7 +34,20 @@ pub(super) fn decode<T: 'static>(
     dict: &[T],
     out: &mut [MaybeUninit<T>],
 ) -> Option<Result<usize>> {
-    if !(1..=32).contains(&width) || !native::<T>() || dict.len() > i32::MAX as usize {
+    decode_as::<T, T, 1>(data, width, dict, out)
+}
+
+fn decode_as<T: 'static, U: 'static, const MULTIPLIER: i64>(
+    data: &[u8],
+    width: u8,
+    dict: &[T],
+    out: &mut [MaybeUninit<U>],
+) -> Option<Result<usize>> {
+    // The same-type wrapper accepts native primitives. The widening caller
+    // supplies raw little-endian INT32 words and i64 output slots.
+    let widened = size_of::<T>() == 4 && size_of::<U>() == 8;
+    if !(1..=32).contains(&width) || (!widened && !native::<T>()) || dict.len() > i32::MAX as usize
+    {
         return None;
     }
     #[cfg(target_arch = "x86_64")]
@@ -71,9 +84,9 @@ pub(super) fn decode<T: 'static>(
                 // The count fits both the packed input and MaybeUninit output.
                 return Some(unsafe {
                     if small {
-                        avx512_small(data, width, dict, &mut out[..count])
+                        avx512_small::<T, U, MULTIPLIER>(data, width, dict, &mut out[..count])
                     } else {
-                        avx512(data, width, dict, &mut out[..count])
+                        avx512::<T, U, MULTIPLIER>(data, width, dict, &mut out[..count])
                     }
                 });
             }
@@ -89,7 +102,9 @@ pub(super) fn decode<T: 'static>(
             if count >= 8 {
                 // SAFETY: AVX2, exact primitive types, input padding, and output
                 // extent are checked here. The kernel validates each gather.
-                return Some(unsafe { avx2(data, width, dict, &mut out[..count]) });
+                return Some(unsafe {
+                    avx2::<T, U, MULTIPLIER>(data, width, dict, &mut out[..count])
+                });
             }
         }
     }
@@ -98,7 +113,7 @@ pub(super) fn decode<T: 'static>(
     None
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", feature = "arrow"))]
 #[cold]
 fn invalid(dict_len: usize, index: u32) -> ParquetError {
     general_err!(
@@ -117,7 +132,12 @@ use std::arch::x86_64::*;
 /// outputs plus at least sixteen trailing readable bytes.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn avx2<T>(data: &[u8], width: u8, dict: &[T], out: &mut [MaybeUninit<T>]) -> Result<usize> {
+unsafe fn avx2<T, U, const MULTIPLIER: i64>(
+    data: &[u8],
+    width: u8,
+    dict: &[T],
+    out: &mut [MaybeUninit<U>],
+) -> Result<usize> {
     debug_assert!(matches!(size_of::<T>(), 4 | 8));
     let w = width as usize;
     let mut shuffle = [0u8; 32];
@@ -175,7 +195,21 @@ unsafe fn avx2<T>(data: &[u8], width: u8, dict: &[T], out: &mut [MaybeUninit<T>]
                 _mm256_storeu_si256(dst.as_mut_ptr().add(4).cast(), hi);
             } else {
                 let values = _mm256_i32gather_epi32::<4>(dict.as_ptr().cast(), ids);
-                _mm256_storeu_si256(dst.as_mut_ptr().cast(), values);
+                if size_of::<U>() == 8 {
+                    let lo = _mm256_cvtepi32_epi64(_mm256_castsi256_si128(values));
+                    let hi = _mm256_cvtepi32_epi64(_mm256_extracti128_si256::<1>(values));
+                    let scale = |values| {
+                        if MULTIPLIER == 1 {
+                            values
+                        } else {
+                            _mm256_mul_epi32(values, _mm256_set1_epi64x(MULTIPLIER))
+                        }
+                    };
+                    _mm256_storeu_si256(dst.as_mut_ptr().cast(), scale(lo));
+                    _mm256_storeu_si256(dst.as_mut_ptr().add(4).cast(), scale(hi));
+                } else {
+                    _mm256_storeu_si256(dst.as_mut_ptr().cast(), values);
+                }
             }
         }
     }
@@ -291,19 +325,19 @@ impl Unpack {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
-unsafe fn blocks<T>(
+unsafe fn blocks<T, U>(
     data: &[u8],
     width: u8,
     dict: &[T],
-    out: &mut [MaybeUninit<T>],
-    lookup: impl FnMut(__m512i, *mut MaybeUninit<T>, u16),
+    out: &mut [MaybeUninit<U>],
+    lookup: impl FnMut(__m512i, *mut MaybeUninit<U>, u16),
 ) -> Result<usize> {
     // SAFETY: the contract is this function's.
     unsafe {
         if width > 24 {
-            blocks_of::<T, true>(data, width, dict, out, lookup)
+            blocks_of::<T, U, true>(data, width, dict, out, lookup)
         } else {
-            blocks_of::<T, false>(data, width, dict, out, lookup)
+            blocks_of::<T, U, false>(data, width, dict, out, lookup)
         }
     }
 }
@@ -316,12 +350,12 @@ unsafe fn blocks<T>(
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
-unsafe fn blocks_of<T, const WIDE: bool>(
+unsafe fn blocks_of<T, U, const WIDE: bool>(
     data: &[u8],
     width: u8,
     dict: &[T],
-    out: &mut [MaybeUninit<T>],
-    mut lookup: impl FnMut(__m512i, *mut MaybeUninit<T>, u16),
+    out: &mut [MaybeUninit<U>],
+    mut lookup: impl FnMut(__m512i, *mut MaybeUninit<U>, u16),
 ) -> Result<usize> {
     debug_assert!(matches!(size_of::<T>(), 4 | 8) && out.len().is_multiple_of(8));
     let unpack = Unpack::new(width);
@@ -361,11 +395,11 @@ unsafe fn blocks_of<T, const WIDE: bool>(
 /// As [`blocks`].
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
-unsafe fn avx512<T>(
+unsafe fn avx512<T, U, const MULTIPLIER: i64>(
     data: &[u8],
     width: u8,
     dict: &[T],
-    out: &mut [MaybeUninit<T>],
+    out: &mut [MaybeUninit<U>],
 ) -> Result<usize> {
     let base = dict.as_ptr();
     // SAFETY: `blocks` passes only validated IDs in active lanes; inactive
@@ -382,6 +416,14 @@ unsafe fn avx512<T>(
                     );
                     _mm512_storeu_si512(dst.add(8).cast(), hi);
                 }
+            } else if size_of::<U>() == 8 {
+                let values = _mm512_mask_i32gather_epi32::<4>(
+                    _mm512_setzero_si512(),
+                    active,
+                    ids,
+                    base.cast(),
+                );
+                store_widened::<MULTIPLIER>(values, dst.cast(), active);
             } else if active == u16::MAX {
                 let values = _mm512_i32gather_epi32::<4>(ids, base.cast());
                 _mm512_storeu_si512(dst.cast(), values);
@@ -404,11 +446,11 @@ unsafe fn avx512<T>(
 /// As [`blocks`]; also `dict.len() * size_of::<T>() <= 4 * SMALL_ENTRIES`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
-unsafe fn avx512_small<T>(
+unsafe fn avx512_small<T, U, const MULTIPLIER: i64>(
     data: &[u8],
     width: u8,
     dict: &[T],
-    out: &mut [MaybeUninit<T>],
+    out: &mut [MaybeUninit<U>],
 ) -> Result<usize> {
     let bytes = std::mem::size_of_val(dict);
     debug_assert!(bytes <= 4 * SMALL_ENTRIES);
@@ -470,11 +512,127 @@ unsafe fn avx512_small<T>(
                     );
                     _mm512_storeu_si512(dst.add(8).cast(), hi);
                 }
+            } else if size_of::<U>() == 8 {
+                store_widened::<MULTIPLIER>(lookup(ids, 32), dst.cast(), active);
             } else {
                 _mm512_mask_storeu_epi32(dst.cast(), active, lookup(ids, 32));
             }
         })
     }
+}
+
+/// # Safety
+/// The destination holds eight or sixteen i64 slots according to the mask.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx512f")]
+unsafe fn store_widened<const MULTIPLIER: i64>(values: __m512i, dst: *mut i64, active: u16) {
+    let scale = |values| {
+        if MULTIPLIER == 1 {
+            values
+        } else {
+            _mm512_mul_epi32(values, _mm512_set1_epi64(MULTIPLIER))
+        }
+    };
+    let lo = _mm512_cvtepi32_epi64(_mm512_castsi512_si256(values));
+    // SAFETY: the caller bounds the number of writable slots.
+    unsafe {
+        _mm512_storeu_si512(dst.cast(), scale(lo));
+        if active == u16::MAX {
+            let hi = _mm512_cvtepi32_epi64(_mm512_extracti64x4_epi64::<1>(values));
+            _mm512_storeu_si512(dst.add(8).cast(), scale(hi));
+        }
+    }
+}
+
+/// Append dictionary values from a compact PLAIN INT32 dictionary. The RLE
+/// reader owns the run cursor and validates headers through its existing reload.
+#[cfg(feature = "arrow")]
+pub(crate) fn append_widened_dictionary<const MULTIPLIER: i64>(
+    decoder: &mut super::RleDecoder,
+    dict: &[[u8; 4]],
+    out: &mut Vec<i64>,
+    count: usize,
+) -> Result<usize> {
+    debug_assert!(decoder.bit_width <= super::MAX_RLE_DICTIONARY_BIT_WIDTH);
+    out.reserve(count);
+    let start = out.len();
+    let read = read_widened_dictionary::<MULTIPLIER>(
+        decoder,
+        dict,
+        &mut out.spare_capacity_mut()[..count],
+    );
+    match read {
+        Ok(read) => {
+            // SAFETY: successful decoding initialized the reported prefix.
+            unsafe { out.set_len(start + read) };
+            Ok(read)
+        }
+        Err(error) => Err(decoder.fail(error)),
+    }
+}
+
+#[cfg(feature = "arrow")]
+fn read_widened_dictionary<const MULTIPLIER: i64>(
+    decoder: &mut super::RleDecoder,
+    dict: &[[u8; 4]],
+    out: &mut [MaybeUninit<i64>],
+) -> Result<usize> {
+    let value = |id: u32| {
+        dict.get(id as usize)
+            .map(|&bytes| i64::from(i32::from_le_bytes(bytes)) * MULTIPLIER)
+            .ok_or_else(|| invalid(dict.len(), id))
+    };
+    let mut written = 0;
+    while written < out.len() {
+        if decoder.rle_left > 0 {
+            let n = (out.len() - written).min(decoder.rle_left as usize);
+            let id = decoder
+                .current_value
+                .ok_or_else(|| general_err!("RLE run missing dictionary index"))?;
+            super::runs::fill(&mut out[written..], n, &value(id as u32)?);
+            decoder.rle_left -= n as u32;
+            written += n;
+        } else if decoder.bit_packed_left > 0 {
+            let reader = decoder
+                .bit_reader
+                .as_mut()
+                .ok_or_else(|| general_err!("bit_reader should be set"))?;
+            let width = decoder.bit_width;
+            let mut n = (out.len() - written).min(decoder.bit_packed_left as usize);
+            let to_group = decoder.bit_packed_left as usize % 8;
+            if to_group != 0 {
+                n = n.min(to_group);
+            }
+            if let Some(data) = reader.aligned_remaining()
+                && let Some(result) =
+                    decode_as::<_, _, MULTIPLIER>(data, width, dict, &mut out[written..written + n])
+            {
+                let read = result?;
+                reader.skip(read, width as usize);
+                written += read;
+                decoder.bit_packed_left -= read as u32;
+                continue;
+            }
+            let indices = decoder.index_buf.get_or_insert_with(|| Box::new([0; 1024]));
+            let read = reader.get_batch(&mut indices[..n.min(1024)], width as usize);
+            if read == 0 {
+                decoder.bit_packed_left = 0;
+                continue;
+            }
+            for (slot, &id) in out[written..written + read]
+                .iter_mut()
+                .zip(&indices[..read])
+            {
+                slot.write(value(id as u32)?);
+            }
+            written += read;
+            decoder.bit_packed_left -= read as u32;
+        } else if !decoder.reload()? {
+            break;
+        }
+    }
+    Ok(written)
 }
 
 #[cfg(test)]
@@ -490,6 +648,41 @@ mod tests {
             }
         }
         data
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn test_widened_dictionary_signed_scaling_and_error_prefix() {
+        crate::util::native::dispatch::for_each_tier(|| {
+            let dict = [i32::MIN, -1, 0, i32::MAX].map(i32::to_le_bytes);
+            let ids: Vec<u32> = (0..64).map(|i| i % 4).collect();
+            let page = |ids: &[u32]| {
+                let mut page = vec![17]; // Eight groups of eight packed IDs.
+                page.extend(packed(ids, 7));
+                page.into()
+            };
+            let mut decoder = super::super::RleDecoder::new(7);
+            decoder.set_data(page(&ids)).unwrap();
+            let mut out = vec![5];
+            assert_eq!(
+                append_widened_dictionary::<86_400_000>(&mut decoder, &dict, &mut out, 63).unwrap(),
+                63
+            );
+            for (value, id) in out[1..].iter().zip(&ids) {
+                assert_eq!(
+                    *value,
+                    i64::from(i32::from_le_bytes(dict[*id as usize])) * 86_400_000
+                );
+            }
+            let mut invalid_ids = ids;
+            invalid_ids[47] = 4;
+            decoder.set_data(page(&invalid_ids)).unwrap();
+            let len = out.len();
+            assert!(append_widened_dictionary::<1>(&mut decoder, &dict, &mut out, 64).is_err());
+            assert_eq!(out.len(), len);
+            assert!(append_widened_dictionary::<1>(&mut decoder, &dict, &mut out, 64).is_err());
+            assert_eq!(out.len(), len);
+        });
     }
 
     #[test]
@@ -556,7 +749,8 @@ mod tests {
                         // SAFETY: exact primitive type, supported feature/width,
                         // eight-value blocks, and sixteen readable trailing bytes.
                         assert_eq!(
-                            unsafe { avx2(&padded, width as u8, &dict, &mut out) }.unwrap(),
+                            unsafe { avx2::<_, _, 1>(&padded, width as u8, &dict, &mut out) }
+                                .unwrap(),
                             n
                         );
                         for i in 0..n {
