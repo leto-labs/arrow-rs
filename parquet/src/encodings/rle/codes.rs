@@ -22,6 +22,9 @@
 use super::{run_len, runs};
 use crate::errors::{ParquetError, Result};
 
+const MAX_TABLE_WIDTH: u8 = 20;
+const INVALID_VERDICT: u8 = 2;
+
 /// A run of levels or non-null dictionary indices.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CodeRun<'a> {
@@ -166,7 +169,7 @@ impl<'a> CodeCursor<'a> {
         if self.remaining == 0 {
             return Ok(None);
         }
-        let result = self.read_run();
+        let result = self.read_run::<true>();
         self.failed = result.is_err();
         result.map(Some)
     }
@@ -177,11 +180,16 @@ impl<'a> CodeCursor<'a> {
     /// the valid prefix, so publish its output only after this returns success.
     #[inline]
     pub fn drain<S: RunSink>(&mut self, sink: &mut S) -> Result<()> {
+        self.drain_impl::<S, true>(sink)
+    }
+
+    #[inline(always)]
+    fn drain_impl<S: RunSink, const CHECK_PACKED: bool>(&mut self, sink: &mut S) -> Result<()> {
         if self.failed {
             return Err(general_err!("Invalid code stream"));
         }
         while self.remaining != 0 {
-            match self.read_run() {
+            match self.read_run::<CHECK_PACKED>() {
                 Ok(CodeRun::Repeated { code, len }) => sink.repeated(code, len),
                 Ok(CodeRun::Packed { width, bytes, len }) => sink.packed(width, bytes, len),
                 Err(error) => {
@@ -194,7 +202,29 @@ impl<'a> CodeCursor<'a> {
     }
 
     #[inline(always)]
-    fn read_run(&mut self) -> Result<CodeRun<'a>> {
+    fn read_run<const CHECK_PACKED: bool>(&mut self) -> Result<CodeRun<'a>> {
+        let width = usize::from(self.width);
+        let repeated_bytes = width.div_ceil(8);
+        if let Some(word) = self
+            .data
+            .first_chunk::<8>()
+            .copied()
+            .map(u64::from_le_bytes)
+        {
+            let header = word as u8;
+            if header & 0x81 == 0 && header != 0 {
+                let len = usize::from(header >> 1);
+                let code = (word >> 8) & low_mask(repeated_bytes * 8);
+                if len <= self.remaining && code < self.code_limit.min(1u64 << width) {
+                    self.data = &self.data[1 + repeated_bytes..];
+                    self.remaining -= len;
+                    return Ok(CodeRun::Repeated {
+                        code: code as u32,
+                        len,
+                    });
+                }
+            }
+        }
         let (indicator, offset) =
             runs::header(self.data, 0).ok_or_else(|| general_err!("Incomplete code run header"))?;
         if offset == 10 && self.data[9] > 1 {
@@ -204,11 +234,10 @@ impl<'a> CodeCursor<'a> {
         if run == 0 {
             return Err(general_err!("Empty code run"));
         }
-        let width = usize::from(self.width);
         let data = &self.data[offset..];
         let len = run.min(self.remaining);
         let (result, consumed) = if indicator & 1 == 0 {
-            let consumed = width.div_ceil(8);
+            let consumed = repeated_bytes;
             if run != len || data.len() < consumed {
                 return Err(general_err!("Invalid repeated code run length"));
             }
@@ -234,7 +263,7 @@ impl<'a> CodeCursor<'a> {
                 .get(..consumed)
                 .filter(|_| run - len < 8)
                 .ok_or_else(|| general_err!("Invalid packed code run length"))?;
-            if self.code_limit < 1u64 << width {
+            if CHECK_PACKED && self.code_limit < 1u64 << width {
                 for index in 0..len {
                     self.validate_code(packed_code(bytes, width, index))?;
                 }
@@ -242,7 +271,7 @@ impl<'a> CodeCursor<'a> {
             (
                 CodeRun::Packed {
                     width: self.width,
-                    bytes,
+                    bytes: if CHECK_PACKED { bytes } else { data },
                     len,
                 },
                 consumed,
@@ -251,6 +280,42 @@ impl<'a> CodeCursor<'a> {
         self.data = &data[consumed..];
         self.remaining -= len;
         Ok(result)
+    }
+
+    /// Writes dense verdict words. The caller scatters them to row positions.
+    /// Invalid packed entries accumulate one error for the page.
+    pub fn verdicts(&mut self, table: &mut VerdictTable, out: &mut Vec<u64>) -> Result<()> {
+        let width = self.width;
+        let limit = table.entries;
+        if limit as u64 != self.code_limit {
+            return Err(general_err!("Verdict table does not match dictionary size"));
+        }
+        if width <= MAX_TABLE_WIDTH {
+            let size = 1usize << width;
+            if table.flags.len() < size {
+                table.flags.resize(size, INVALID_VERDICT);
+            }
+        }
+
+        out.clear();
+        out.resize(self.remaining.div_ceil(64), 0);
+        let mut tail = [0; 16];
+        let tail_bytes = self.data.len().min(8);
+        tail[8 - tail_bytes..8].copy_from_slice(&self.data[self.data.len() - tail_bytes..]);
+        let mut sink = VerdictSink {
+            writer: WordWriter::new(out),
+            table,
+            tail,
+            invalid: 0,
+            max_code: 0,
+            has_packed: false,
+        };
+        self.drain_impl::<_, false>(&mut sink)?;
+        if sink.invalid != 0 || (sink.has_packed && sink.max_code as usize >= limit) {
+            self.failed = true;
+            return Err(invalid_packed_code());
+        }
+        Ok(())
     }
 
     #[inline]
@@ -291,6 +356,141 @@ impl<'a> CodeCursor<'a> {
             return Err(general_err!("Code selection past the end of the page"));
         }
         Ok(keys)
+    }
+}
+
+/// Reusable verdicts for a single chunk dictionary.
+#[derive(Debug)]
+pub struct VerdictTable {
+    flags: Vec<u8>,
+    entries: usize,
+}
+
+impl VerdictTable {
+    /// Creates a table in dictionary index order.
+    pub fn new(verdicts: impl IntoIterator<Item = bool>) -> Self {
+        let flags: Vec<_> = verdicts.into_iter().map(u8::from).collect();
+        let entries = flags.len();
+        Self { flags, entries }
+    }
+}
+
+#[cold]
+fn invalid_packed_code() -> ParquetError {
+    general_err!("Packed dictionary index out of bounds")
+}
+
+struct VerdictSink<'a> {
+    writer: WordWriter<'a>,
+    table: &'a VerdictTable,
+    tail: [u8; 16],
+    invalid: u8,
+    max_code: u32,
+    has_packed: bool,
+}
+
+impl RunSink for VerdictSink<'_> {
+    #[inline]
+    fn repeated(&mut self, code: u32, len: usize) {
+        self.writer
+            .repeat(self.table.flags[code as usize] == 1, len);
+    }
+
+    #[inline]
+    fn packed(&mut self, width: u8, bytes: &[u8], len: usize) {
+        self.has_packed = true;
+        let mask = low_mask(width as usize);
+        if width <= MAX_TABLE_WIDTH {
+            let flags = &self.table.flags[..=mask as usize];
+            self.write_packed(bytes, width, len, |sink, code| {
+                let flag = flags[code as usize];
+                sink.invalid |= flag & INVALID_VERDICT;
+                flag & 1
+            });
+        } else {
+            self.write_packed(bytes, width, len, |sink, code| {
+                sink.max_code = sink.max_code.max(code);
+                sink.table.flags.get(code as usize).copied().unwrap_or(0) & 1
+            });
+        }
+    }
+}
+
+impl VerdictSink<'_> {
+    #[inline(always)]
+    fn write_packed(
+        &mut self,
+        bytes: &[u8],
+        width: u8,
+        len: usize,
+        mut lookup: impl FnMut(&mut Self, u32) -> u8,
+    ) {
+        let width = width as usize;
+        let mask = low_mask(width);
+        let tail_start = bytes.len().saturating_sub(8);
+        // For a suffix shorter than eight bytes, its start is within the saved
+        // page tail. Otherwise the last eight bytes of the suffix ARE that tail.
+        let tail_offset = 8 - bytes.len().min(8);
+        let mut start = 0;
+        while start < len {
+            let count = (len - start).min(64);
+            let mut word = 0;
+            for i in 0..count {
+                let index = start + i;
+                let bit = (index % 8) * width;
+                let first = (index / 8) * width + bit / 8;
+                let packed = bytes[first..].first_chunk::<8>().unwrap_or_else(|| {
+                    self.tail[first - tail_start + tail_offset..]
+                        .first_chunk::<8>()
+                        .unwrap()
+                });
+                let code = ((u64::from_le_bytes(*packed) >> (bit % 8)) & mask) as u32;
+                word |= u64::from(lookup(self, code)) << i;
+            }
+            self.writer.write(word, count);
+            start += count;
+        }
+    }
+}
+
+#[inline]
+pub(crate) fn low_mask(bits: usize) -> u64 {
+    u64::MAX.checked_shr((64 - bits) as u32).unwrap_or(0)
+}
+
+/// Writes least-significant-bit-first to pre-zeroed words.
+pub(crate) struct WordWriter<'a> {
+    words: &'a mut [u64],
+    position: usize,
+}
+
+impl<'a> WordWriter<'a> {
+    pub(crate) fn new(words: &'a mut [u64]) -> Self {
+        Self { words, position: 0 }
+    }
+
+    #[inline]
+    pub(crate) fn write(&mut self, bits: u64, len: usize) {
+        let word = self.position / 64;
+        let shift = self.position % 64;
+        self.words[word] |= bits << shift;
+        if len > 64 - shift {
+            self.words[word + 1] |= bits >> (64 - shift);
+        }
+        self.position += len;
+    }
+
+    #[inline]
+    pub(crate) fn repeat(&mut self, bit: bool, mut len: usize) {
+        if !bit {
+            self.position += len;
+            return;
+        }
+        while len > 64 {
+            self.write(u64::MAX, 64);
+            len -= 64;
+        }
+        self.write(low_mask(len), len);
     }
 }
 
@@ -348,6 +548,19 @@ mod tests {
                     .drain(&mut pushed)
                     .unwrap();
                 assert_eq!(pushed.0, input);
+                let mut table = VerdictTable::new((0..entries).map(|code| code % 5 == 0));
+                let mut bitmap = Vec::new();
+                CodeCursor::new(width, &data, input.len(), entries)
+                    .unwrap()
+                    .verdicts(&mut table, &mut bitmap)
+                    .unwrap();
+                for (i, &code) in input.iter().enumerate() {
+                    assert_eq!((bitmap[i / 64] >> (i % 64)) & 1, u64::from(code % 5 == 0));
+                }
+                assert_eq!(
+                    *bitmap.last().unwrap() & !low_mask((input.len() - 1) % 64 + 1),
+                    0
+                );
 
                 let mut cursor = CodeCursor::new(width, &data, input.len(), entries).unwrap();
                 let selected: Vec<_> = (0..input.len()).filter(|i| i % 3 != 0).collect();
@@ -387,6 +600,32 @@ mod tests {
     }
 
     #[test]
+    fn verdicts_validate_wide_codes_and_a_short_page_tail() {
+        for code in [32u32, u32::MAX] {
+            let mut data = vec![3];
+            data.extend_from_slice(&code.to_le_bytes());
+            data.extend_from_slice(&[0; 28]);
+            let mut cursor = CodeCursor::new(32, &data, 1, 33).unwrap();
+            let mut table = VerdictTable::new((0..33).map(|key| key == 32));
+            let mut bitmap = Vec::new();
+            if code == 32 {
+                cursor.verdicts(&mut table, &mut bitmap).unwrap();
+                assert_eq!(bitmap, [1]);
+            } else {
+                assert!(cursor.verdicts(&mut table, &mut bitmap).is_err());
+            }
+        }
+        // The final code starts fewer than eight bytes from the end of the
+        // stream and crosses a byte boundary.
+        let data = [3, 0x49, 0x92, 0x24];
+        let mut cursor = CodeCursor::new(3, &data, 8, 8).unwrap();
+        let mut table = VerdictTable::new((0..8).map(|key| key == 1));
+        let mut bitmap = Vec::new();
+        cursor.verdicts(&mut table, &mut bitmap).unwrap();
+        assert_eq!(bitmap, [0xff]);
+    }
+
+    #[test]
     fn rejects_invalid_codes_and_malformed_runs() {
         for data in [&[2, 1][..], &[3, 1], &[2], &[3], &[0], &[1], &[0x80]] {
             let mut cursor = CodeCursor::new(1, data, 1, 1).unwrap();
@@ -400,6 +639,15 @@ mod tests {
             assert!(cursor.drain(&mut pushed).is_err(), "{data:?}");
             assert!(pushed.0.is_empty());
             assert!(cursor.drain(&mut pushed).is_err());
+
+            let mut table = VerdictTable::new([true]);
+            let mut bitmap = Vec::new();
+            let mut cursor = CodeCursor::new(1, data, 1, 1).unwrap();
+            assert!(
+                cursor.verdicts(&mut table, &mut bitmap).is_err(),
+                "{data:?}"
+            );
+            assert!(cursor.next_run().is_err());
         }
         let mut cursor = CodeCursor::new(1, &[2, 0], 1, 0).unwrap();
         assert!(cursor.next_run().is_err());
