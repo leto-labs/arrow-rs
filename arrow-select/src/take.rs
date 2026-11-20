@@ -1,3 +1,4 @@
+// Modified by the Longbow authors; see third_party/README.md.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -573,7 +574,7 @@ fn take_nulls<I: ArrowPrimitiveType, const VALIDATE_INDICES: bool>(
 ) -> Option<NullBuffer> {
     match values.filter(|n| n.null_count() > 0) {
         Some(n) => NullBuffer::from_unsliced_buffer(
-            take_bits::<_, VALIDATE_INDICES>(n.inner(), indices).into_inner(),
+            take_bits::<_, VALIDATE_INDICES, true>(n.inner(), indices).into_inner(),
             indices.len(),
         ),
         None => indices.nulls().cloned(),
@@ -657,7 +658,11 @@ unsafe fn pack_bit(src: *const u8, bit_idx: usize, out_pos: usize) -> u8 {
 }
 
 #[inline(never)]
-fn take_bits<I: ArrowPrimitiveType, const VALIDATE_INDICES: bool>(
+fn take_bits<
+    I: ArrowPrimitiveType,
+    const VALIDATE_INDICES: bool,
+    const COPY_CONSECUTIVE_VALIDITY: bool,
+>(
     values: &BooleanBuffer,
     indices: &PrimitiveArray<I>,
 ) -> BooleanBuffer {
@@ -694,6 +699,31 @@ fn take_bits<I: ArrowPrimitiveType, const VALIDATE_INDICES: bool>(
 
             for (byte_idx, out_byte) in out_slice.iter_mut().enumerate().take(full_bytes) {
                 let base = byte_idx * 8;
+                if COPY_CONSECUTIVE_VALIDITY {
+                    let group = &indices.values()[base..base + 8];
+                    let first = group[0].as_usize();
+                    let last = group[7].as_usize();
+                    if last.checked_sub(first) == Some(7)
+                        && last < values.len()
+                        && group[1..7]
+                            .iter()
+                            .enumerate()
+                            .all(|(position, index)| index.as_usize() == first + position + 1)
+                    {
+                        // A consecutive group contributes eight consecutive source bits,
+                        // possibly straddling two bytes in a sliced input bitmap.
+                        let start = src_offset + first;
+                        let input = values.values();
+                        let shift = start % 8;
+                        let low = input[start / 8] >> shift;
+                        *out_byte = if shift == 0 {
+                            low
+                        } else {
+                            low | (input[start / 8 + 1] << (8 - shift))
+                        };
+                        continue;
+                    }
+                }
                 let mut byte = 0u8;
                 for bit in 0..8usize {
                     // SAFETY: base + bit < full_bytes * 8 <= len, so base + bit is a valid
@@ -861,7 +891,7 @@ fn take_boolean<IndexType: ArrowPrimitiveType, const VALIDATE_INDICES: bool>(
             BooleanArray::new(val_buf, null_buf)
         }
         None => {
-            let val_buf = take_bits::<_, VALIDATE_INDICES>(bits, indices);
+            let val_buf = take_bits::<_, VALIDATE_INDICES, false>(bits, indices);
             let null_buf = take_nulls::<_, VALIDATE_INDICES>(None, indices);
             BooleanArray::new(val_buf, null_buf)
         }
@@ -1742,6 +1772,52 @@ mod tests {
     use arrow_buffer::{IntervalDayTime, IntervalMonthDayNano};
     use arrow_schema::{Field, Fields, Schema, TimeUnit, UnionFields};
     use num_traits::ToPrimitive;
+
+    #[test]
+    fn test_take_primitive_validity_gather_across_bit_boundaries() {
+        let source: Int32Array = (0..96)
+            .map(|i| (i % 5 != 2 && i % 7 != 1).then_some(i))
+            .collect();
+        for source_offset in 0..8 {
+            let source = source.slice(source_offset, 83);
+            for index_offset in 0..8 {
+                for len in [0, 1, 7, 8, 9, 63, 64, 65] {
+                    let patterns: [fn(usize) -> usize; 3] = [
+                        |i| i,
+                        |_| 15,
+                        |i| if i % 4 == 3 { 15 } else { (i * 19) % 83 },
+                    ];
+                    for index_for in patterns {
+                        for nullable in [false, true] {
+                            let indices: UInt64Array = (0..index_offset + len)
+                                .map(|i| (!nullable || i % 11 < 8).then_some(index_for(i) as u64))
+                                .collect();
+                            let indices = indices.slice(index_offset, len);
+                            let expected: Int32Array = indices
+                                .iter()
+                                .map(|index| {
+                                    let i = index? as usize;
+                                    source.is_valid(i).then(|| source.value(i))
+                                })
+                                .collect();
+                            let output =
+                                take(&source, &indices, Some(TakeOptions { check_bounds: true }))
+                                    .unwrap();
+                            assert_eq!(output.as_primitive::<Int32Type>(), &expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "idx < self.bit_len")]
+    fn test_take_bits_rejects_index_outside_sliced_logical_length() {
+        let values = BooleanBuffer::new_set(128).slice(3, 8);
+        let indices = UInt64Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        take_bits::<UInt64Type, true, true>(&values, &indices);
+    }
 
     fn test_take_decimal_arrays(
         data: Vec<Option<i128>>,
