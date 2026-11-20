@@ -18,9 +18,11 @@
 // under the License.
 
 //! Drives flat dictionary pages through validity and the row verdict bitmap
-//! and compares them with the pull cursors over the same level and index bytes.
+//! and compares them with an independent reader for the on-wire encoding.
 
 #![no_main]
+
+mod oracle;
 
 use arrow_array::types::Int32Type as ArrowInt32;
 use bytes::Bytes;
@@ -30,8 +32,11 @@ use parquet::column::page::{Page, PageMetadata, PageReader};
 use parquet::column::reader::{CodeColumnPage, CodeColumnReader};
 use parquet::data_type::Int32Type;
 use parquet::errors::Result;
-use parquet::schema::{parser::parse_message_type, types::SchemaDescriptor};
-use std::sync::Arc;
+use parquet::schema::{
+    parser::parse_message_type,
+    types::{ColumnDescPtr, SchemaDescriptor},
+};
+use std::sync::{Arc, OnceLock};
 
 struct Pages(std::vec::IntoIter<Page>);
 
@@ -57,56 +62,157 @@ impl PageReader for Pages {
     }
 }
 
+fn descriptor(nullable: bool) -> ColumnDescPtr {
+    static OPTIONAL: OnceLock<ColumnDescPtr> = OnceLock::new();
+    static REQUIRED: OnceLock<ColumnDescPtr> = OnceLock::new();
+    let (cache, schema) = if nullable {
+        (&OPTIONAL, "message x { OPTIONAL INT32 value; }")
+    } else {
+        (&REQUIRED, "message x { REQUIRED INT32 value; }")
+    };
+    cache
+        .get_or_init(|| {
+            SchemaDescriptor::new(Arc::new(parse_message_type(schema).unwrap())).column(0)
+        })
+        .clone()
+}
+
+fn index_payload(
+    bytes: &[u8],
+    count: usize,
+    entries: usize,
+    check_packed_codes: bool,
+) -> Option<Vec<u32>> {
+    match bytes.split_first() {
+        Some((&width, data)) => {
+            oracle::hybrid(width, data, count, entries as u64, check_packed_codes)
+        }
+        None => (count == 0).then(Vec::new),
+    }
+}
+
+fn repeated_header(count: usize) -> Vec<u8> {
+    let mut value = 2 * count;
+    let mut bytes = Vec::new();
+    while value >= 128 {
+        bytes.push((value & 127) as u8 | 128);
+        value >>= 7;
+    }
+    bytes.push(value as u8);
+    bytes
+}
+
 fuzz_target!(|input: &[u8]| {
     let [
-        rows_low,
         flags,
+        values,
+        rows,
         entries,
         width,
-        levels_len,
+        level_len,
         nulls,
         bytes @ ..,
     ] = input
     else {
         return;
     };
-    let rows = (usize::from(*flags & 0x03) << 8) | usize::from(*rows_low);
-    let v2 = flags & 0x04 != 0;
+    let v2 = flags & 1 != 0;
+    let nullable = flags & 2 != 0;
+    let legacy = !v2 && nullable && flags & 4 != 0;
+    let structured = flags & 8 != 0;
+    let count = usize::from(*values) * if flags & 16 != 0 { 4 } else { 1 };
+    let header_rows = if flags & 32 != 0 {
+        usize::from(*rows)
+    } else {
+        count
+    };
     let entries = usize::from(*entries);
-    let levels_len = usize::from(*levels_len).min(bytes.len());
-    let (levels, indices) = bytes.split_at(levels_len);
-    let indices: Vec<u8> = [width % 34]
-        .into_iter()
-        .chain(indices.iter().copied())
-        .collect();
-    let num_nulls = u32::from(*nulls).min(rows as u32);
-    let page = if v2 {
-        let mut buf = levels.to_vec();
+
+    let (raw_levels, raw_indices) = bytes.split_at(usize::from(*level_len).min(bytes.len()));
+    let mut levels = if nullable || (v2 && flags & 64 != 0) {
+        raw_levels.to_vec()
+    } else {
+        Vec::new()
+    };
+    let mut indices = Vec::new();
+    if flags & 128 == 0 {
+        indices.push(width % 34);
+        indices.extend_from_slice(raw_indices);
+    }
+    let mut num_nulls = if nullable || flags & 64 != 0 {
+        usize::from(*nulls)
+    } else {
+        0
+    };
+
+    if structured {
+        let present = !nullable || nulls % 2 == 0;
+        num_nulls = if present { 0 } else { count };
+        levels.clear();
+        if nullable && count != 0 {
+            if legacy {
+                levels.resize(count.div_ceil(8), if present { u8::MAX } else { 0 });
+                if !count.is_multiple_of(8) && present {
+                    *levels.last_mut().unwrap() <<= 8 - count % 8;
+                }
+            } else {
+                levels.extend(repeated_header(count));
+                levels.push(u8::from(present));
+            }
+        }
+        indices.clear();
+        if present && count != 0 {
+            indices.push(0);
+            indices.extend(repeated_header(count));
+        }
+    }
+
+    let mut buf = Vec::new();
+    if nullable && !v2 && !legacy {
+        buf.extend_from_slice(&(levels.len() as u32).to_le_bytes());
+    }
+    buf.extend_from_slice(&levels);
+    let (legacy_levels, legacy_indices) = if legacy {
+        // V1 BIT_PACKED has no length prefix. A short levels fragment can
+        // consume bytes intended as indices, so split the actual page body.
         buf.extend_from_slice(&indices);
+        match buf.split_at_checked(count.div_ceil(8)) {
+            Some((def, codes)) => (Some(def.to_vec()), codes.to_vec()),
+            None => (None, Vec::new()),
+        }
+    } else {
+        buf.extend_from_slice(&indices);
+        (None, Vec::new())
+    };
+    let buf = Bytes::from(buf);
+    let page = if v2 {
         Page::DataPageV2 {
-            buf: buf.into(),
-            num_values: rows as u32,
+            buf,
+            num_values: count as u32,
             encoding: Encoding::RLE_DICTIONARY,
-            num_nulls,
-            num_rows: rows as u32,
-            def_levels_byte_len: levels_len as u32,
+            num_nulls: num_nulls as u32,
+            num_rows: header_rows as u32,
+            def_levels_byte_len: levels.len() as u32,
             rep_levels_byte_len: 0,
             is_compressed: false,
             statistics: None,
         }
     } else {
-        let mut buf = (levels_len as u32).to_le_bytes().to_vec();
-        buf.extend_from_slice(levels);
-        buf.extend_from_slice(&indices);
         Page::DataPage {
-            buf: buf.into(),
-            num_values: rows as u32,
+            buf,
+            num_values: count as u32,
             encoding: Encoding::RLE_DICTIONARY,
-            def_level_encoding: Encoding::RLE,
+            #[expect(deprecated, reason = "Fuzz legacy V1 levels")]
+            def_level_encoding: if legacy {
+                Encoding::BIT_PACKED
+            } else {
+                Encoding::RLE
+            },
             rep_level_encoding: Encoding::RLE,
             statistics: None,
         }
     };
+
     let dictionary = Page::DictionaryPage {
         buf: Bytes::from(
             (0..entries as i32)
@@ -117,79 +223,103 @@ fuzz_target!(|input: &[u8]| {
         encoding: Encoding::PLAIN,
         is_sorted: false,
     };
-    let schema = parse_message_type("message x { OPTIONAL INT32 value; }").unwrap();
-    let descriptor = SchemaDescriptor::new(Arc::new(schema)).column(0);
-    let Ok(mut reader) = CodeColumnReader::<Int32Type, ArrowInt32>::new(
-        descriptor,
+    let mut reader = CodeColumnReader::<Int32Type, ArrowInt32>::new(
+        descriptor(nullable),
         Box::new(Pages(vec![dictionary, page].into_iter())),
-    ) else {
+    )
+    .unwrap();
+    let page = reader.next_page();
+    if v2
+        && (header_rows != count
+            || num_nulls > count
+            || (!nullable && (!levels.is_empty() || num_nulls != 0)))
+    {
+        assert!(page.is_err());
         return;
-    };
-    let Ok(Some(CodeColumnPage::Dictionary(page))) = reader.next_page() else {
+    }
+
+    if legacy {
+        let expected = legacy_levels.and_then(|levels| {
+            let valid: Vec<_> = (0..count)
+                .map(|i| levels[i / 8] & (128 >> (i % 8)) != 0)
+                .collect();
+            let present = valid.iter().filter(|&&bit| bit).count();
+            let mut keys = index_payload(&legacy_indices, present, entries, true)?.into_iter();
+            Some(
+                valid
+                    .into_iter()
+                    .map(|bit| bit.then(|| keys.next().unwrap() as i32))
+                    .collect::<Vec<_>>(),
+            )
+        });
+        match page {
+            Ok(Some(CodeColumnPage::Values { values, .. })) => {
+                assert_eq!(Some(values.iter().collect::<Vec<_>>()), expected);
+            }
+            Err(_) => assert!(expected.is_none()),
+            other => panic!("unexpected legacy page {other:?}"),
+        }
         return;
+    }
+
+    let expected_levels = if nullable {
+        oracle::hybrid(1, &levels, count, 2, true)
+    } else {
+        Some(vec![1; count])
+    }
+    .filter(|valid| !v2 || valid.iter().filter(|&&bit| bit == 0).count() == num_nulls);
+    let keys = expected_levels.as_ref().and_then(|valid| {
+        index_payload(
+            &indices,
+            valid.iter().filter(|&&bit| bit != 0).count(),
+            entries,
+            true,
+        )
+    });
+    let page = match page {
+        Ok(Some(CodeColumnPage::Dictionary(page))) => page,
+        Err(_) => {
+            assert!(keys.is_none());
+            return;
+        }
+        other => panic!("unexpected hybrid page {other:?}"),
     };
-
-    // Oracle validity from the pull cursor over the level stream.
-    let mut expected_valid = Vec::with_capacity(rows);
-    let mut levels_ok = true;
-    let mut cursor = page.levels().unwrap();
-    loop {
-        match cursor.next_run() {
-            Ok(None) => break,
-            Ok(Some(run)) => {
-                for i in 0..run.len() {
-                    expected_valid.push(run.code_at(i).unwrap() == 1);
-                }
-            }
-            Err(_) => {
-                levels_ok = false;
-                break;
-            }
-        }
-    }
-    let ones = expected_valid.iter().filter(|&&valid| valid).count();
-    if levels_ok {
-        assert_eq!(expected_valid.len(), rows);
-        levels_ok = !v2 || ones == rows - num_nulls as usize;
-    }
-
-    let mut validity = Vec::new();
-    let result = page.validity(&mut validity);
-    assert_eq!(result.is_ok(), levels_ok, "validity result");
-    if let Ok(count) = result {
-        assert_eq!(count, ones);
-        assert_eq!(validity.len(), rows.div_ceil(64));
-        for (row, &valid) in expected_valid.iter().enumerate() {
-            assert_eq!((validity[row / 64] >> (row % 64)) & 1, u64::from(valid));
-        }
-        if rows % 64 != 0 {
-            assert_eq!(validity.last().unwrap() >> (rows % 64), 0);
+    let mut valid = Vec::new();
+    let validity = page.validity(&mut valid);
+    let valid_expected = expected_levels
+        .as_ref()
+        .filter(|_| nullable || index_payload(&indices, count, entries, false).is_some());
+    assert_eq!(
+        validity.is_ok(),
+        valid_expected.is_some(),
+        "validity result"
+    );
+    if let Some(expected) = valid_expected {
+        assert_eq!(
+            validity.unwrap(),
+            expected.iter().filter(|&&bit| bit != 0).count()
+        );
+        assert_eq!(valid.len(), count.div_ceil(64));
+        for (row, &value) in expected.iter().enumerate() {
+            assert_eq!((valid[row / 64] >> (row % 64)) & 1, u64::from(value));
         }
     }
 
-    // Oracle keys from the pull cursor over the index stream.
-    let keys = page
-        .indices()
-        .and_then(|mut cursor| cursor.selected_keys(0..ones));
     let mut table = page
         .dictionary()
         .verdict_table((0..entries).map(|key| key % 3 == 0));
     let mut verdicts = Vec::new();
-    let result = page.verdicts(&mut table, &mut validity, &mut verdicts);
-    let keys = match (levels_ok, keys) {
-        (true, Ok(keys)) if keys.len() == ones => Some(keys),
-        _ => None,
-    };
+    let result = page.verdicts(&mut table, &mut valid, &mut verdicts);
     assert_eq!(result.is_ok(), keys.is_some(), "verdict result");
     if let Some(keys) = keys {
-        assert_eq!(verdicts.len(), rows.div_ceil(64));
+        assert_eq!(verdicts.len(), count.div_ceil(64));
         let mut keys = keys.into_iter();
-        for (row, &valid) in expected_valid.iter().enumerate() {
-            let expected = valid && keys.next().unwrap() % 3 == 0;
+        for (row, value) in expected_levels.unwrap().into_iter().enumerate() {
+            let expected = value != 0 && keys.next().unwrap() % 3 == 0;
             assert_eq!((verdicts[row / 64] >> (row % 64)) & 1, u64::from(expected));
         }
-        if rows % 64 != 0 {
-            assert_eq!(verdicts.last().unwrap() >> (rows % 64), 0);
+        if count % 64 != 0 {
+            assert_eq!(verdicts.last().unwrap() >> (count % 64), 0);
         }
     }
 });

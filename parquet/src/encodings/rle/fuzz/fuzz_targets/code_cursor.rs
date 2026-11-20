@@ -19,6 +19,8 @@
 
 #![no_main]
 
+mod oracle;
+
 use libfuzzer_sys::fuzz_target;
 use parquet::encodings::rle::codes::{CodeCursor, CodeRun, RunSink, VerdictTable};
 
@@ -43,7 +45,9 @@ fuzz_target!(|input: &[u8]| {
     let width = width % 34;
     let len = usize::from(*len);
     let entries = u64::from(*entries);
+    let expected = oracle::hybrid(width, bytes, len, entries, true);
     let Ok(mut cursor) = CodeCursor::new(width, bytes, len, entries) else {
+        assert!(width > 32);
         return;
     };
     let mut push_cursor = CodeCursor::new(width, bytes, len, entries).unwrap();
@@ -53,39 +57,34 @@ fuzz_target!(|input: &[u8]| {
     let mut table = VerdictTable::new((0..entries).map(|key| key % 2 == 0));
     let mut bitmap = Vec::new();
     let verdict_result = verdict_cursor.verdicts(&mut table, &mut bitmap);
-    let mut count = 0;
-    while let Some(run) = match cursor.next_run() {
-        Ok(run) => run,
-        Err(_) => {
-            assert!(cursor.next_run().is_err());
-            assert!(push_result.is_err());
-            assert!(verdict_result.is_err());
-            assert!(push_cursor.drain(&mut pushed).is_err());
-            assert_eq!(pushed.0.len(), count);
-            return;
+
+    let mut pulled = DenseCodes::default();
+    let pull_ok = loop {
+        match cursor.next_run() {
+            Ok(Some(CodeRun::Repeated { code, len })) => pulled.repeated(code, len),
+            Ok(Some(CodeRun::Packed { width, bytes, len })) => pulled.packed(width, bytes, len),
+            Ok(None) => break true,
+            Err(_) => break false,
         }
-    } {
-        count += match run {
-            CodeRun::Repeated { len, code } => {
-                assert!(u64::from(code) < entries);
-                len
-            }
-            CodeRun::Packed { len, .. } => len,
-        };
-        assert!(count <= len);
-    }
-    push_result.unwrap();
-    assert_eq!(count, len);
-    let keys = CodeCursor::new(width, bytes, len, entries)
+    };
+    let selected = CodeCursor::new(width, bytes, len, entries)
         .unwrap()
-        .selected_keys(0..len)
-        .unwrap();
-    assert_eq!(keys.len(), len);
-    assert_eq!(pushed.0, keys);
-    verdict_result.unwrap();
+        .selected_keys(0..len);
+    assert_eq!(pull_ok, expected.is_some());
+    assert_eq!(push_result.is_ok(), expected.is_some());
+    assert_eq!(verdict_result.is_ok(), expected.is_some());
+    assert_eq!(selected.as_ref().ok(), expected.as_ref());
+    assert_eq!(pushed.0, pulled.0);
+    let Some(keys) = expected else {
+        assert!(cursor.next_run().is_err());
+        assert!(push_cursor.drain(&mut pushed).is_err());
+        assert!(verdict_cursor.next_run().is_err());
+        return;
+    };
+
+    assert_eq!(pulled.0, keys);
     assert_eq!(bitmap.len(), len.div_ceil(64));
     for (i, &key) in keys.iter().enumerate() {
         assert_eq!((bitmap[i / 64] >> (i % 64)) & 1, u64::from(key % 2 == 0));
     }
-    assert!(keys.iter().all(|&key| u64::from(key) < entries));
 });

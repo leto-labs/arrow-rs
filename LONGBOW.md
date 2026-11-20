@@ -66,16 +66,20 @@ for 7%. The remaining samples covered shared definition-level handling and
 other scan work. See the lane's benchmark evidence in the consuming
 repository's benchmark data.
 
-The follow-up walker calls each sink directly. Its dense verdict sink checks
-packed codes in the lookup table through width 20 and tracks the maximum
-code at wider widths. It reads the packed page with unaligned little-endian
-loads and saves the final bytes once for padded loads at the boundary.
-The flat page builds its validity words once per verdict call, checks a V2
-declared count, then expands dense verdicts to row positions. The validity
-sink starts with all rows valid and writes only null ranges. On the AVX-512
-tier with BMI2 and POPCNT, row expansion uses hardware bit deposit. Errors invalidate
-the caller's scratch output. The count-only push checkpoint measured
-10.51 user cycles per input row across the three columns on CPU 24.
+The walker calls each sink directly. Its dense verdict sink checks packed
+codes in the lookup table through width 20 and tracks the maximum code at
+wider widths. Packed validity is built in row order with one padded
+little-endian load per 64 levels. On the AVX-512 tier with BMI2 and POPCNT,
+row expansion uses hardware bit deposit. Errors invalidate the caller's
+scratch output.
+
+Before growing a bitmap, the reader checks that run lengths and payloads
+cover the declared count. A final packed group may pad up to seven slots.
+The reader also accepts trailing zero-byte padding emitted by fastparquet.
+V2 flat pages require equal row and value counts. The V1 value fallback
+reads deprecated BIT_PACKED levels in MSB-first order.
+[Parquet encodings](https://parquet.apache.org/docs/file-format/data-pages/encodings/) ·
+[Parquet Thrift headers](https://github.com/apache/parquet-format/blob/master/src/main/thrift/parquet.thrift)
 
 FUG requires Parquet MSRV 1.89 for stable AVX-512 intrinsics; other packages keep
 their upstream minimums. SIMD paths select instructions at run time and have

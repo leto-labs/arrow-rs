@@ -133,6 +133,15 @@ where
     }
 }
 
+/// Sink used to check run lengths without materializing levels or verdicts.
+struct CheckRunLengths;
+
+impl RunSink for CheckRunLengths {
+    fn repeated(&mut self, _code: u32, _len: usize) {}
+
+    fn packed(&mut self, _width: u8, _bytes: &[u8], _len: usize) {}
+}
+
 /// A page-local cursor over hybrid RLE runs. For dictionary indices, pass the
 /// number of non-null values as `len` and the chunk's entry count as `code_limit`.
 /// For definition levels, pass the page's level count and the maximum level plus one.
@@ -162,11 +171,13 @@ impl<'a> CodeCursor<'a> {
 
     /// Reads a validated run. Packed bytes borrow the page and can contain up
     /// to seven padding entries past the logical end of the final run.
+    /// Read through `None` to validate the end of the stream.
     pub fn next_run(&mut self) -> Result<Option<CodeRun<'a>>> {
         if self.failed {
             return Err(general_err!("Invalid code stream"));
         }
         if self.remaining == 0 {
+            self.finish_stream()?;
             return Ok(None);
         }
         let result = self.read_run::<true>();
@@ -228,7 +239,60 @@ impl<'a> CodeCursor<'a> {
                 }
             }
         }
+        self.finish_stream()
+    }
+
+    #[inline]
+    fn finish_stream(&mut self) -> Result<()> {
+        if self.data.is_empty() {
+            return Ok(());
+        }
+        self.check_padding()
+    }
+
+    #[cold]
+    fn check_padding(&mut self) -> Result<()> {
+        // Hybrid bit-packed padding is consumed with the final group. Some
+        // fastparquet writers also append zero bytes (see RleDecoder::reload).
+        // A nonzero byte can start an excess run, even after zero padding.
+        if self.data.iter().any(|&byte| byte != 0) {
+            self.failed = true;
+            return Err(general_err!("Trailing bytes after declared code count"));
+        }
+        self.data = &[];
         Ok(())
+    }
+
+    /// Resizes a scratch bitmap after validating the stream extent whenever
+    /// the declared count would grow the allocation.
+    #[inline]
+    pub(crate) fn prepare_bitmap(&mut self, out: &mut Vec<u64>) -> Result<()> {
+        if self.failed {
+            return Err(general_err!("Invalid code stream"));
+        }
+        let words = self.remaining.div_ceil(64);
+        if words > out.capacity() {
+            let result = self.validate_extent();
+            self.failed = result.is_err();
+            result?;
+        }
+        out.clear();
+        out.resize(words, 0);
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn validate_extent(&self) -> Result<()> {
+        if self.remaining != 0 && self.code_limit == 0 {
+            return Err(general_err!(
+                "Nonempty code stream needs a dictionary entry"
+            ));
+        }
+        // Walk a copy before allocating. A plausible first run (even a very
+        // long one) says nothing about the size or validity of later runs.
+        let mut check = Self { ..*self };
+        check.drain_impl::<_, false>(&mut CheckRunLengths)
     }
 
     #[inline(always)]
@@ -311,6 +375,7 @@ impl<'a> CodeCursor<'a> {
         if limit as u64 != self.code_limit {
             return Err(general_err!("Verdict table does not match dictionary size"));
         }
+        self.prepare_bitmap(out)?;
         if width <= MAX_TABLE_WIDTH {
             let size = 1usize << width;
             if table.flags.len() < size {
@@ -318,8 +383,6 @@ impl<'a> CodeCursor<'a> {
             }
         }
 
-        out.clear();
-        out.resize(self.remaining.div_ceil(64), 0);
         let mut sink = VerdictSink {
             writer: WordWriter::new(out),
             table,
@@ -680,6 +743,62 @@ mod tests {
         let mut bitmap = Vec::new();
         cursor.verdicts(&mut table, &mut bitmap).unwrap();
         assert_eq!(bitmap, [0xff]);
+    }
+
+    #[test]
+    fn rejects_excess_runs_but_accepts_writer_padding() {
+        // A one-value stream followed by an extra repeated key, or by
+        // fastparquet's zero-byte padding. A packed group may pad seven slots.
+        for (data, valid) in [
+            (&[2, 0, 2, 1][..], false),
+            (&[2, 0, 0, 2, 0], false),
+            (&[2, 0, 0, 0], true),
+            (&[3, 0xfe, 0, 0], true),
+        ] {
+            let mut pull = CodeCursor::new(1, data, 1, 1).unwrap();
+            assert_eq!(pull.next_run().unwrap().unwrap().code_at(0), Some(0));
+            assert_eq!(
+                pull.next_run().map(|run| run.is_none()).ok(),
+                valid.then_some(true)
+            );
+            if !valid {
+                assert!(pull.next_run().is_err());
+            }
+
+            let mut selected = CodeCursor::new(1, data, 1, 1).unwrap();
+            assert_eq!(selected.selected_keys([0]).is_ok(), valid);
+
+            let mut dense = DenseCodes::default();
+            let mut push = CodeCursor::new(1, data, 1, 1).unwrap();
+            assert_eq!(push.drain(&mut dense).is_ok(), valid);
+            assert_eq!(dense.0, [0]);
+
+            let mut out = Vec::new();
+            let mut bitmap = CodeCursor::new(1, data, 1, 1).unwrap();
+            assert_eq!(
+                bitmap
+                    .verdicts(&mut VerdictTable::new([true]), &mut out)
+                    .is_ok(),
+                valid
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_verdict_stream_does_not_allocate_for_declared_count() {
+        // A complete 64-value run, but the declared count needs another run.
+        // Width zero is legal for a single-entry dictionary.
+        for data in [&[0x80, 0x01][..], &[0xfc, 0xff, 0xff, 0xff, 0x0f]] {
+            let mut cursor = CodeCursor::new(0, data, i32::MAX as usize, 1).unwrap();
+            let mut out = Vec::new();
+            assert!(
+                cursor
+                    .verdicts(&mut VerdictTable::new([true]), &mut out)
+                    .is_err()
+            );
+            assert_eq!(out.capacity(), 0);
+            assert!(cursor.next_run().is_err());
+        }
     }
 
     #[test]

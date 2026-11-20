@@ -200,26 +200,33 @@ impl DictionaryCodePage {
 
     /// Builds a row validity bitmap and returns its non-null count.
     /// Word bits are in row order, starting at the least significant bit.
+    /// For required pages the index stream must cover the declared row count.
     pub fn validity(&self, out: &mut Vec<u64>) -> Result<usize> {
+        if self.levels.is_none() {
+            self.indices_with_count(self.rows)?.validate_extent()?;
+        } else if self.rows.div_ceil(64) > out.capacity() {
+            self.validate_levels()?;
+        }
         self.validity_inline(out)
     }
 
     #[inline(always)]
     fn validity_inline(&self, out: &mut Vec<u64>) -> Result<usize> {
-        out.clear();
         let Some(levels) = &self.levels else {
+            out.clear();
             out.resize(self.rows.div_ceil(64), u64::MAX);
             if let Some(last) = out.last_mut() {
                 *last = low_mask((self.rows - 1) % 64 + 1);
             }
             return Ok(self.rows);
         };
-        out.resize(self.rows.div_ceil(64), 0);
+        let mut cursor = CodeCursor::new(1, levels, self.rows, 2)?;
+        cursor.prepare_bitmap(out)?;
         let mut sink = ValidityWriter {
             writer: WordWriter::new(out),
             tail: padded_tail(levels),
         };
-        CodeCursor::new(1, levels, self.rows, 2)?.drain_padded(&mut sink)?;
+        cursor.drain_padded(&mut sink)?;
         sink.writer.finish();
         // Packed loads are masked to their runs, so bits past the last row
         // are zero.
@@ -236,6 +243,11 @@ impl DictionaryCodePage {
         validity: &mut Vec<u64>,
         out: &mut Vec<u64>,
     ) -> Result<()> {
+        // The validity allocation also depends on the index stream being
+        // complete. A huge valid level run can precede a truncated index.
+        if self.rows.div_ceil(64) > validity.capacity() && self.levels.is_some() {
+            self.validate_optional_verdict_extent()?;
+        }
         #[cfg(all(target_arch = "x86_64", not(miri)))]
         if fast_bitmaps() {
             // SAFETY: `fast_bitmaps` checked that the CPU has BMI2 and POPCNT.
@@ -248,6 +260,13 @@ impl DictionaryCodePage {
                 expand(bits, mask)
             }
         })
+    }
+
+    #[cold]
+    fn validate_optional_verdict_extent(&self) -> Result<()> {
+        let count = count_valid_levels(&mut self.levels().expect("optional page"))?;
+        self.check_count(count)?;
+        self.indices_with_count(count)?.validate_extent()
     }
 
     /// The whole page path compiled with BMI2 and POPCNT: the level walk,
@@ -498,10 +517,16 @@ where
                     num_values,
                     encoding,
                     num_nulls,
+                    num_rows,
                     def_levels_byte_len,
                     rep_levels_byte_len,
                     ..
                 }) => {
+                    // Flat columns have exactly one level slot per row.
+                    // See DataPageHeaderV2 in the Parquet Thrift specification.
+                    if num_rows != num_values {
+                        return Err(general_err!("Flat DataPage V2 row/value counts differ"));
+                    }
                     let len = def_levels_byte_len as usize;
                     if rep_levels_byte_len != 0
                         || len > buf.len()
@@ -610,6 +635,19 @@ fn decode_levels(
     let Some(levels) = levels else {
         return Ok((None, rows));
     };
+    #[expect(deprecated, reason = "Read legacy V1 definition levels")]
+    if encoding == Encoding::BIT_PACKED {
+        // The deprecated bit-packing starts at the MSB, unlike hybrid RLE.
+        // https://parquet.apache.org/docs/file-format/data-pages/encodings/#bit-packed-deprecated-bit_packed--4
+        if levels.len() < rows.div_ceil(8) {
+            return Err(general_err!("Incomplete BIT_PACKED definition levels"));
+        }
+        let decoded: Vec<i16> = (0..rows)
+            .map(|row| i16::from((levels[row / 8] >> (7 - row % 8)) & 1))
+            .collect();
+        let values = decoded.iter().map(|&level| level as usize).sum();
+        return Ok((Some(decoded), values));
+    }
     let mut decoder = DefinitionLevelDecoderImpl::new(1);
     decoder.set_data(encoding, levels)?;
     let mut decoded = Vec::new();
@@ -653,14 +691,42 @@ mod tests {
         encoding: Encoding,
         data: impl IntoIterator<Item = u8>,
     ) -> Page {
-        let mut levels = RleEncoder::new(1, 0);
-        for &valid in definition {
-            levels.put(u64::from(valid));
-        }
-        let levels = levels.consume();
+        flat_data_page(v2, definition, Some(Encoding::RLE), encoding, data)
+    }
+
+    #[expect(deprecated, reason = "Write legacy V1 BIT_PACKED test pages")]
+    fn flat_data_page(
+        v2: bool,
+        definition: &[bool],
+        level_encoding: Option<Encoding>,
+        encoding: Encoding,
+        data: impl IntoIterator<Item = u8>,
+    ) -> Page {
+        let levels = match level_encoding {
+            None => Vec::new(),
+            Some(Encoding::BIT_PACKED) => {
+                assert!(!v2);
+                definition
+                    .chunks(8)
+                    .map(|chunk| {
+                        chunk.iter().enumerate().fold(0, |byte, (bit, &valid)| {
+                            byte | (u8::from(valid) << (7 - bit))
+                        })
+                    })
+                    .collect()
+            }
+            Some(Encoding::RLE) => {
+                let mut levels = RleEncoder::new(1, 0);
+                for &valid in definition {
+                    levels.put(u64::from(valid));
+                }
+                levels.consume()
+            }
+            _ => unreachable!(),
+        };
         let rows = definition.len() as u32;
         let mut buf = Vec::new();
-        if !v2 {
+        if !v2 && level_encoding == Some(Encoding::RLE) {
             buf.extend_from_slice(&(levels.len() as u32).to_le_bytes());
         }
         buf.extend_from_slice(&levels);
@@ -682,7 +748,7 @@ mod tests {
                 buf: buf.into(),
                 num_values: rows,
                 encoding,
-                def_level_encoding: Encoding::RLE,
+                def_level_encoding: level_encoding.unwrap_or(Encoding::RLE),
                 rep_level_encoding: Encoding::RLE,
                 statistics: None,
             }
@@ -821,6 +887,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Compare legacy V1 BIT_PACKED pages to expected values"
+    )]
     fn code_page_row_bitmaps_match_levels_for_random_null_patterns() {
         crate::util::native::dispatch::for_each_tier(|| {
             let mut seed = 0x9e37_79b9_u32;
@@ -832,11 +902,34 @@ mod tests {
             };
             let mut validity = Vec::new();
             let mut verdicts = Vec::new();
+            let required = SchemaDescriptor::new(Arc::new(
+                parse_message_type("message x { REQUIRED INT32 value; }").unwrap(),
+            ))
+            .column(0);
+            let optional = descriptor();
             for case in 0..400 {
-                let rows = 1 + next(if case % 4 == 0 { 700 } else { 140 }) as usize;
+                let (v2, level_encoding) = [
+                    (false, None),
+                    (true, None),
+                    (false, Some(Encoding::RLE)),
+                    (true, Some(Encoding::RLE)),
+                    (false, Some(Encoding::BIT_PACKED)),
+                ][case % 5];
+                let desc = if level_encoding.is_some() {
+                    &optional
+                } else {
+                    &required
+                };
+                let rows = match case / 5 {
+                    0 => 0,
+                    1 => 1,
+                    2 => 64,
+                    3 => 65,
+                    _ => 1 + next(if case % 4 == 0 { 700 } else { 140 }) as usize,
+                };
                 // Mix scattered nulls (packed level runs at every offset) with
                 // long valid and null runs (repeated runs, some over 64).
-                let density = next(5);
+                let density = if level_encoding.is_some() { next(5) } else { 0 };
                 let mut definition = Vec::with_capacity(rows);
                 while definition.len() < rows {
                     let long = next(3) == 0;
@@ -863,21 +956,48 @@ mod tests {
                 }
                 let indices: Vec<_> = std::iter::once(width).chain(encoder.consume()).collect();
                 let dictionary_values: Vec<i32> = (0..entries as i32).collect();
-                let page = data_page(
-                    case % 2 == 1,
+                let page = flat_data_page(
+                    v2,
                     &definition,
+                    level_encoding,
                     Encoding::RLE_DICTIONARY,
                     indices,
                 );
+                let mut mismatched = page.clone();
+                if let Page::DataPageV2 { num_rows, .. } = &mut mismatched {
+                    let wrong_count = next(*num_rows + 7);
+                    *num_rows = wrong_count + u32::from(wrong_count >= *num_rows);
+                    let mut reader = CodeColumnReader::<Int32Type, ArrowInt32>::new(
+                        desc.clone(),
+                        Box::new(InMemoryPageReader::new([
+                            dictionary(&dictionary_values),
+                            mismatched,
+                        ])),
+                    )
+                    .unwrap();
+                    assert!(reader.next_page().is_err(), "case {case}");
+                }
                 let mut reader = CodeColumnReader::<Int32Type, ArrowInt32>::new(
-                    descriptor(),
+                    desc.clone(),
                     Box::new(InMemoryPageReader::new([
                         dictionary(&dictionary_values),
                         page,
                     ])),
                 )
                 .unwrap();
-                let Some(CodeColumnPage::Dictionary(page)) = reader.next_page().unwrap() else {
+                let page = reader.next_page().unwrap().unwrap();
+                if level_encoding == Some(Encoding::BIT_PACKED) {
+                    let CodeColumnPage::Values { values, .. } = page else {
+                        panic!("expected legacy levels to fall back to values")
+                    };
+                    let mut codes = codes.iter();
+                    let expected = definition.iter().map(|&valid| {
+                        valid.then(|| dictionary_values[*codes.next().unwrap() as usize])
+                    });
+                    assert!(values.iter().eq(expected), "case {case}");
+                    continue;
+                }
+                let CodeColumnPage::Dictionary(page) = page else {
                     panic!("expected dictionary page")
                 };
                 let pass = |code: u32| code % 3 == 1;
@@ -896,9 +1016,11 @@ mod tests {
                     let expected = valid && pass(*codes.next().unwrap());
                     assert_eq!(bit(&verdicts), u64::from(expected), "case {case} row {row}");
                 }
-                let unused = !low_mask((rows - 1) % 64 + 1);
-                assert_eq!(validity.last().unwrap() & unused, 0, "case {case}");
-                assert_eq!(verdicts.last().unwrap() & unused, 0, "case {case}");
+                if let Some(last) = rows.checked_sub(1) {
+                    let unused = !low_mask(last % 64 + 1);
+                    assert_eq!(validity.last().unwrap() & unused, 0, "case {case}");
+                    assert_eq!(verdicts.last().unwrap() & unused, 0, "case {case}");
+                }
             }
         });
     }
@@ -928,6 +1050,174 @@ mod tests {
                 page.verdicts(&mut table, &mut validity, &mut verdicts)
                     .is_err()
             );
+        }
+    }
+
+    #[test]
+    #[expect(deprecated, reason = "Exercise the Parquet V1 BIT_PACKED encoding")]
+    fn code_page_legacy_levels_are_msb_first() {
+        crate::util::native::dispatch::for_each_tier(|| {
+            // The specification's BIT_PACKED encoding starts in the high bit.
+            // There is no size prefix in V1. The two levels are 1 and 0.
+            for (encoding, payload) in [
+                (Encoding::PLAIN, &[0x80, 17, 0, 0, 0][..]),
+                (Encoding::RLE_DICTIONARY, &[0x80, 0, 2]),
+            ] {
+                let page = Page::DataPage {
+                    buf: Bytes::copy_from_slice(payload),
+                    num_values: 2,
+                    encoding,
+                    def_level_encoding: Encoding::BIT_PACKED,
+                    rep_level_encoding: Encoding::RLE,
+                    statistics: None,
+                };
+                let mut reader = CodeColumnReader::<Int32Type, ArrowInt32>::new(
+                    descriptor(),
+                    Box::new(InMemoryPageReader::new([dictionary(&[17]), page])),
+                )
+                .unwrap();
+                let Some(CodeColumnPage::Values { values, .. }) = reader.next_page().unwrap()
+                else {
+                    panic!("expected a value page")
+                };
+                assert_eq!(values.iter().collect::<Vec<_>>(), [Some(17), None]);
+            }
+        });
+    }
+
+    #[test]
+    fn code_page_truncated_levels_do_not_allocate_for_declared_count() {
+        crate::util::native::dispatch::for_each_tier(|| {
+            // V1 RLE levels have a four-byte length. An empty level stream
+            // cannot cover the declared rows. The index width is zero.
+            let page = Page::DataPage {
+                buf: Bytes::from_static(&[0, 0, 0, 0, 0]),
+                num_values: i32::MAX as u32,
+                encoding: Encoding::RLE_DICTIONARY,
+                def_level_encoding: Encoding::RLE,
+                rep_level_encoding: Encoding::RLE,
+                statistics: None,
+            };
+            let mut reader = CodeColumnReader::<Int32Type, ArrowInt32>::new(
+                descriptor(),
+                Box::new(InMemoryPageReader::new([dictionary(&[17]), page])),
+            )
+            .unwrap();
+            let Some(CodeColumnPage::Dictionary(page)) = reader.next_page().unwrap() else {
+                panic!("expected a dictionary page")
+            };
+            let mut out = Vec::new();
+            assert!(page.validity(&mut out).is_err());
+            assert_eq!(out.capacity(), 0);
+        });
+    }
+
+    #[test]
+    fn code_page_truncated_indices_do_not_grow_validity() {
+        crate::util::native::dispatch::for_each_tier(|| {
+            // The level header 2 * i32::MAX declares one all-valid run.
+            // The index stream contains its width but no runs.
+            let page = Page::DataPage {
+                buf: Bytes::from_static(&[6, 0, 0, 0, 0xfe, 0xff, 0xff, 0xff, 0x0f, 1, 0]),
+                num_values: i32::MAX as u32,
+                encoding: Encoding::RLE_DICTIONARY,
+                def_level_encoding: Encoding::RLE,
+                rep_level_encoding: Encoding::RLE,
+                statistics: None,
+            };
+            let mut reader = CodeColumnReader::<Int32Type, ArrowInt32>::new(
+                descriptor(),
+                Box::new(InMemoryPageReader::new([dictionary(&[17]), page])),
+            )
+            .unwrap();
+            let Some(CodeColumnPage::Dictionary(page)) = reader.next_page().unwrap() else {
+                panic!("expected a dictionary page")
+            };
+            let mut validity = Vec::new();
+            let mut verdicts = Vec::new();
+            let mut table = page.dictionary().verdict_table([true]);
+            assert!(
+                page.verdicts(&mut table, &mut validity, &mut verdicts)
+                    .is_err()
+            );
+            assert_eq!(validity.capacity(), 0);
+            assert_eq!(verdicts.capacity(), 0);
+        });
+    }
+
+    #[test]
+    fn code_page_rejects_extra_index_runs() {
+        crate::util::native::dispatch::for_each_tier(|| {
+            // One valid row in V2, then one dictionary index at width 1.
+            // The second run declares a key outside the one-entry dictionary.
+            let page = Page::DataPageV2 {
+                buf: Bytes::from_static(&[2, 1, 1, 2, 0, 2, 1]),
+                num_values: 1,
+                encoding: Encoding::RLE_DICTIONARY,
+                num_nulls: 0,
+                num_rows: 1,
+                def_levels_byte_len: 2,
+                rep_levels_byte_len: 0,
+                is_compressed: false,
+                statistics: None,
+            };
+            let mut reader = CodeColumnReader::<Int32Type, ArrowInt32>::new(
+                descriptor(),
+                Box::new(InMemoryPageReader::new([dictionary(&[17]), page])),
+            )
+            .unwrap();
+            let Some(CodeColumnPage::Dictionary(page)) = reader.next_page().unwrap() else {
+                panic!("expected a dictionary page")
+            };
+            let mut cursor = page.indices().unwrap();
+            assert_eq!(cursor.next_run().unwrap().unwrap().code_at(0), Some(0));
+            assert!(cursor.next_run().is_err());
+            assert!(page.selected_keys([0]).is_err());
+            let mut table = page.dictionary().verdict_table([true]);
+            assert!(
+                page.verdicts(&mut table, &mut vec![0], &mut vec![0])
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn code_page_rejects_inconsistent_v2_row_count() {
+        for nullable in [false, true] {
+            let modifier = if nullable { "OPTIONAL" } else { "REQUIRED" };
+            let schema =
+                parse_message_type(&format!("message x {{ {modifier} INT32 value; }}")).unwrap();
+            let descriptor = SchemaDescriptor::new(Arc::new(schema)).column(0);
+            for (encoding, data) in [
+                (Encoding::RLE_DICTIONARY, &[0, 4][..]),
+                (Encoding::PLAIN, &[17, 0, 0, 0, 17, 0, 0, 0]),
+            ] {
+                for num_rows in [1, 3] {
+                    let levels: &[u8] = if nullable { &[4, 1] } else { &[] };
+                    let page = Page::DataPageV2 {
+                        buf: levels
+                            .iter()
+                            .chain(data)
+                            .copied()
+                            .collect::<Vec<_>>()
+                            .into(),
+                        num_values: 2,
+                        encoding,
+                        num_nulls: 0,
+                        num_rows,
+                        def_levels_byte_len: levels.len() as u32,
+                        rep_levels_byte_len: 0,
+                        is_compressed: false,
+                        statistics: None,
+                    };
+                    let mut reader = CodeColumnReader::<Int32Type, ArrowInt32>::new(
+                        descriptor.clone(),
+                        Box::new(InMemoryPageReader::new([dictionary(&[17]), page])),
+                    )
+                    .unwrap();
+                    assert!(reader.next_page().is_err());
+                }
+            }
         }
     }
 
