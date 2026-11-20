@@ -215,6 +215,7 @@ impl DictionaryCodePage {
         } else if self.rows != 0 {
             sink.repeated(1, self.rows);
         }
+        sink.writer.finish();
         Ok(sink.valid)
     }
 
@@ -236,29 +237,8 @@ impl DictionaryCodePage {
             return Ok(());
         }
 
-        // Expand in reverse. A row word can only read dense words at or
-        // below its own position, so expansion can reuse the output buffer.
         out.resize(validity.len(), 0);
-        let mut rank = count;
-        for (i, &mask) in validity.iter().enumerate().rev() {
-            let len = mask.count_ones() as usize;
-            rank -= len;
-            if len == 0 {
-                out[i] = 0;
-                continue;
-            }
-            let word = rank / 64;
-            let shift = rank % 64;
-            let mut bits = out[word] >> shift;
-            if len > 64 - shift {
-                bits |= out[word + 1] << (64 - shift);
-            }
-            out[i] = if mask == u64::MAX {
-                bits
-            } else {
-                expand(bits, mask)
-            };
-        }
+        scatter_verdicts(out, validity, count);
         Ok(())
     }
 
@@ -322,6 +302,69 @@ impl DictionaryCodePage {
                 .map(|valid| valid.then(|| keys.next().expect("one key per selected valid row"))),
         );
         DictionaryArray::try_new(keys, Arc::clone(&self.dictionary.values)).map_err(Into::into)
+    }
+}
+
+fn scatter_verdicts(out: &mut [u64], validity: &[u64], count: usize) {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    if std::is_x86_feature_detected!("avx512f")
+        && std::is_x86_feature_detected!("bmi2")
+        && std::is_x86_feature_detected!("popcnt")
+    {
+        #[cfg(test)]
+        let enabled = !matches!(
+            crate::util::native::dispatch::tier(),
+            crate::util::native::dispatch::Tier::Scalar | crate::util::native::dispatch::Tier::Avx2
+        );
+        #[cfg(not(test))]
+        let enabled = true;
+        if enabled {
+            // SAFETY: Both target features are enabled on this CPU.
+            unsafe { scatter_verdicts_bmi2(out, validity, count) };
+            return;
+        }
+    }
+    scatter_verdicts_with(out, validity, count, |bits, mask| {
+        if mask == u64::MAX {
+            bits
+        } else {
+            expand(bits, mask)
+        }
+    });
+}
+
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+#[target_feature(enable = "bmi2,popcnt")]
+fn scatter_verdicts_bmi2(out: &mut [u64], validity: &[u64], count: usize) {
+    scatter_verdicts_with(out, validity, count, |bits, mask| {
+        std::arch::x86_64::_pdep_u64(bits, mask)
+    });
+}
+
+#[inline(always)]
+fn scatter_verdicts_with(
+    out: &mut [u64],
+    validity: &[u64],
+    count: usize,
+    deposit: impl Fn(u64, u64) -> u64,
+) {
+    // Expand in reverse. A row word can only read dense words at or
+    // below its own position, so expansion can reuse the output buffer.
+    let mut rank = count;
+    for (i, &mask) in validity.iter().enumerate().rev() {
+        let len = mask.count_ones() as usize;
+        rank -= len;
+        if len == 0 {
+            out[i] = 0;
+            continue;
+        }
+        let word = rank / 64;
+        let shift = rank % 64;
+        let mut bits = out[word] >> shift;
+        if len > 64 - shift {
+            bits |= out[word + 1] << (64 - shift);
+        }
+        out[i] = deposit(bits, mask);
     }
 }
 

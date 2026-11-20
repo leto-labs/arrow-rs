@@ -315,6 +315,7 @@ impl<'a> CodeCursor<'a> {
             self.failed = true;
             return Err(invalid_packed_code());
         }
+        sink.writer.finish();
         Ok(())
     }
 
@@ -458,32 +459,46 @@ pub(crate) fn low_mask(bits: usize) -> u64 {
     u64::MAX.checked_shr((64 - bits) as u32).unwrap_or(0)
 }
 
-/// Writes least-significant-bit-first to pre-zeroed words.
+/// Appends bits in row order, holding the partial word until it is complete.
 pub(crate) struct WordWriter<'a> {
     words: &'a mut [u64],
-    position: usize,
+    index: usize,
+    pending: u64,
+    filled: usize,
 }
 
 impl<'a> WordWriter<'a> {
     pub(crate) fn new(words: &'a mut [u64]) -> Self {
-        Self { words, position: 0 }
-    }
-
-    #[inline]
-    pub(crate) fn write(&mut self, bits: u64, len: usize) {
-        let word = self.position / 64;
-        let shift = self.position % 64;
-        self.words[word] |= bits << shift;
-        if len > 64 - shift {
-            self.words[word + 1] |= bits >> (64 - shift);
+        Self {
+            words,
+            index: 0,
+            pending: 0,
+            filled: 0,
         }
-        self.position += len;
     }
 
-    #[inline]
+    #[inline(always)]
+    pub(crate) fn write(&mut self, bits: u64, len: usize) {
+        let end = self.filled + len;
+        self.pending |= bits << self.filled;
+        if end >= 64 {
+            self.words[self.index] = self.pending;
+            self.index += 1;
+            self.pending = (bits >> 1) >> (63 - self.filled);
+        }
+        self.filled = end % 64;
+    }
+
+    #[inline(always)]
     pub(crate) fn repeat(&mut self, bit: bool, mut len: usize) {
         if !bit {
-            self.position += len;
+            let end = self.filled + len;
+            if end >= 64 {
+                self.words[self.index] = self.pending;
+                self.index += end / 64;
+                self.pending = 0;
+            }
+            self.filled = end % 64;
             return;
         }
         while len > 64 {
@@ -491,6 +506,13 @@ impl<'a> WordWriter<'a> {
             len -= 64;
         }
         self.write(low_mask(len), len);
+    }
+
+    #[inline]
+    pub(crate) fn finish(self) {
+        if self.filled != 0 {
+            self.words[self.index] = self.pending;
+        }
     }
 }
 
