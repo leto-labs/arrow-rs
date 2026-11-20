@@ -30,7 +30,7 @@ use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::{BitReader, num_required_bits};
 
 #[cfg(feature = "arrow")]
-pub(super) mod code_page;
+pub(crate) mod code_page;
 
 /// Decodes level data
 pub trait ColumnLevelDecoder {

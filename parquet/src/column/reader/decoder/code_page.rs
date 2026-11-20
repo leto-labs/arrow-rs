@@ -20,37 +20,100 @@
 //! Opt-in page reader for code-space consumers of flat primitive columns.
 
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow_array::{
     Array, ArrayRef, DictionaryArray, PrimitiveArray,
-    types::{ArrowPrimitiveType, UInt32Type},
+    types::{self, ArrowPrimitiveType, UInt32Type},
 };
 use arrow_buffer::{Buffer, ScalarBuffer, bit_util::expand};
 use bytes::Bytes;
 
 use super::super::parse_v1_level;
 use super::{ColumnLevelDecoder, DefinitionLevelDecoder, DefinitionLevelDecoderImpl, get_decoder};
-use crate::basic::Encoding;
+use crate::basic::{Encoding, Type};
 use crate::column::page::{Page, PageReader};
-use crate::data_type::DataType;
+use crate::data_type::{self, DataType, private::ParquetValueType};
+use crate::encodings::decoding::{Decoder, PlainDecoder};
 use crate::encodings::rle::codes::{
-    CodeCursor, CodeRun, RunSink, VerdictTable, WordWriter, load_padded, low_mask, padded_tail,
+    CodeCursor, CodePosition, CodeRun, RunSink, VerdictTable, WordWriter, load_padded, low_mask,
+    padded_tail,
 };
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 
-/// Decoded values shared by the dictionary pages of a single column chunk.
+/// PLAIN dictionary bytes shared by the data pages of a single column chunk.
 #[derive(Clone, Debug)]
 pub struct ChunkDictionary {
-    values: ArrayRef,
+    plain: Bytes,
     entries: usize,
+    physical_type: Type,
+    values: Arc<OnceLock<ArrayRef>>,
+    materialize: fn(&Bytes, usize) -> ArrayRef,
 }
 
 impl ChunkDictionary {
+    fn new<P, A>(page: &Page) -> Result<Self>
+    where
+        P: DataType<T = A::Native>,
+        A: ArrowPrimitiveType,
+    {
+        let Page::DictionaryPage {
+            buf,
+            num_values,
+            encoding,
+            ..
+        } = page
+        else {
+            return Err(general_err!("Expected dictionary page"));
+        };
+        if !matches!(encoding, Encoding::PLAIN | Encoding::PLAIN_DICTIONARY) {
+            return Err(general_err!("Unexpected dictionary encoding"));
+        }
+        let entries = *num_values as usize;
+        if entries > buf.len() / size_of::<A::Native>() {
+            return Err(general_err!("Incomplete primitive dictionary"));
+        }
+        Ok(Self {
+            plain: buf.clone(),
+            entries,
+            physical_type: P::get_physical_type(),
+            values: Arc::new(OnceLock::new()),
+            materialize: materialize_dictionary::<P, A>,
+        })
+    }
+
+    pub(crate) fn new_native(page: &Page, physical_type: Type) -> Result<Self> {
+        match physical_type {
+            Type::INT32 => Self::new::<data_type::Int32Type, types::Int32Type>(page),
+            Type::INT64 => Self::new::<data_type::Int64Type, types::Int64Type>(page),
+            Type::FLOAT => Self::new::<data_type::FloatType, types::Float32Type>(page),
+            Type::DOUBLE => Self::new::<data_type::DoubleType, types::Float64Type>(page),
+            _ => Err(general_err!(
+                "Unsupported physical type for a primitive dictionary"
+            )),
+        }
+    }
+
     /// The chunk's single values allocation. Its pointer identifies this dictionary.
     pub fn values(&self) -> &ArrayRef {
-        &self.values
+        self.values
+            .get_or_init(|| (self.materialize)(&self.plain, self.entries))
+    }
+
+    /// Appends native values at the supplied codes, including repeated codes.
+    /// PLAIN entries can be read directly from their little-endian page bytes.
+    pub fn gather<T: ParquetValueType>(&self, codes: &[u32], out: &mut Vec<T>) -> Result<()> {
+        if self.physical_type != T::PHYSICAL_TYPE {
+            return Err(general_err!("Dictionary and output physical types differ"));
+        }
+        if cfg!(target_endian = "little")
+            && codes.len().saturating_mul(64) > self.entries * size_of::<T>()
+        {
+            let values = self.values().to_data();
+            return gather_plain(values.buffers()[0].as_slice(), self.entries, codes, out);
+        }
+        gather_plain(&self.plain, self.entries, codes, out)
     }
 
     /// Builds a reusable verdict table in this chunk's dictionary order.
@@ -62,6 +125,54 @@ impl ChunkDictionary {
     pub fn entry_count(&self) -> usize {
         self.entries
     }
+}
+
+fn materialize_dictionary<P, A>(data: &Bytes, entries: usize) -> ArrayRef
+where
+    P: DataType<T = A::Native>,
+    A: ArrowPrimitiveType,
+{
+    let values = if cfg!(target_endian = "little")
+        && data.as_ptr().align_offset(align_of::<A::Native>()) == 0
+    {
+        ScalarBuffer::new(Buffer::from(data.clone()), 0, entries)
+    } else {
+        let mut decoder = PlainDecoder::<P>::new(0);
+        decoder
+            .set_data(data.clone(), entries)
+            .expect("validated fixed-width dictionary");
+        let mut values = vec![A::Native::default(); entries];
+        let decoded = decoder
+            .get(&mut values)
+            .expect("validated fixed-width dictionary");
+        assert_eq!(decoded, entries);
+        values.into()
+    };
+    Arc::new(PrimitiveArray::<A>::new(values, None))
+}
+
+#[inline]
+pub(crate) fn gather_plain<T: ParquetValueType>(
+    bytes: &[u8],
+    entries: usize,
+    ranks: &[u32],
+    out: &mut Vec<T>,
+) -> Result<()> {
+    let width = size_of::<T>();
+    if entries > bytes.len() / width {
+        return Err(general_err!("Incomplete fixed-width value page"));
+    }
+    let bytes = &bytes[..entries * width];
+    out.reserve(ranks.len());
+    for &rank in ranks {
+        let rank = rank as usize;
+        if rank >= entries {
+            return Err(general_err!("Fixed-width value rank out of range"));
+        }
+        let offset = rank * width;
+        out.push(T::try_from_le_slice(&bytes[offset..offset + width])?);
+    }
+    Ok(())
 }
 
 /// A page in either code space or value space.
@@ -198,6 +309,25 @@ impl DictionaryCodePage {
         CodeCursor::new(width, bytes, count, self.dictionary.entries as u64)
     }
 
+    /// Writes codes at strictly increasing non-null ranks, relative to the page.
+    /// Validates selected codes and the run lengths. Discard `out` on error.
+    pub fn codes_at(&self, ranks: &[u32], out: &mut Vec<u32>) -> Result<()> {
+        self.indices()?.codes_at(ranks, out)
+    }
+
+    #[inline]
+    pub(crate) fn codes_in_range(
+        &self,
+        count: usize,
+        end: usize,
+        ranks: &[u32],
+        out: &mut Vec<u32>,
+        position: &mut Option<CodePosition>,
+    ) -> Result<()> {
+        self.indices_with_count(count)?
+            .codes_in_range(ranks, out, position, Some(end))
+    }
+
     /// Builds a row validity bitmap and returns its non-null count.
     /// Word bits are in row order, starting at the least significant bit.
     /// For required pages the index stream must cover the declared row count.
@@ -212,25 +342,7 @@ impl DictionaryCodePage {
 
     #[inline(always)]
     fn validity_inline(&self, out: &mut Vec<u64>) -> Result<usize> {
-        let Some(levels) = &self.levels else {
-            out.clear();
-            out.resize(self.rows.div_ceil(64), u64::MAX);
-            if let Some(last) = out.last_mut() {
-                *last = low_mask((self.rows - 1) % 64 + 1);
-            }
-            return Ok(self.rows);
-        };
-        let mut cursor = CodeCursor::new(1, levels, self.rows, 2)?;
-        cursor.prepare_bitmap(out)?;
-        let mut sink = ValidityWriter {
-            writer: WordWriter::new(out),
-            tail: padded_tail(levels),
-        };
-        cursor.drain_padded(&mut sink)?;
-        sink.writer.finish();
-        // Packed loads are masked to their runs, so bits past the last row
-        // are zero.
-        let count = out.iter().map(|word| word.count_ones() as usize).sum();
+        let count = flat_validity(self.rows, self.levels.as_ref(), out)?;
         self.check_count(count)?;
         Ok(count)
     }
@@ -366,7 +478,7 @@ impl DictionaryCodePage {
                 .into_iter()
                 .map(|valid| valid.then(|| keys.next().expect("one key per selected valid row"))),
         );
-        DictionaryArray::try_new(keys, Arc::clone(&self.dictionary.values)).map_err(Into::into)
+        DictionaryArray::try_new(keys, Arc::clone(self.dictionary.values())).map_err(Into::into)
     }
 }
 
@@ -451,101 +563,26 @@ where
         self.dictionary.as_ref()
     }
 
-    fn install_dictionary(&mut self, page: Page) -> Result<()> {
-        let Page::DictionaryPage {
-            buf,
-            num_values,
-            encoding,
-            ..
-        } = page
-        else {
-            return Err(general_err!("Expected dictionary page"));
-        };
-        if self.dictionary.is_some()
-            || !matches!(encoding, Encoding::PLAIN | Encoding::PLAIN_DICTIONARY)
-        {
-            return Err(general_err!("Unexpected dictionary page or encoding"));
+    fn install_dictionary(&mut self, page: &Page) -> Result<()> {
+        if self.dictionary.is_some() {
+            return Err(general_err!("Unexpected dictionary page"));
         }
-        let entries = num_values as usize;
-        if entries > buf.len() / size_of::<A::Native>() {
-            return Err(general_err!("Incomplete primitive dictionary"));
-        }
-        let values = if cfg!(target_endian = "little")
-            && buf.as_ptr().align_offset(align_of::<A::Native>()) == 0
-        {
-            PrimitiveArray::<A>::new(ScalarBuffer::new(Buffer::from(buf), 0, entries), None)
-        } else {
-            self.decode_values(Encoding::PLAIN, buf, entries, None)?
-        };
-        let values = Arc::new(values);
-        self.dictionary = Some(ChunkDictionary { values, entries });
+        let dictionary = ChunkDictionary::new::<P, A>(page)?;
+        self.dictionary = Some(dictionary);
         Ok(())
     }
 
     /// Reads the next data page, loading the chunk dictionary at most once.
     pub fn next_page(&mut self) -> Result<Option<CodeColumnPage<A>>> {
-        let nullable = self.descr.max_def_level() != 0;
-        let (data, rows, encoding, levels, level_encoding, non_null) = loop {
+        let page = loop {
             match self.reader.get_next_page()? {
                 None => return Ok(None),
-                Some(page @ Page::DictionaryPage { .. }) => self.install_dictionary(page)?,
-                Some(Page::DataPage {
-                    buf,
-                    num_values,
-                    encoding,
-                    def_level_encoding,
-                    ..
-                }) => {
-                    let (offset, levels) = if nullable {
-                        let (offset, levels) =
-                            parse_v1_level(1, num_values, def_level_encoding, buf.clone())?;
-                        (offset, Some(levels))
-                    } else {
-                        (0, None)
-                    };
-                    break (
-                        buf.slice(offset..),
-                        num_values as usize,
-                        encoding,
-                        levels,
-                        def_level_encoding,
-                        None,
-                    );
-                }
-                Some(Page::DataPageV2 {
-                    buf,
-                    num_values,
-                    encoding,
-                    num_nulls,
-                    num_rows,
-                    def_levels_byte_len,
-                    rep_levels_byte_len,
-                    ..
-                }) => {
-                    // Flat columns have exactly one level slot per row.
-                    // See DataPageHeaderV2 in the Parquet Thrift specification.
-                    if num_rows != num_values {
-                        return Err(general_err!("Flat DataPage V2 row/value counts differ"));
-                    }
-                    let len = def_levels_byte_len as usize;
-                    if rep_levels_byte_len != 0
-                        || len > buf.len()
-                        || num_nulls > num_values
-                        || (!nullable && (len != 0 || num_nulls != 0))
-                    {
-                        return Err(general_err!("Invalid flat DataPage V2 levels"));
-                    }
-                    break (
-                        buf.slice(len..),
-                        num_values as usize,
-                        encoding,
-                        nullable.then(|| buf.slice(..len)),
-                        Encoding::RLE,
-                        Some((num_values - num_nulls) as usize),
-                    );
-                }
+                Some(page) if page.is_dictionary_page() => self.install_dictionary(&page)?,
+                Some(page) => break page,
             }
         };
+        let flat = FlatDataPage::new(&page, self.descr.max_def_level() != 0)?;
+        let encoding = flat.encoding;
         if matches!(
             encoding,
             Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
@@ -553,39 +590,30 @@ where
             if self.dictionary.is_none()
                 && let Some(page) = self.reader.take_deferred_dictionary()?
             {
-                self.install_dictionary(page)?;
+                self.install_dictionary(&page)?;
             }
             let dictionary = self
                 .dictionary
                 .clone()
                 .ok_or_else(|| general_err!("Missing column chunk dictionary"))?;
-            if level_encoding == Encoding::RLE || levels.is_none() {
-                let values = non_null.or_else(|| levels.is_none().then_some(rows));
-                let page = DictionaryCodePage {
-                    dictionary,
-                    rows,
-                    values,
-                    levels,
-                    indices: data,
-                };
-                // Check the encoding width now. For V1 optional pages, an
-                // empty payload is only known to be valid after reading levels.
-                page.indices_with_count(values.unwrap_or(0))?;
-                return Ok(Some(CodeColumnPage::Dictionary(page)));
+            if flat.has_hybrid_levels() {
+                return Ok(Some(CodeColumnPage::Dictionary(
+                    flat.into_dictionary(dictionary)?,
+                )));
             }
             // The legacy BIT_PACKED level encoding falls back to value space.
-            let (levels, count) = decode_levels(levels, level_encoding, rows)?;
+            let (levels, count) = decode_levels(flat.levels, flat.level_encoding, flat.rows)?;
             let page = DictionaryCodePage {
                 dictionary,
-                rows,
+                rows: flat.rows,
                 values: Some(count),
                 levels: None,
-                indices: data,
+                indices: flat.data,
             };
             let keys = page.indices()?.selected_keys(0..count)?;
             let dictionary = page
                 .dictionary
-                .values
+                .values()
                 .as_any()
                 .downcast_ref::<PrimitiveArray<A>>()
                 .unwrap();
@@ -595,13 +623,13 @@ where
                 values: with_levels(values, levels),
             }));
         }
-        let (levels, count) = decode_levels(levels, level_encoding, rows)?;
-        if non_null.is_some_and(|values| values != count) {
+        let (levels, count) = decode_levels(flat.levels, flat.level_encoding, flat.rows)?;
+        if flat.non_null.is_some_and(|values| values != count) {
             return Err(general_err!(
                 "Definition level count disagrees with DataPage V2"
             ));
         }
-        let values = self.decode_values(encoding, data, count, levels)?;
+        let values = self.decode_values(encoding, flat.data, count, levels)?;
         Ok(Some(CodeColumnPage::Values { encoding, values }))
     }
 
@@ -625,6 +653,141 @@ where
         }
         Ok(with_levels(values.into_iter(), levels))
     }
+}
+
+pub(crate) struct FlatDataPage {
+    pub(crate) data: Bytes,
+    pub(crate) rows: usize,
+    pub(crate) encoding: Encoding,
+    levels: Option<Bytes>,
+    level_encoding: Encoding,
+    non_null: Option<usize>,
+}
+
+impl FlatDataPage {
+    pub(crate) fn new(page: &Page, nullable: bool) -> Result<Self> {
+        match page {
+            Page::DataPage {
+                buf,
+                num_values,
+                encoding,
+                def_level_encoding,
+                ..
+            } => {
+                let (offset, levels) = if nullable {
+                    let (offset, levels) =
+                        parse_v1_level(1, *num_values, *def_level_encoding, buf.clone())?;
+                    (offset, Some(levels))
+                } else {
+                    (0, None)
+                };
+                Ok(Self {
+                    data: buf.slice(offset..),
+                    rows: *num_values as usize,
+                    encoding: *encoding,
+                    levels,
+                    level_encoding: *def_level_encoding,
+                    non_null: None,
+                })
+            }
+            Page::DataPageV2 {
+                buf,
+                num_values,
+                encoding,
+                num_nulls,
+                num_rows,
+                def_levels_byte_len,
+                rep_levels_byte_len,
+                ..
+            } => {
+                if num_rows != num_values {
+                    return Err(general_err!("Flat DataPage V2 row/value counts differ"));
+                }
+                let len = *def_levels_byte_len as usize;
+                if *rep_levels_byte_len != 0
+                    || len > buf.len()
+                    || num_nulls > num_values
+                    || (!nullable && (len != 0 || *num_nulls != 0))
+                {
+                    return Err(general_err!("Invalid flat DataPage V2 levels"));
+                }
+                Ok(Self {
+                    data: buf.slice(len..),
+                    rows: *num_rows as usize,
+                    encoding: *encoding,
+                    levels: nullable.then(|| buf.slice(..len)),
+                    level_encoding: Encoding::RLE,
+                    non_null: Some((num_values - num_nulls) as usize),
+                })
+            }
+            Page::DictionaryPage { .. } => Err(general_err!("Expected data page")),
+        }
+    }
+
+    pub(crate) fn has_hybrid_levels(&self) -> bool {
+        self.levels.is_none() || self.level_encoding == Encoding::RLE
+    }
+
+    pub(crate) fn into_dictionary(self, dictionary: ChunkDictionary) -> Result<DictionaryCodePage> {
+        let values = self
+            .non_null
+            .or_else(|| self.levels.is_none().then_some(self.rows));
+        let page = DictionaryCodePage {
+            dictionary,
+            rows: self.rows,
+            values,
+            levels: self.levels,
+            indices: self.data,
+        };
+        // For optional V1 pages, an empty payload is valid when all rows are null.
+        page.indices_with_count(values.unwrap_or(0))?;
+        Ok(page)
+    }
+
+    pub(crate) fn validity(&self, out: &mut Vec<u64>) -> Result<usize> {
+        let count = if self.has_hybrid_levels() {
+            flat_validity(self.rows, self.levels.as_ref(), out)?
+        } else {
+            let (levels, count) =
+                decode_levels(self.levels.clone(), self.level_encoding, self.rows)?;
+            out.clear();
+            out.resize(self.rows.div_ceil(64), 0);
+            for (row, level) in levels.unwrap().into_iter().enumerate() {
+                out[row / 64] |= u64::from(level == 1) << (row % 64);
+            }
+            count
+        };
+        if self.non_null.is_some_and(|expected| count != expected) {
+            return Err(general_err!(
+                "Definition level count disagrees with DataPage V2"
+            ));
+        }
+        Ok(count)
+    }
+}
+
+#[inline(always)]
+fn flat_validity(rows: usize, levels: Option<&Bytes>, out: &mut Vec<u64>) -> Result<usize> {
+    let Some(levels) = levels else {
+        out.clear();
+        out.resize(rows.div_ceil(64), u64::MAX);
+        if let Some(last) = out.last_mut() {
+            *last = low_mask((rows - 1) % 64 + 1);
+        }
+        return Ok(rows);
+    };
+    let mut cursor = CodeCursor::new(1, levels, rows, 2)?;
+    cursor.prepare_bitmap(out)?;
+    let mut sink = ValidityWriter {
+        writer: WordWriter::new(out),
+        tail: padded_tail(levels),
+    };
+    cursor.drain_padded(&mut sink)?;
+    sink.writer.finish();
+    // Packed loads are masked to their runs, so bits past the last row
+    // are zero.
+    let count = out.iter().map(|word| word.count_ones() as usize).sum();
+    Ok(count)
 }
 
 fn decode_levels(
@@ -678,6 +841,31 @@ fn with_levels<A: ArrowPrimitiveType>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selected_gather_reads_unaligned_dictionary_bytes() {
+        let mut storage = vec![0];
+        storage.extend((-48i32..48).flat_map(i32::to_le_bytes));
+        let page = Page::DictionaryPage {
+            buf: Bytes::from(storage).slice(1..),
+            num_values: 96,
+            encoding: Encoding::PLAIN,
+            is_sorted: false,
+        };
+        let dictionary = ChunkDictionary::new_native(&page, Type::INT32).unwrap();
+        let mut values = vec![123];
+        dictionary.gather(&[0, 95, 0], &mut values).unwrap();
+        assert_eq!(values, [123i32, -48, 47, -48]);
+        assert!(dictionary.values.get().is_none());
+
+        // A dense gather may install an owned dictionary. It has the same
+        // ordering, including duplicates, as the unaligned byte gather.
+        let mut dense = Vec::<i32>::new();
+        dictionary.gather(&[95; 8], &mut dense).unwrap();
+        assert_eq!(dense, [47i32; 8]);
+        assert!(dictionary.gather(&[96], &mut dense).is_err());
+        assert!(dictionary.gather(&[0], &mut Vec::<i64>::new()).is_err());
+    }
+
     use crate::column::reader::ColumnReaderImpl;
     use crate::data_type::Int32Type;
     use crate::encodings::rle::RleEncoder;
