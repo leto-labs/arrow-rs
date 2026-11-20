@@ -465,6 +465,7 @@ impl<'a> CodeCursor<'a> {
             out,
             offset: start,
             tail: padded_tail(self.data),
+            sparse: ranks.len().saturating_mul(32) <= end.saturating_sub(start),
         };
         sink.out.reserve(ranks.len());
         self.drain_impl::<_, false>(&mut sink, count - end)?;
@@ -526,6 +527,7 @@ struct RankSink<'a> {
     out: &'a mut Vec<u32>,
     offset: usize,
     tail: [u8; 16],
+    sparse: bool,
 }
 
 impl RunSink for RankSink<'_> {
@@ -553,7 +555,15 @@ impl RunSink for RankSink<'_> {
         if self.ranks.first().is_none_or(|&rank| rank as usize >= end) {
             return;
         }
-        let count = self.ranks.partition_point(|&rank| (rank as usize) < end);
+        // A sparse run usually needs only the front of the selection.
+        // The seventeenth rank proves whether the rest can be excluded.
+        let search = if self.sparse && self.ranks.get(16).is_some_and(|&rank| rank as usize >= end)
+        {
+            &self.ranks[..16]
+        } else {
+            self.ranks
+        };
+        let count = search.partition_point(|&rank| (rank as usize) < end);
         let (ranks, remaining) = self.ranks.split_at(count);
         let mask = low_mask(usize::from(width));
         self.out.extend(ranks.iter().map(|&rank| {
@@ -825,6 +835,24 @@ mod tests {
                 );
                 start = end;
             }
+        }
+    }
+
+    #[test]
+    fn selected_sparse_runs_keep_the_first_rank_of_the_following_run() {
+        let values = (0..1024u64).collect::<Vec<_>>();
+        let mut encoder = RleEncoder::new(10, 0);
+        encoder.put_batch(&values);
+        let bytes = encoder.consume();
+
+        for first_run_hits in [0, 15, 16, 17] {
+            let ranks = (0..first_run_hits)
+                .chain([512, 513, 1023])
+                .collect::<Vec<_>>();
+            let mut cursor = CodeCursor::new(10, &bytes, values.len(), 1024).unwrap();
+            let mut codes = Vec::new();
+            cursor.codes_at(&ranks, &mut codes).unwrap();
+            assert_eq!(codes, ranks, "first_run_hits={first_run_hits}");
         }
     }
 
