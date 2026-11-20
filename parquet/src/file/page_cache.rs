@@ -113,8 +113,12 @@ pub struct CachedValidity {
 pub type PageWithValidity = (Page, Option<Arc<CachedValidity>>);
 
 impl CachedValidity {
+    fn charge(bitmap_bytes: usize) -> usize {
+        bitmap_bytes + std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>()
+    }
+
     fn buffer_len(&self) -> usize {
-        self.bits.len() + std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>()
+        Self::charge(self.bits.len())
     }
 }
 
@@ -144,18 +148,44 @@ impl CachedPage {
         }
     }
 
-    #[cfg(feature = "arrow")]
-    pub(crate) fn with_flat_validity(mut self, flat_nullable: bool) -> Self {
-        if flat_nullable {
-            self.validity =
-                crate::arrow::record_reader::definition_levels::cache_validity(&self.page)
-                    .map(Arc::new);
+    /// Offers the page to a fill ticket, with optional flat nullable validity.
+    #[doc(hidden)]
+    pub fn publish(self, fill: Box<dyn PageFill>, flat_nullable: bool) {
+        #[cfg(feature = "arrow")]
+        if flat_nullable && let Some(bytes) = self.validity_build_charge() {
+            return fill.complete_with_validity(self, bytes, Self::build_validity);
         }
-        self
+        let _ = flat_nullable;
+        fill.complete(self);
     }
 
-    #[cfg(not(feature = "arrow"))]
-    pub(crate) fn with_flat_validity(self, _flat_nullable: bool) -> Self {
+    #[cfg(feature = "arrow")]
+    fn validity_build_charge(&self) -> Option<usize> {
+        // Bound work and temporary memory even when the cache has ample room.
+        const MAX_BITMAP_BYTES: usize = 1024 * 1024;
+        match &self.page {
+            Page::DataPage {
+                def_level_encoding: crate::basic::Encoding::RLE,
+                ..
+            }
+            | Page::DataPageV2 {
+                rep_levels_byte_len: 0,
+                ..
+            } => {}
+            _ => return None,
+        }
+        let bitmap_bytes = (self.page.num_values() as usize).div_ceil(8);
+        (bitmap_bytes <= MAX_BITMAP_BYTES).then(|| {
+            // The builder holds the bitmap and eight bytes of word-store slack,
+            // rounded up by MutableBuffer. Its allocation overlaps the copy.
+            CachedValidity::charge(bitmap_bytes) + (bitmap_bytes + 8).next_multiple_of(64)
+        })
+    }
+
+    #[cfg(feature = "arrow")]
+    fn build_validity(mut self) -> Self {
+        self.validity = crate::arrow::record_reader::definition_levels::cache_validity(&self.page)
+            .map(Arc::new);
         self
     }
 
@@ -247,6 +277,20 @@ pub enum PageLookup {
 pub trait PageFill: Send {
     /// Offers the decoded page to the cache. The cache may refuse it.
     fn complete(self: Box<Self>, page: CachedPage);
+
+    /// Offers a page with optional validity. Invoke `build` only after
+    /// admitting the page plus `extra_bytes`, which covers temporary and
+    /// retained bitmap allocations. Charge the returned page's actual size
+    /// for residency. A cache that declines the extra bytes can keep the
+    /// encoded page.
+    fn complete_with_validity(
+        self: Box<Self>,
+        page: CachedPage,
+        _extra_bytes: usize,
+        _build: fn(CachedPage) -> CachedPage,
+    ) {
+        self.complete(page);
+    }
 }
 
 /// The engine's side of a [`PageLease`]: it unpins the leased pages and
@@ -673,6 +717,18 @@ pub(crate) mod testing {
             self.fills.fetch_add(1, Ordering::Relaxed);
             self.pages.lock().unwrap().insert(self.offset, page);
         }
+
+        fn complete_with_validity(
+            self: Box<Self>,
+            page: CachedPage,
+            extra_bytes: usize,
+            build: fn(CachedPage) -> CachedPage,
+        ) {
+            // Test fixtures permit bounded builds. Fail before allocating if
+            // an oversized page ever makes it past the preflight.
+            assert!(extra_bytes < 3 * 1024 * 1024);
+            self.complete(build(page));
+        }
     }
 
     struct Release {
@@ -805,5 +861,75 @@ pub(crate) mod testing {
                 })),
             ))
         }
+    }
+}
+
+#[cfg(all(test, feature = "arrow"))]
+mod validity_admission_tests {
+    use super::*;
+    use crate::basic::Encoding;
+    use crate::util::bit_util::BitWriter;
+
+    #[test]
+    fn oversized_validity_is_not_built() {
+        // Fit millions of NULL levels into one short run.
+        let levels = i32::MAX as u32;
+        let mut run = BitWriter::new(8);
+        run.put_vlq_int(u64::from(levels) * 2);
+        run.put_value(0, 8);
+        let run = run.consume();
+        let mut buf = (run.len() as u32).to_le_bytes().to_vec();
+        buf.extend_from_slice(&run);
+        let page = CachedPage::new(
+            Page::DataPage {
+                buf: buf.into(),
+                num_values: levels,
+                encoding: Encoding::PLAIN,
+                def_level_encoding: Encoding::RLE,
+                rep_level_encoding: Encoding::RLE,
+                statistics: None,
+            },
+            1,
+            Compression::SNAPPY,
+        );
+        let encoded_len = page.buffer_len();
+        use crate::column::reader::ColumnReaderImpl;
+        use crate::data_type::Int32Type;
+        use crate::schema::types::{ColumnDescriptor, ColumnPath, Type};
+        use crate::util::test_common::page_util::InMemoryPageReader;
+
+        let cache = testing::MapPageCache::with_leases();
+        let PageLookup::Miss(Some(ticket)) = cache.get(0, true) else {
+            panic!("expected fill ticket");
+        };
+        page.publish(ticket, true);
+        let cached = cache.probe(0).unwrap();
+        assert_eq!(cached.buffer_len(), encoded_len);
+
+        let desc = Arc::new(ColumnDescriptor::new(
+            Arc::new(
+                Type::primitive_type_builder("i", crate::basic::Type::INT32)
+                    .with_repetition(crate::basic::Repetition::OPTIONAL)
+                    .build()
+                    .unwrap(),
+            ),
+            1,
+            0,
+            ColumnPath::from("i"),
+        ));
+        let mut reader = ColumnReaderImpl::<Int32Type>::new(
+            desc,
+            Box::new(InMemoryPageReader::new(vec![cached.page().clone()])),
+        );
+        let mut values = Vec::new();
+        let mut levels = Vec::new();
+        assert_eq!(
+            reader
+                .read_records(17, Some(&mut levels), None, &mut values)
+                .unwrap(),
+            (17, 0, 17)
+        );
+        assert_eq!(levels, vec![0; 17]);
+        assert!(values.is_empty());
     }
 }

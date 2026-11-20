@@ -240,17 +240,12 @@ pub(crate) fn cache_validity(page: &Page) -> Option<CachedValidity> {
 
     let mut decoder = PackedDecoder::new();
     decoder.set_data(Encoding::RLE, data);
-    // A short or malformed stream must not allocate from its declared count.
-    const CHUNK: usize = 65_536;
-    let mut bitmap = BooleanBufferBuilder::new(len.min(CHUNK));
-    let mut valid = 0;
-    while bitmap.len() < len {
-        let n = (len - bitmap.len()).min(CHUNK);
-        let (read, count) = decoder.read(&mut bitmap, n).ok()?;
-        if read != n {
-            return None;
-        }
-        valid += count;
+    // The fill ticket already admitted this allocation and the retained copy.
+    // PackedDecoder writes complete words and needs eight bytes past the end.
+    let mut bitmap = BooleanBufferBuilder::new(len + 64);
+    let (read, valid) = decoder.read(&mut bitmap, len).ok()?;
+    if read != len {
+        return None;
     }
     let nulls = len - valid;
     if header_nulls.is_some_and(|count| count != nulls) {
@@ -917,6 +912,81 @@ mod tests {
             }
             assert!(bits[pos.div_ceil(8) + 8..].iter().all(|&b| b == 0));
         }
+    }
+
+    #[test]
+    fn independent_cached_validity_unaligned_skip_matrix() {
+        let mut saw_unaligned_copy = false;
+        for len in [1, 7, 8, 9, 63, 64, 65, 193, 65_541] {
+            for pattern in 0..3 {
+                let bits: Vec<_> = (0..len)
+                    .map(|i| match pattern {
+                        0 => false,
+                        1 => true,
+                        _ => i % 11 < 4 || i % 23 == 0,
+                    })
+                    .collect();
+                let mut encoder = RleEncoder::new(1, len);
+                for &bit in &bits {
+                    encoder.put(bit as u64);
+                }
+                let data = Bytes::from(encoder.consume());
+                let mut body = (data.len() as u32).to_le_bytes().to_vec();
+                body.extend_from_slice(&data);
+                let page = Page::DataPage {
+                    buf: Bytes::from(body),
+                    num_values: len as u32,
+                    encoding: Encoding::PLAIN,
+                    def_level_encoding: Encoding::RLE,
+                    rep_level_encoding: Encoding::RLE,
+                    statistics: None,
+                };
+                let validity = Arc::new(cache_validity(&page).unwrap());
+                for prefix in 0..8 {
+                    for skip in [0, 1, 3, 7, 9, len / 2] {
+                        let mut cursor = ValidityCursor {
+                            data: validity.clone(),
+                            offset: 0,
+                            remaining_valid: len - validity.nulls,
+                        };
+                        let mut expected = vec![true; prefix];
+                        let mut output = BooleanBufferBuilder::new(0);
+                        output.append_n(prefix, true);
+                        let mut offset = 0;
+                        for (count, read) in [
+                            (skip, false),
+                            (17, true),
+                            (9, false),
+                            (19, true),
+                            (len + 5, true),
+                            (5, false),
+                        ] {
+                            let end = (offset + count).min(len);
+                            let range = &bits[offset..end];
+                            let ones = range.iter().filter(|&&bit| bit).count();
+                            if read {
+                                saw_unaligned_copy |= offset % 8 != 0
+                                    && output.len() % 8 != 0
+                                    && ones > 0
+                                    && ones < range.len();
+                                expected.extend_from_slice(range);
+                            }
+                            assert_eq!(
+                                cursor.consume(count, read.then_some(&mut output)),
+                                (ones, range.len()),
+                                "len={len} pattern={pattern} prefix={prefix} skip={skip} offset={offset}",
+                            );
+                            offset = end;
+                        }
+                        assert_eq!(output.len(), expected.len());
+                        for (i, bit) in expected.into_iter().enumerate() {
+                            assert_eq!(output.get_bit(i), bit, "len={len} bit={i}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(saw_unaligned_copy);
     }
 
     #[test]

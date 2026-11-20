@@ -814,10 +814,7 @@ fn publish_page(
             }
         } else if let Some(fill) = fill {
             if let Some(stored) = chunk.data_page(&page, owns_buffer) {
-                fill.complete(
-                    CachedPage::new(stored.clone(), stored_len, codec)
-                        .with_flat_validity(flat_nullable),
-                );
+                CachedPage::new(stored.clone(), stored_len, codec).publish(fill, flat_nullable);
                 return stored;
             }
             return page;
@@ -826,9 +823,7 @@ fn publish_page(
     if let Some(fill) = fill
         && owns_buffer
     {
-        fill.complete(
-            CachedPage::new(page.clone(), stored_len, codec).with_flat_validity(flat_nullable),
-        );
+        CachedPage::new(page.clone(), stored_len, codec).publish(fill, flat_nullable);
     }
     page
 }
