@@ -35,7 +35,7 @@ in `third_party/README.md` and `docs/UPSTREAM_MATRIX.toml`.
 
 | Family | Purpose in this stack | Dependent feature | Classification |
 |---|---|---|---|
-| DCX | Borrow validated hybrid runs and extract selected dictionary indices | DICTIONARY-CODE-EXECUTION | UPSTREAMABLE |
+| DCX | Read flat primitive chunk dictionaries, borrowed hybrid runs and selected nullable keys | DICTIONARY-CODE-EXECUTION | UPSTREAMABLE |
 | DPC | Hook decompressed page caching and atomic page leases into PageIndexProvider and shared fetch planning | SCAN-PAGE-CACHE | UPSTREAMABLE |
 | DRL | Decode dictionary runs and definition levels with register cursors, SIMD lookup and in-place NULL expansion | NATIVE-PARQUET-DECODE | UPSTREAMABLE |
 | FUG | Fuse primitive dictionary unpack and gather with runtime AVX2 and AVX-512 dispatch | NATIVE-PARQUET-DECODE | UPSTREAMABLE |

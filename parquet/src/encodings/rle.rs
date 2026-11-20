@@ -411,7 +411,7 @@ impl RleEncoder {
     }
 }
 
-#[cfg(any(feature = "experimental", test))]
+#[cfg(any(feature = "arrow", feature = "experimental", test))]
 pub mod codes;
 mod fused;
 mod runs;
