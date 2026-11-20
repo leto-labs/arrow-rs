@@ -34,9 +34,7 @@ use super::{ColumnLevelDecoder, DefinitionLevelDecoder, DefinitionLevelDecoderIm
 use crate::basic::Encoding;
 use crate::column::page::{Page, PageReader};
 use crate::data_type::DataType;
-use crate::encodings::rle::codes::{
-    CodeCursor, CodeRun, RunSink, VerdictTable, WordWriter, low_mask,
-};
+use crate::encodings::rle::codes::{CodeCursor, CodeRun, RunSink, VerdictTable, low_mask};
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 
@@ -104,15 +102,46 @@ impl RunSink for LevelCount {
 }
 
 struct ValidityWriter<'a> {
-    writer: WordWriter<'a>,
-    valid: usize,
+    words: &'a mut [u64],
+    position: usize,
+    nulls: usize,
+}
+
+impl ValidityWriter<'_> {
+    #[inline]
+    fn clear_bits(&mut self, bits: u64, len: usize) {
+        if bits != 0 {
+            let word = self.position / 64;
+            let shift = self.position % 64;
+            self.words[word] &= !(bits << shift);
+            if len > 64 - shift {
+                self.words[word + 1] &= !(bits >> (64 - shift));
+            }
+            self.nulls += bits.count_ones() as usize;
+        }
+        self.position += len;
+    }
 }
 
 impl RunSink for ValidityWriter<'_> {
     #[inline]
     fn repeated(&mut self, code: u32, len: usize) {
-        self.writer.repeat(code == 1, len);
-        self.valid += code as usize * len;
+        let end = self.position + len;
+        if code == 0 {
+            let first = self.position / 64;
+            let last = (end - 1) / 64;
+            let head = u64::MAX << (self.position % 64);
+            let tail = low_mask((end - 1) % 64 + 1);
+            if first == last {
+                self.words[first] &= !(head & tail);
+            } else {
+                self.words[first] &= !head;
+                self.words[first + 1..last].fill(0);
+                self.words[last] &= !tail;
+            }
+            self.nulls += len;
+        }
+        self.position = end;
     }
 
     #[inline]
@@ -122,18 +151,16 @@ impl RunSink for ValidityWriter<'_> {
         let mut remaining = len;
         for chunk in &mut chunks {
             let count = remaining.min(64);
-            let word = u64::from_le_bytes(chunk.try_into().unwrap()) & low_mask(count);
-            self.valid += word.count_ones() as usize;
-            self.writer.write(word, count);
+            let word = u64::from_le_bytes(chunk.try_into().unwrap());
+            self.clear_bits(!word & low_mask(count), count);
             remaining -= count;
         }
         if remaining != 0 {
             let mut tail = [0; 8];
             let tail_len = chunks.remainder().len();
             tail[..tail_len].copy_from_slice(chunks.remainder());
-            let word = u64::from_le_bytes(tail) & low_mask(remaining);
-            self.valid += word.count_ones() as usize;
-            self.writer.write(word, remaining);
+            let word = u64::from_le_bytes(tail);
+            self.clear_bits(!word & low_mask(remaining), remaining);
         }
     }
 }
@@ -204,19 +231,21 @@ impl DictionaryCodePage {
     /// Word bits are in row order, starting at the least significant bit.
     pub fn validity(&self, out: &mut Vec<u64>) -> Result<usize> {
         out.clear();
-        out.resize(self.rows.div_ceil(64), 0);
+        out.resize(self.rows.div_ceil(64), u64::MAX);
+        if let Some(last) = out.last_mut() {
+            *last = low_mask((self.rows - 1) % 64 + 1);
+        }
         let mut sink = ValidityWriter {
-            writer: WordWriter::new(out),
-            valid: 0,
+            words: out,
+            position: 0,
+            nulls: 0,
         };
         if let Some(mut levels) = self.levels() {
             levels.drain(&mut sink)?;
-            self.check_count(sink.valid)?;
-        } else if self.rows != 0 {
-            sink.repeated(1, self.rows);
         }
-        sink.writer.finish();
-        Ok(sink.valid)
+        let count = self.rows - sink.nulls;
+        self.check_count(count)?;
+        Ok(count)
     }
 
     /// Evaluates the dictionary verdict into a row bitmap with nulls cleared.

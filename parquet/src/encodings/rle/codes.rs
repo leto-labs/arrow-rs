@@ -188,7 +188,23 @@ impl<'a> CodeCursor<'a> {
         if self.failed {
             return Err(general_err!("Invalid code stream"));
         }
+        let width = usize::from(self.width);
+        let repeated_bytes = width.div_ceil(8);
+        let repeated_mask = low_mask(repeated_bytes * 8);
+        let code_limit = self.code_limit.min(1u64 << width);
         while self.remaining != 0 {
+            if let Some(bytes) = self.data.first_chunk::<8>() {
+                let word = u64::from_le_bytes(*bytes);
+                let header = word as u8;
+                let len = usize::from(header >> 1);
+                let code = (word >> 8) & repeated_mask;
+                if header & 0x81 == 0 && len != 0 && len <= self.remaining && code < code_limit {
+                    self.data = &self.data[1 + repeated_bytes..];
+                    self.remaining -= len;
+                    sink.repeated(code as u32, len);
+                    continue;
+                }
+            }
             match self.read_run::<CHECK_PACKED>() {
                 Ok(CodeRun::Repeated { code, len }) => sink.repeated(code, len),
                 Ok(CodeRun::Packed { width, bytes, len }) => sink.packed(width, bytes, len),
@@ -205,26 +221,6 @@ impl<'a> CodeCursor<'a> {
     fn read_run<const CHECK_PACKED: bool>(&mut self) -> Result<CodeRun<'a>> {
         let width = usize::from(self.width);
         let repeated_bytes = width.div_ceil(8);
-        if let Some(word) = self
-            .data
-            .first_chunk::<8>()
-            .copied()
-            .map(u64::from_le_bytes)
-        {
-            let header = word as u8;
-            if header & 0x81 == 0 && header != 0 {
-                let len = usize::from(header >> 1);
-                let code = (word >> 8) & low_mask(repeated_bytes * 8);
-                if len <= self.remaining && code < self.code_limit.min(1u64 << width) {
-                    self.data = &self.data[1 + repeated_bytes..];
-                    self.remaining -= len;
-                    return Ok(CodeRun::Repeated {
-                        code: code as u32,
-                        len,
-                    });
-                }
-            }
-        }
         let (indicator, offset) =
             runs::header(self.data, 0).ok_or_else(|| general_err!("Incomplete code run header"))?;
         if offset == 10 && self.data[9] > 1 {
