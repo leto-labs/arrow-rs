@@ -71,7 +71,9 @@ packed codes in the lookup table through width 20 and tracks the maximum
 code at wider widths. It reads the packed page with unaligned little-endian
 loads and saves the final bytes once for padded loads at the boundary.
 The flat page builds its validity words once per verdict call, checks a V2
-declared count, then expands dense verdicts to row positions. Errors invalidate
+declared count, then expands dense verdicts to row positions. The validity
+sink starts with all rows valid and writes only null ranges. On the AVX-512
+tier with BMI2 and POPCNT, row expansion uses hardware bit deposit. Errors invalidate
 the caller's scratch output. The count-only push checkpoint measured
 10.51 user cycles per input row across the three columns on CPU 24.
 

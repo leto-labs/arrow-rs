@@ -188,7 +188,23 @@ impl<'a> CodeCursor<'a> {
         if self.failed {
             return Err(general_err!("Invalid code stream"));
         }
+        let width = usize::from(self.width);
+        let repeated_bytes = width.div_ceil(8);
+        let repeated_mask = low_mask(repeated_bytes * 8);
+        let code_limit = self.code_limit.min(1u64 << width);
         while self.remaining != 0 {
+            if let Some(bytes) = self.data.first_chunk::<8>() {
+                let word = u64::from_le_bytes(*bytes);
+                let header = word as u8;
+                let len = usize::from(header >> 1);
+                let code = (word >> 8) & repeated_mask;
+                if header & 0x81 == 0 && len != 0 && len <= self.remaining && code < code_limit {
+                    self.data = &self.data[1 + repeated_bytes..];
+                    self.remaining -= len;
+                    sink.repeated(code as u32, len);
+                    continue;
+                }
+            }
             match self.read_run::<CHECK_PACKED>() {
                 Ok(CodeRun::Repeated { code, len }) => sink.repeated(code, len),
                 Ok(CodeRun::Packed { width, bytes, len }) => sink.packed(width, bytes, len),
@@ -205,26 +221,6 @@ impl<'a> CodeCursor<'a> {
     fn read_run<const CHECK_PACKED: bool>(&mut self) -> Result<CodeRun<'a>> {
         let width = usize::from(self.width);
         let repeated_bytes = width.div_ceil(8);
-        if let Some(word) = self
-            .data
-            .first_chunk::<8>()
-            .copied()
-            .map(u64::from_le_bytes)
-        {
-            let header = word as u8;
-            if header & 0x81 == 0 && header != 0 {
-                let len = usize::from(header >> 1);
-                let code = (word >> 8) & low_mask(repeated_bytes * 8);
-                if len <= self.remaining && code < self.code_limit.min(1u64 << width) {
-                    self.data = &self.data[1 + repeated_bytes..];
-                    self.remaining -= len;
-                    return Ok(CodeRun::Repeated {
-                        code: code as u32,
-                        len,
-                    });
-                }
-            }
-        }
         let (indicator, offset) =
             runs::header(self.data, 0).ok_or_else(|| general_err!("Incomplete code run header"))?;
         if offset == 10 && self.data[9] > 1 {
@@ -315,6 +311,7 @@ impl<'a> CodeCursor<'a> {
             self.failed = true;
             return Err(invalid_packed_code());
         }
+        sink.writer.finish();
         Ok(())
     }
 
@@ -458,32 +455,46 @@ pub(crate) fn low_mask(bits: usize) -> u64 {
     u64::MAX.checked_shr((64 - bits) as u32).unwrap_or(0)
 }
 
-/// Writes least-significant-bit-first to pre-zeroed words.
+/// Appends bits in row order, holding the partial word until it is complete.
 pub(crate) struct WordWriter<'a> {
     words: &'a mut [u64],
-    position: usize,
+    index: usize,
+    pending: u64,
+    filled: usize,
 }
 
 impl<'a> WordWriter<'a> {
     pub(crate) fn new(words: &'a mut [u64]) -> Self {
-        Self { words, position: 0 }
-    }
-
-    #[inline]
-    pub(crate) fn write(&mut self, bits: u64, len: usize) {
-        let word = self.position / 64;
-        let shift = self.position % 64;
-        self.words[word] |= bits << shift;
-        if len > 64 - shift {
-            self.words[word + 1] |= bits >> (64 - shift);
+        Self {
+            words,
+            index: 0,
+            pending: 0,
+            filled: 0,
         }
-        self.position += len;
     }
 
-    #[inline]
+    #[inline(always)]
+    pub(crate) fn write(&mut self, bits: u64, len: usize) {
+        let end = self.filled + len;
+        self.pending |= bits << self.filled;
+        if end >= 64 {
+            self.words[self.index] = self.pending;
+            self.index += 1;
+            self.pending = (bits >> 1) >> (63 - self.filled);
+        }
+        self.filled = end % 64;
+    }
+
+    #[inline(always)]
     pub(crate) fn repeat(&mut self, bit: bool, mut len: usize) {
         if !bit {
-            self.position += len;
+            let end = self.filled + len;
+            if end >= 64 {
+                self.words[self.index] = self.pending;
+                self.index += end / 64;
+                self.pending = 0;
+            }
+            self.filled = end % 64;
             return;
         }
         while len > 64 {
@@ -491,6 +502,13 @@ impl<'a> WordWriter<'a> {
             len -= 64;
         }
         self.write(low_mask(len), len);
+    }
+
+    #[inline]
+    pub(crate) fn finish(self) {
+        if self.filled != 0 {
+            self.words[self.index] = self.pending;
+        }
     }
 }
 
