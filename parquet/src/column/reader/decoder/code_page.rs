@@ -113,7 +113,7 @@ impl ChunkDictionary {
             let values = self.values().to_data();
             return gather_plain(values.buffers()[0].as_slice(), self.entries, codes, out);
         }
-        gather_plain(&self.plain, self.entries, codes, out)
+        gather_fixed_width::<T, true>(&self.plain, self.entries, codes, out)
     }
 
     /// Builds a reusable verdict table in this chunk's dictionary order.
@@ -158,6 +158,16 @@ pub(crate) fn gather_plain<T: ParquetValueType>(
     ranks: &[u32],
     out: &mut Vec<T>,
 ) -> Result<()> {
+    gather_fixed_width::<T, false>(bytes, entries, ranks, out)
+}
+
+#[inline]
+fn gather_fixed_width<T: ParquetValueType, const PREFETCH: bool>(
+    bytes: &[u8],
+    entries: usize,
+    ranks: &[u32],
+    out: &mut Vec<T>,
+) -> Result<()> {
     let width = size_of::<T>();
     if entries > bytes.len() / width {
         return Err(general_err!("Incomplete fixed-width value page"));
@@ -166,14 +176,34 @@ pub(crate) fn gather_plain<T: ParquetValueType>(
     if ranks.iter().any(|&rank| rank as usize >= entries) {
         return Err(general_err!("Fixed-width value rank out of range"));
     }
-    out.extend(ranks.iter().map(|&rank| {
-        let offset = rank as usize * width;
+    let read = |rank: u32| {
+        let offset = rank as usize * size_of::<T>();
         let mut encoded = T::Buffer::default();
         encoded
             .as_mut()
-            .copy_from_slice(&bytes[offset..offset + width]);
+            .copy_from_slice(&bytes[offset..offset + size_of::<T>()]);
         T::from_le_bytes(encoded)
-    }));
+    };
+
+    // Use read-ahead on sparse batches from large dictionaries. Wider
+    // batches already have overlapping loads and benefit from regular reads.
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    if PREFETCH && bytes.len() >= 64 * 1024 && (32..=256).contains(&ranks.len()) {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        const AHEAD: usize = 16;
+        let (head, tail) = ranks.split_at(ranks.len() - AHEAD);
+        out.reserve(ranks.len());
+        out.extend(head.iter().zip(&ranks[AHEAD..]).map(|(&rank, &ahead)| {
+            let offset = ahead as usize * size_of::<T>();
+            // SAFETY: x86_64 includes SSE. All ranks were checked against
+            // entries, and the byte span covers every fixed-width entry.
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(bytes.as_ptr().add(offset).cast()) };
+            read(rank)
+        }));
+        out.extend(tail.iter().copied().map(read));
+        return Ok(());
+    }
+    out.extend(ranks.iter().copied().map(read));
     Ok(())
 }
 
@@ -866,6 +896,37 @@ mod tests {
         assert_eq!(dense, [47i32; 8]);
         assert!(dictionary.gather(&[96], &mut dense).is_err());
         assert!(dictionary.gather(&[0], &mut Vec::<i64>::new()).is_err());
+    }
+
+    #[test]
+    fn selected_gather_large_unaligned_dictionary() {
+        let entries = 16_384u32;
+        let mut storage = vec![0];
+        storage.extend((0..entries).flat_map(|i| (i64::from(i) * -7).to_le_bytes()));
+        let page = Page::DictionaryPage {
+            buf: Bytes::from(storage).slice(1..),
+            num_values: entries,
+            encoding: Encoding::PLAIN,
+            is_sorted: false,
+        };
+        let dictionary = ChunkDictionary::new_native(&page, Type::INT64).unwrap();
+        for len in [16, 31, 32, 33, 48, 152, 256, 257] {
+            let ranks = (0..len).map(|i| (i * 13_877) % entries).collect::<Vec<_>>();
+            let mut out = vec![17i64];
+            dictionary.gather(&ranks, &mut out).unwrap();
+            assert_eq!(out[0], 17);
+            assert!(
+                out[1..]
+                    .iter()
+                    .copied()
+                    .eq(ranks.iter().map(|&i| i64::from(i) * -7))
+            );
+            let mut bad = ranks;
+            bad[len as usize / 2] = entries;
+            assert!(dictionary.gather(&bad, &mut out).is_err());
+            assert_eq!(out.len(), len as usize + 1);
+        }
+        assert!(dictionary.values.get().is_none());
     }
 
     use crate::column::reader::ColumnReaderImpl;
