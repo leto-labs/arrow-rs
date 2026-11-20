@@ -52,6 +52,20 @@ in `third_party/README.md` and `docs/UPSTREAM_MATRIX.toml`.
 
 ## Decode and page-cache notes
 
+DCX keeps code readers opt-in. The flat primitive reader owns the dictionary
+and checks the page encoding in its own path. On worker-01 the three hot PLAIN
+UTF-8 functions retained the same instructions and call targets after
+relocation normalization. A same-source linker-layout control moved the
+synthetic case by 4.32%, and the isolated DCX comparison moved it by 1.26%.
+
+The portable `vertical_ceiling --groups codes` ABBA on the three
+`store_sales.1` columns in task 5.11a measured 30.32 user cycles per row
+against the 9-cycle ceiling. In diagnostic cycle samples, the shared cursor
+accounted for 55%, packed-specific work for 18%, and repeated-specific work
+for 7%. The remaining samples covered shared definition-level handling and
+other scan work. See the lane's benchmark evidence in the consuming
+repository's benchmark data.
+
 FUG requires Parquet MSRV 1.89 for stable AVX-512 intrinsics; other packages keep
 their upstream minimums. SIMD paths select instructions at run time and have
 scalar differential coverage. Z1-A borrows only aligned immutable dictionary
