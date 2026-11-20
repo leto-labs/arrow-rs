@@ -34,6 +34,12 @@ use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::{ceil, num_required_bits, read_num_bytes};
 
 pub(crate) mod decoder;
+#[cfg(feature = "arrow")]
+pub use crate::encodings::rle::codes::{CodeCursor, CodeRun};
+#[cfg(feature = "arrow")]
+pub use decoder::code_page::{
+    ChunkDictionary, CodeColumnPage, CodeColumnReader, DictionaryCodePage,
+};
 mod legacy_fixed_len_byte_array;
 mod spaced;
 

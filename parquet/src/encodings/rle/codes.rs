@@ -43,6 +43,68 @@ pub enum CodeRun<'a> {
     },
 }
 
+impl CodeRun<'_> {
+    /// Logical entries in the run, excluding packed padding.
+    pub fn len(&self) -> usize {
+        match *self {
+            Self::Repeated { len, .. } | Self::Packed { len, .. } => len,
+        }
+    }
+
+    /// Whether the run has no logical entries.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the code at this logical offset.
+    #[inline]
+    pub fn code_at(&self, offset: usize) -> Option<u32> {
+        if offset >= self.len() {
+            return None;
+        }
+        match *self {
+            Self::Repeated { code, .. } => Some(code),
+            Self::Packed { width, bytes, .. } if width <= 32 => {
+                let width = usize::from(width);
+                let group = (offset / 8).checked_mul(width)?;
+                let bytes = bytes.get(group..group.checked_add(width)?)?;
+                Some(packed_code(bytes, width, offset % 8) as u32)
+            }
+            _ => None,
+        }
+    }
+
+    /// Counts set bits in part of a flat definition-level run.
+    #[cfg(feature = "arrow")]
+    pub(crate) fn count_ones(&self, start: usize, end: usize) -> usize {
+        debug_assert!(start <= end && end <= self.len());
+        if start == end {
+            return 0;
+        }
+        match *self {
+            Self::Repeated { code, .. } => usize::from(code == 1) * (end - start),
+            Self::Packed {
+                width: 1, bytes, ..
+            } => {
+                let first = start / 8;
+                let last = (end - 1) / 8;
+                let first_mask = u8::MAX << (start % 8);
+                let last_mask = u8::MAX >> (7 - (end - 1) % 8);
+                if first == last {
+                    return (bytes[first] & first_mask & last_mask).count_ones() as usize;
+                }
+                (bytes[first] & first_mask).count_ones() as usize
+                    + bytes[first + 1..last]
+                        .iter()
+                        .map(|b| b.count_ones() as usize)
+                        .sum::<usize>()
+                    + (bytes[last] & last_mask).count_ones() as usize
+            }
+            _ => unreachable!("flat definition levels use width 1"),
+        }
+    }
+}
+
 /// A page-local cursor over hybrid RLE runs. For dictionary indices, pass the
 /// number of non-null values as `len` and the chunk's entry count as `code_limit`.
 /// For definition levels, pass the page's level count and the maximum level plus one.
