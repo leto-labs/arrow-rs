@@ -163,15 +163,17 @@ pub(crate) fn gather_plain<T: ParquetValueType>(
         return Err(general_err!("Incomplete fixed-width value page"));
     }
     let bytes = &bytes[..entries * width];
-    out.reserve(ranks.len());
-    for &rank in ranks {
-        let rank = rank as usize;
-        if rank >= entries {
-            return Err(general_err!("Fixed-width value rank out of range"));
-        }
-        let offset = rank * width;
-        out.push(T::try_from_le_slice(&bytes[offset..offset + width])?);
+    if ranks.iter().any(|&rank| rank as usize >= entries) {
+        return Err(general_err!("Fixed-width value rank out of range"));
     }
+    out.extend(ranks.iter().map(|&rank| {
+        let offset = rank as usize * width;
+        let mut encoded = T::Buffer::default();
+        encoded
+            .as_mut()
+            .copy_from_slice(&bytes[offset..offset + width]);
+        T::from_le_bytes(encoded)
+    }));
     Ok(())
 }
 
@@ -325,7 +327,7 @@ impl DictionaryCodePage {
         position: &mut Option<CodePosition>,
     ) -> Result<()> {
         self.indices_with_count(count)?
-            .codes_in_range(ranks, out, position, Some(end))
+            .codes_in_range::<false>(ranks, out, position, Some(end))
     }
 
     /// Builds a row validity bitmap and returns its non-null count.

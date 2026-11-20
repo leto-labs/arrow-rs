@@ -237,7 +237,7 @@ where
 
     fn read_selected(&mut self, words: &[u64], rows: usize) -> Result<ArrayRef> {
         check_selection(words, rows)?;
-        if self.record_reader.num_records() != 0 {
+        if self.record_reader.num_values() != 0 {
             return Err(general_err!(
                 "Consume the previous batch before reading a selected vector"
             ));
@@ -839,7 +839,7 @@ mod tests {
                                 3 => rng.random_bool(0.7),
                                 _ => i % 2 == 0,
                             };
-                            valid.then(|| if i % 701 < 74 { 42 } else { i as i64 })
+                            valid.then_some(if i % 701 < 74 { 42 } else { i as i64 })
                         })
                         .collect::<Vec<_>>();
                     let schema =

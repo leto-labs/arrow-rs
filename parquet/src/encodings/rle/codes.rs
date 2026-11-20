@@ -430,13 +430,14 @@ impl<'a> CodeCursor<'a> {
         if ranks.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(general_err!("Code selections must be strictly increasing"));
         }
-        Self::codes_in_range(self, ranks, out, &mut None, None)
+        self.codes_in_range::<true>(ranks, out, &mut None, None)
     }
 
     /// The caller supplies page-relative ranks in order, in successive
     /// nonoverlapping ranges. The position is private to this page.
+    /// When `CHECK_CODES` is false, the caller must check each returned code.
     #[inline]
-    pub(crate) fn codes_in_range(
+    pub(crate) fn codes_in_range<const CHECK_CODES: bool>(
         &mut self,
         ranks: &[u32],
         out: &mut Vec<u32>,
@@ -467,7 +468,9 @@ impl<'a> CodeCursor<'a> {
         };
         sink.out.reserve(ranks.len());
         self.drain_impl::<_, false>(&mut sink, count - end)?;
-        if !sink.ranks.is_empty() || out.iter().any(|&code| u64::from(code) >= self.code_limit) {
+        if !sink.ranks.is_empty()
+            || (CHECK_CODES && out.iter().any(|&code| u64::from(code) >= self.code_limit))
+        {
             self.failed = true;
             return Err(invalid_packed_code());
         }
@@ -541,26 +544,26 @@ impl RunSink for RankSink<'_> {
 
     #[inline(always)]
     fn packed(&mut self, width: u8, bytes: &[u8], len: usize) {
-        let end = self.offset + len;
         if width == 0 {
             return self.repeated(0, len);
         }
-        let width = usize::from(width);
-        let mask = low_mask(width);
-        while let Some((&rank, rest)) = self.ranks.split_first() {
-            let rank = rank as usize;
-            if rank >= end {
-                break;
-            }
-            let index = rank - self.offset;
-            // Compute within an eight-code group to avoid overflow on 32-bit.
-            let bit = (index % 8) * width;
-            let offset = (index / 8) * width + bit / 8;
-            let code = load_padded(bytes, offset, &self.tail) >> (bit % 8);
-            self.out.push((code & mask) as u32);
-            self.ranks = rest;
-        }
+        let start = self.offset;
+        let end = start + len;
         self.offset = end;
+        if self.ranks.first().is_none_or(|&rank| rank as usize >= end) {
+            return;
+        }
+        let count = self.ranks.partition_point(|&rank| (rank as usize) < end);
+        let (ranks, remaining) = self.ranks.split_at(count);
+        let mask = low_mask(usize::from(width));
+        self.out.extend(ranks.iter().map(|&rank| {
+            // Rank and width are at most 32 bits and 32 respectively.
+            // The validated packed run bounds the byte offset in usize.
+            let bit = (rank as usize - start) as u64 * u64::from(width);
+            let code = load_padded(bytes, (bit / 8) as usize, &self.tail) >> (bit % 8);
+            (code & mask) as u32
+        }));
+        self.ranks = remaining;
     }
 }
 
@@ -811,7 +814,7 @@ mod tests {
                 let ranks = (start..end).step_by(3).collect::<Vec<_>>();
                 CodeCursor::new(width, &bytes, values.len(), 1u64 << width)
                     .unwrap()
-                    .codes_in_range(&ranks, &mut out, &mut position, Some(end as usize))
+                    .codes_in_range::<true>(&ranks, &mut out, &mut position, Some(end as usize))
                     .unwrap();
                 assert_eq!(
                     out,
