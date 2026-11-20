@@ -183,6 +183,20 @@ impl<'a> CodeCursor<'a> {
         self.drain_impl::<S, true>(sink)
     }
 
+    /// Pushes all remaining runs for a code limit of `1 << width`, such as
+    /// flat definition levels. Packed runs receive the rest of the stream, so a
+    /// sink can read whole words past the run and mask them; see `load_padded`.
+    #[inline(always)]
+    pub(crate) fn drain_padded<S: RunSink>(&mut self, sink: &mut S) -> Result<()> {
+        if self.code_limit < 1u64 << self.width {
+            return Err(general_err!(
+                "Padded drain needs every code of width {}",
+                self.width
+            ));
+        }
+        self.drain_impl::<S, false>(sink)
+    }
+
     #[inline(always)]
     fn drain_impl<S: RunSink, const CHECK_PACKED: bool>(&mut self, sink: &mut S) -> Result<()> {
         if self.failed {
@@ -281,6 +295,17 @@ impl<'a> CodeCursor<'a> {
     /// Writes dense verdict words. The caller scatters them to row positions.
     /// Invalid packed entries accumulate one error for the page.
     pub fn verdicts(&mut self, table: &mut VerdictTable, out: &mut Vec<u64>) -> Result<()> {
+        self.verdicts_inline(table, out)
+    }
+
+    /// `verdicts`, inlined so a caller compiled with extra target features
+    /// also compiles the run walk with them.
+    #[inline(always)]
+    pub(crate) fn verdicts_inline(
+        &mut self,
+        table: &mut VerdictTable,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
         let width = self.width;
         let limit = table.entries;
         if limit as u64 != self.code_limit {
@@ -295,13 +320,10 @@ impl<'a> CodeCursor<'a> {
 
         out.clear();
         out.resize(self.remaining.div_ceil(64), 0);
-        let mut tail = [0; 16];
-        let tail_bytes = self.data.len().min(8);
-        tail[8 - tail_bytes..8].copy_from_slice(&self.data[self.data.len() - tail_bytes..]);
         let mut sink = VerdictSink {
             writer: WordWriter::new(out),
             table,
-            tail,
+            tail: padded_tail(self.data),
             invalid: 0,
             max_code: 0,
             has_packed: false,
@@ -387,13 +409,15 @@ struct VerdictSink<'a> {
 }
 
 impl RunSink for VerdictSink<'_> {
-    #[inline]
+    #[inline(always)]
     fn repeated(&mut self, code: u32, len: usize) {
+        // Table entries are 0 or 1 below the dictionary size; the walk has
+        // checked the code against it.
         self.writer
-            .repeat(self.table.flags[code as usize] == 1, len);
+            .repeat(self.table.flags[code as usize] & 1 != 0, len);
     }
 
-    #[inline]
+    #[inline(always)]
     fn packed(&mut self, width: u8, bytes: &[u8], len: usize) {
         self.has_packed = true;
         let mask = low_mask(width as usize);
@@ -424,10 +448,6 @@ impl VerdictSink<'_> {
     ) {
         let width = width as usize;
         let mask = low_mask(width);
-        let tail_start = bytes.len().saturating_sub(8);
-        // For a suffix shorter than eight bytes, its start is within the saved
-        // page tail. Otherwise the last eight bytes of the suffix ARE that tail.
-        let tail_offset = 8 - bytes.len().min(8);
         let mut start = 0;
         while start < len {
             let count = (len - start).min(64);
@@ -436,12 +456,8 @@ impl VerdictSink<'_> {
                 let index = start + i;
                 let bit = (index % 8) * width;
                 let first = (index / 8) * width + bit / 8;
-                let packed = bytes[first..].first_chunk::<8>().unwrap_or_else(|| {
-                    self.tail[first - tail_start + tail_offset..]
-                        .first_chunk::<8>()
-                        .unwrap()
-                });
-                let code = ((u64::from_le_bytes(*packed) >> (bit % 8)) & mask) as u32;
+                let packed = load_padded(bytes, first, &self.tail);
+                let code = ((packed >> (bit % 8)) & mask) as u32;
                 word |= u64::from(lookup(self, code)) << i;
             }
             self.writer.write(word, count);
@@ -453,6 +469,32 @@ impl VerdictSink<'_> {
 #[inline]
 pub(crate) fn low_mask(bits: usize) -> u64 {
     u64::MAX.checked_shr((64 - bits) as u32).unwrap_or(0)
+}
+
+/// The last eight bytes of a stream (fewer if it is shorter), followed by
+/// zeros. `load_padded` reads words that start in them from this copy.
+#[inline]
+pub(crate) fn padded_tail(stream: &[u8]) -> [u8; 16] {
+    let mut tail = [0; 16];
+    let len = stream.len().min(8);
+    tail[8 - len..8].copy_from_slice(&stream[stream.len() - len..]);
+    tail
+}
+
+/// Loads eight little-endian bytes at `offset < suffix.len()`, where `suffix`
+/// ends where the stream given to `padded_tail` ends. Bytes past that end read
+/// as zero. Callers mask the bits they own.
+#[inline(always)]
+pub(crate) fn load_padded(suffix: &[u8], offset: usize, tail: &[u8; 16]) -> u64 {
+    let bytes = match suffix[offset..].first_chunk::<8>() {
+        Some(bytes) => bytes,
+        // Fewer than eight bytes remain, so they are the last
+        // `suffix.len() - offset` bytes of the saved tail.
+        None => tail[8 - (suffix.len() - offset)..]
+            .first_chunk::<8>()
+            .unwrap(),
+    };
+    u64::from_le_bytes(*bytes)
 }
 
 /// Appends bits in row order, holding the partial word until it is complete.
@@ -473,35 +515,32 @@ impl<'a> WordWriter<'a> {
         }
     }
 
+    /// Appends `len` bits, `1..=64`. Bits of `bits` at or above `len` must be zero.
     #[inline(always)]
     pub(crate) fn write(&mut self, bits: u64, len: usize) {
+        debug_assert!((1..=64).contains(&len) && (len == 64 || bits >> len == 0));
+        let pending = self.pending | (bits << self.filled);
         let end = self.filled + len;
-        self.pending |= bits << self.filled;
-        if end >= 64 {
-            self.words[self.index] = self.pending;
-            self.index += 1;
-            self.pending = (bits >> 1) >> (63 - self.filled);
-        }
-        self.filled = end % 64;
+        // Store the partial word every time instead of branching on whether
+        // it is complete. A later write rewrites it until it is. The index
+        // stays in bounds because callers write at most 64 bits per word.
+        self.words[self.index] = pending;
+        let full = end >> 6;
+        let spill = (bits >> 1) >> (63 - self.filled);
+        self.index += full;
+        self.pending = if full != 0 { spill } else { pending };
+        self.filled = end & 63;
     }
 
+    /// Appends `len >= 1` copies of `bit`.
     #[inline(always)]
     pub(crate) fn repeat(&mut self, bit: bool, mut len: usize) {
-        if !bit {
-            let end = self.filled + len;
-            if end >= 64 {
-                self.words[self.index] = self.pending;
-                self.index += end / 64;
-                self.pending = 0;
-            }
-            self.filled = end % 64;
-            return;
-        }
+        let fill = 0u64.wrapping_sub(u64::from(bit));
         while len > 64 {
-            self.write(u64::MAX, 64);
+            self.write(fill, 64);
             len -= 64;
         }
-        self.write(low_mask(len), len);
+        self.write(fill & low_mask(len), len);
     }
 
     #[inline]
