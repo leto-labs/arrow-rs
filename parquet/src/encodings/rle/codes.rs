@@ -191,7 +191,7 @@ impl<'a> CodeCursor<'a> {
     /// the valid prefix, so publish its output only after this returns success.
     #[inline]
     pub fn drain<S: RunSink>(&mut self, sink: &mut S) -> Result<()> {
-        self.drain_impl::<S, true>(sink)
+        self.drain_impl::<S, true>(sink, 0)
     }
 
     /// Pushes all remaining runs for a code limit of `1 << width`, such as
@@ -205,11 +205,15 @@ impl<'a> CodeCursor<'a> {
                 self.width
             ));
         }
-        self.drain_impl::<S, false>(sink)
+        self.drain_impl::<S, false>(sink, 0)
     }
 
     #[inline(always)]
-    fn drain_impl<S: RunSink, const CHECK_PACKED: bool>(&mut self, sink: &mut S) -> Result<()> {
+    fn drain_impl<S: RunSink, const CHECK_PACKED: bool>(
+        &mut self,
+        sink: &mut S,
+        remaining_floor: usize,
+    ) -> Result<()> {
         if self.failed {
             return Err(general_err!("Invalid code stream"));
         }
@@ -217,7 +221,11 @@ impl<'a> CodeCursor<'a> {
         let repeated_bytes = width.div_ceil(8);
         let repeated_mask = low_mask(repeated_bytes * 8);
         let code_limit = self.code_limit.min(1u64 << width);
-        while self.remaining != 0 {
+        let mut last = (self.data, self.remaining);
+        while self.remaining > remaining_floor {
+            if remaining_floor != 0 {
+                last = (self.data, self.remaining);
+            }
             if let Some(bytes) = self.data.first_chunk::<8>() {
                 let word = u64::from_le_bytes(*bytes);
                 let header = word as u8;
@@ -239,7 +247,15 @@ impl<'a> CodeCursor<'a> {
                 }
             }
         }
-        self.finish_stream()
+        if remaining_floor == 0 {
+            return self.finish_stream();
+        }
+        if self.remaining < remaining_floor {
+            // The next vector also intersects this run. Keep its header and
+            // decode its selected codes at their offsets, without realigning.
+            (self.data, self.remaining) = last;
+        }
+        Ok(())
     }
 
     #[inline]
@@ -292,7 +308,7 @@ impl<'a> CodeCursor<'a> {
         // Walk a copy before allocating. A plausible first run (even a very
         // long one) says nothing about the size or validity of later runs.
         let mut check = Self { ..*self };
-        check.drain_impl::<_, false>(&mut CheckRunLengths)
+        check.drain_impl::<_, false>(&mut CheckRunLengths, 0)
     }
 
     #[inline(always)]
@@ -391,7 +407,7 @@ impl<'a> CodeCursor<'a> {
             max_code: 0,
             has_packed: false,
         };
-        self.drain_impl::<_, false>(&mut sink)?;
+        self.drain_impl::<_, false>(&mut sink, 0)?;
         if sink.invalid != 0 || (sink.has_packed && sink.max_code as usize >= limit) {
             self.failed = true;
             return Err(invalid_packed_code());
@@ -405,6 +421,60 @@ impl<'a> CodeCursor<'a> {
         if code >= self.code_limit {
             return Err(runs::out_of_bounds(self.code_limit as usize, code));
         }
+        Ok(())
+    }
+
+    /// Writes codes at strictly increasing value ranks. Checks run bounds and
+    /// the selected codes while skipping unselected packed codes.
+    pub fn codes_at(&mut self, ranks: &[u32], out: &mut Vec<u32>) -> Result<()> {
+        if ranks.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(general_err!("Code selections must be strictly increasing"));
+        }
+        Self::codes_in_range(self, ranks, out, &mut None, None)
+    }
+
+    /// The caller supplies page-relative ranks in order, in successive
+    /// nonoverlapping ranges. The position is private to this page.
+    #[inline]
+    pub(crate) fn codes_in_range(
+        &mut self,
+        ranks: &[u32],
+        out: &mut Vec<u32>,
+        position: &mut Option<CodePosition>,
+        end: Option<usize>,
+    ) -> Result<()> {
+        out.clear();
+        let count = self.remaining;
+        let start = if let Some(position) = position {
+            self.data = &self.data[self.data.len() - position.bytes_left..];
+            self.remaining = position.values_left;
+            count - self.remaining
+        } else {
+            0
+        };
+        let end = end.unwrap_or(count);
+        if end > count
+            || ranks.first().is_some_and(|&rank| (rank as usize) < start)
+            || ranks.last().is_some_and(|&rank| rank as usize >= end)
+        {
+            return Err(general_err!("Code selection out of range"));
+        }
+        let mut sink = RankSink {
+            ranks,
+            out,
+            offset: start,
+            tail: padded_tail(self.data),
+        };
+        sink.out.reserve(ranks.len());
+        self.drain_impl::<_, false>(&mut sink, count - end)?;
+        if !sink.ranks.is_empty() || out.iter().any(|&code| u64::from(code) >= self.code_limit) {
+            self.failed = true;
+            return Err(invalid_packed_code());
+        }
+        *position = Some(CodePosition {
+            bytes_left: self.data.len(),
+            values_left: self.remaining,
+        });
         Ok(())
     }
 
@@ -438,6 +508,59 @@ impl<'a> CodeCursor<'a> {
             return Err(general_err!("Code selection past the end of the page"));
         }
         Ok(keys)
+    }
+}
+
+/// A run boundary in one dictionary index stream.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CodePosition {
+    bytes_left: usize,
+    values_left: usize,
+}
+
+struct RankSink<'a> {
+    ranks: &'a [u32],
+    out: &'a mut Vec<u32>,
+    offset: usize,
+    tail: [u8; 16],
+}
+
+impl RunSink for RankSink<'_> {
+    #[inline(always)]
+    fn repeated(&mut self, code: u32, len: usize) {
+        let end = self.offset + len;
+        while let Some((&rank, rest)) = self.ranks.split_first() {
+            if rank as usize >= end {
+                break;
+            }
+            self.out.push(code);
+            self.ranks = rest;
+        }
+        self.offset = end;
+    }
+
+    #[inline(always)]
+    fn packed(&mut self, width: u8, bytes: &[u8], len: usize) {
+        let end = self.offset + len;
+        if width == 0 {
+            return self.repeated(0, len);
+        }
+        let width = usize::from(width);
+        let mask = low_mask(width);
+        while let Some((&rank, rest)) = self.ranks.split_first() {
+            let rank = rank as usize;
+            if rank >= end {
+                break;
+            }
+            let index = rank - self.offset;
+            // Compute within an eight-code group to avoid overflow on 32-bit.
+            let bit = (index % 8) * width;
+            let offset = (index / 8) * width + bit / 8;
+            let code = load_padded(bytes, offset, &self.tail) >> (bit % 8);
+            self.out.push((code & mask) as u32);
+            self.ranks = rest;
+        }
+        self.offset = end;
     }
 }
 
@@ -627,6 +750,94 @@ fn packed_code(bytes: &[u8], width: usize, index: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selected_codes_match_full_decode_at_all_widths() {
+        use rand::{RngExt, SeedableRng};
+
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(0x4a2);
+        for width in 0..=32 {
+            let limit = 1u64 << width;
+            for len in [1, 7, 8, 9, 63, 64, 65, 127, 4097, 20_001] {
+                let mut encoder = crate::encodings::rle::RleEncoder::new(width, len * 5 + 128);
+                let mut expected = Vec::new();
+                while expected.len() < len {
+                    let value = rng.random_range(0..limit);
+                    let run = if rng.random_bool(0.65) {
+                        1
+                    } else {
+                        rng.random_range(8..=30).min(len - expected.len())
+                    };
+                    for _ in 0..run {
+                        encoder.put(value);
+                        expected.push(value as u32);
+                    }
+                }
+                let bytes = Bytes::from(encoder.consume());
+                let mut full = RleDecoder::new(width);
+                full.set_data(bytes.clone()).unwrap();
+                let mut dense = vec![0u32; len];
+                assert_eq!(full.get_batch(&mut dense).unwrap(), len);
+                assert_eq!(dense, expected);
+                for density in [0.0, 0.001, 0.02, 0.1, 0.5, 1.0] {
+                    let ranks: Vec<_> = (0..len as u32)
+                        .filter(|_| rng.random_bool(density))
+                        .collect();
+                    let mut cursor = super::CodeCursor::new(width, &bytes, len, limit).unwrap();
+                    let mut actual = vec![u32::MAX];
+                    cursor.codes_at(&ranks, &mut actual).unwrap();
+                    let expected: Vec<_> = ranks.iter().map(|&i| dense[i as usize]).collect();
+                    assert_eq!(
+                        actual, expected,
+                        "width={width} len={len} density={density}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_codes_resume_inside_packed_and_repeated_runs() {
+        for width in [0, 1, 8, 17, 32] {
+            let values = (0..713)
+                .map(|i| if i < 512 { i % (1u64 << width) } else { 0 })
+                .collect::<Vec<_>>();
+            let mut encoder = RleEncoder::new(width, values.len() * 5 + 128);
+            encoder.put_batch(&values);
+            let bytes = encoder.consume();
+            let mut position = None;
+            let mut out = Vec::new();
+            let mut start = 0;
+            for end in [1, 45, 63, 64, 458, 510, 511, 512, 513, 607, 713] {
+                let ranks = (start..end).step_by(3).collect::<Vec<_>>();
+                CodeCursor::new(width, &bytes, values.len(), 1u64 << width)
+                    .unwrap()
+                    .codes_in_range(&ranks, &mut out, &mut position, Some(end as usize))
+                    .unwrap();
+                assert_eq!(
+                    out,
+                    ranks
+                        .iter()
+                        .map(|&rank| values[rank as usize] as u32)
+                        .collect::<Vec<_>>()
+                );
+                start = end;
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_selected_packed_code_and_run_are_errors() {
+        // A single packed group, all codes 3, in a dictionary with 3 entries.
+        let mut out = Vec::new();
+        let mut cursor = CodeCursor::new(2, &[3, 255, 255], 8, 3).unwrap();
+        assert!(cursor.codes_at(&[5], &mut out).is_err());
+        let mut cursor = CodeCursor::new(2, &[3, 255], 8, 3).unwrap();
+        assert!(cursor.codes_at(&[5], &mut out).is_err());
+        let mut cursor = CodeCursor::new(2, &[3, 0, 0], 8, 3).unwrap();
+        assert!(cursor.codes_at(&[2, 2], &mut out).is_err());
+        assert!(cursor.codes_at(&[8], &mut out).is_err());
+    }
+
     use super::*;
     use crate::encodings::rle::{RleDecoder, RleEncoder};
     use bytes::Bytes;
