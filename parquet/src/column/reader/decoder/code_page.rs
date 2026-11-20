@@ -34,7 +34,7 @@ use super::{ColumnLevelDecoder, DefinitionLevelDecoder, DefinitionLevelDecoderIm
 use crate::basic::Encoding;
 use crate::column::page::{Page, PageReader};
 use crate::data_type::DataType;
-use crate::encodings::rle::codes::{CodeCursor, CodeRun};
+use crate::encodings::rle::codes::{CodeCursor, CodeRun, RunSink};
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 
@@ -82,6 +82,27 @@ pub struct DictionaryCodePage {
     indices: Bytes,
 }
 
+#[derive(Default)]
+struct LevelCount(usize);
+
+impl RunSink for LevelCount {
+    #[inline]
+    fn repeated(&mut self, code: u32, len: usize) {
+        self.0 += code as usize * len;
+    }
+
+    #[inline]
+    fn packed(&mut self, width: u8, bytes: &[u8], len: usize) {
+        self.0 += CodeRun::Packed { width, bytes, len }.count_ones(0, len);
+    }
+}
+
+fn count_valid_levels(levels: &mut CodeCursor<'_>) -> Result<usize> {
+    let mut count = LevelCount::default();
+    levels.drain(&mut count)?;
+    Ok(count.0)
+}
+
 impl DictionaryCodePage {
     /// Rows in this flat page, including nulls.
     pub fn num_rows(&self) -> usize {
@@ -105,11 +126,7 @@ impl DictionaryCodePage {
     pub fn validate_levels(&self) -> Result<()> {
         if self.declared_values {
             if let Some(mut levels) = self.levels() {
-                let mut count = 0;
-                while let Some(run) = levels.next_run()? {
-                    count += run.count_ones(0, run.len());
-                }
-                if count != self.values {
+                if count_valid_levels(&mut levels)? != self.values {
                     return Err(general_err!(
                         "Definition level count disagrees with DataPage V2"
                     ));
@@ -337,11 +354,7 @@ where
                     (None, None) => rows,
                     (None, Some(levels)) => {
                         let mut levels = CodeCursor::new(1, levels, rows, 2)?;
-                        let mut values = 0;
-                        while let Some(run) = levels.next_run()? {
-                            values += run.count_ones(0, run.len());
-                        }
-                        values
+                        count_valid_levels(&mut levels)?
                     }
                 };
                 let page = DictionaryCodePage {

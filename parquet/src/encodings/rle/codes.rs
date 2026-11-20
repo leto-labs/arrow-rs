@@ -105,6 +105,31 @@ impl CodeRun<'_> {
     }
 }
 
+/// A consumer of validated hybrid runs.
+pub trait RunSink {
+    /// Consume one repeated code.
+    fn repeated(&mut self, code: u32, len: usize);
+
+    /// Consume a packed run. The last group may contain padding.
+    fn packed(&mut self, width: u8, bytes: &[u8], len: usize);
+}
+
+impl<R, P> RunSink for (R, P)
+where
+    R: FnMut(u32, usize),
+    P: FnMut(u8, &[u8], usize),
+{
+    #[inline]
+    fn repeated(&mut self, code: u32, len: usize) {
+        self.0(code, len);
+    }
+
+    #[inline]
+    fn packed(&mut self, width: u8, bytes: &[u8], len: usize) {
+        self.1(width, bytes, len);
+    }
+}
+
 /// A page-local cursor over hybrid RLE runs. For dictionary indices, pass the
 /// number of non-null values as `len` and the chunk's entry count as `code_limit`.
 /// For definition levels, pass the page's level count and the maximum level plus one.
@@ -146,6 +171,29 @@ impl<'a> CodeCursor<'a> {
         result.map(Some)
     }
 
+    /// Pushes all remaining validated runs to the sink.
+    ///
+    /// On an invalid run the cursor becomes unusable. A sink may have observed
+    /// the valid prefix, so publish its output only after this returns success.
+    #[inline]
+    pub fn drain<S: RunSink>(&mut self, sink: &mut S) -> Result<()> {
+        if self.failed {
+            return Err(general_err!("Invalid code stream"));
+        }
+        while self.remaining != 0 {
+            match self.read_run() {
+                Ok(CodeRun::Repeated { code, len }) => sink.repeated(code, len),
+                Ok(CodeRun::Packed { width, bytes, len }) => sink.packed(width, bytes, len),
+                Err(error) => {
+                    self.failed = true;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
     fn read_run(&mut self) -> Result<CodeRun<'a>> {
         let (indicator, offset) =
             runs::header(self.data, 0).ok_or_else(|| general_err!("Incomplete code run header"))?;
@@ -263,6 +311,20 @@ mod tests {
     use crate::encodings::rle::{RleDecoder, RleEncoder};
     use bytes::Bytes;
 
+    #[derive(Default)]
+    struct DenseCodes(Vec<u32>);
+
+    impl RunSink for DenseCodes {
+        fn repeated(&mut self, code: u32, len: usize) {
+            self.0.extend(std::iter::repeat_n(code, len));
+        }
+
+        fn packed(&mut self, width: u8, bytes: &[u8], len: usize) {
+            let run = CodeRun::Packed { width, bytes, len };
+            self.0.extend((0..len).map(|i| run.code_at(i).unwrap()));
+        }
+    }
+
     #[test]
     fn codes_match_value_decoder_at_every_width() {
         crate::util::native::dispatch::for_each_tier(|| {
@@ -280,6 +342,13 @@ mod tests {
                     encoder.put(u64::from(code));
                 }
                 let data = encoder.consume();
+                let mut pushed = DenseCodes::default();
+                CodeCursor::new(width, &data, input.len(), entries)
+                    .unwrap()
+                    .drain(&mut pushed)
+                    .unwrap();
+                assert_eq!(pushed.0, input);
+
                 let mut cursor = CodeCursor::new(width, &data, input.len(), entries).unwrap();
                 let selected: Vec<_> = (0..input.len()).filter(|i| i % 3 != 0).collect();
                 let actual = cursor.selected_keys(selected.iter().copied()).unwrap();
@@ -326,6 +395,11 @@ mod tests {
                 "{data:?}"
             );
             assert!(cursor.next_run().is_err());
+            let mut pushed = DenseCodes::default();
+            let mut cursor = CodeCursor::new(1, data, 1, 1).unwrap();
+            assert!(cursor.drain(&mut pushed).is_err(), "{data:?}");
+            assert!(pushed.0.is_empty());
+            assert!(cursor.drain(&mut pushed).is_err());
         }
         let mut cursor = CodeCursor::new(1, &[2, 0], 1, 0).unwrap();
         assert!(cursor.next_run().is_err());
