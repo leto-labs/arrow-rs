@@ -26,7 +26,7 @@ use arrow_array::{
     Array, ArrayRef, DictionaryArray, PrimitiveArray,
     types::{ArrowPrimitiveType, UInt32Type},
 };
-use arrow_buffer::{Buffer, ScalarBuffer};
+use arrow_buffer::{Buffer, ScalarBuffer, bit_util::expand};
 use bytes::Bytes;
 
 use super::super::parse_v1_level;
@@ -34,7 +34,9 @@ use super::{ColumnLevelDecoder, DefinitionLevelDecoder, DefinitionLevelDecoderIm
 use crate::basic::Encoding;
 use crate::column::page::{Page, PageReader};
 use crate::data_type::DataType;
-use crate::encodings::rle::codes::{CodeCursor, CodeRun, RunSink};
+use crate::encodings::rle::codes::{
+    CodeCursor, CodeRun, RunSink, VerdictTable, WordWriter, low_mask,
+};
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 
@@ -49,6 +51,11 @@ impl ChunkDictionary {
     /// The chunk's single values allocation. Its pointer identifies this dictionary.
     pub fn values(&self) -> &ArrayRef {
         &self.values
+    }
+
+    /// Builds a reusable verdict table in this chunk's dictionary order.
+    pub fn verdict_table(&self, verdicts: impl IntoIterator<Item = bool>) -> VerdictTable {
+        VerdictTable::new(verdicts)
     }
 
     /// Number of valid dictionary codes.
@@ -76,8 +83,7 @@ pub enum CodeColumnPage<A: ArrowPrimitiveType> {
 pub struct DictionaryCodePage {
     dictionary: ChunkDictionary,
     rows: usize,
-    values: usize,
-    declared_values: bool,
+    values: Option<usize>,
     levels: Option<Bytes>,
     indices: Bytes,
 }
@@ -94,6 +100,41 @@ impl RunSink for LevelCount {
     #[inline]
     fn packed(&mut self, width: u8, bytes: &[u8], len: usize) {
         self.0 += CodeRun::Packed { width, bytes, len }.count_ones(0, len);
+    }
+}
+
+struct ValidityWriter<'a> {
+    writer: WordWriter<'a>,
+    valid: usize,
+}
+
+impl RunSink for ValidityWriter<'_> {
+    #[inline]
+    fn repeated(&mut self, code: u32, len: usize) {
+        self.writer.repeat(code == 1, len);
+        self.valid += code as usize * len;
+    }
+
+    #[inline]
+    fn packed(&mut self, width: u8, bytes: &[u8], len: usize) {
+        debug_assert_eq!(width, 1);
+        let mut chunks = bytes.chunks_exact(8);
+        let mut remaining = len;
+        for chunk in &mut chunks {
+            let count = remaining.min(64);
+            let word = u64::from_le_bytes(chunk.try_into().unwrap()) & low_mask(count);
+            self.valid += word.count_ones() as usize;
+            self.writer.write(word, count);
+            remaining -= count;
+        }
+        if remaining != 0 {
+            let mut tail = [0; 8];
+            let tail_len = chunks.remainder().len();
+            tail[..tail_len].copy_from_slice(chunks.remainder());
+            let word = u64::from_le_bytes(tail) & low_mask(remaining);
+            self.valid += word.count_ones() as usize;
+            self.writer.write(word, remaining);
+        }
     }
 }
 
@@ -121,31 +162,104 @@ impl DictionaryCodePage {
         })
     }
 
-    /// Verify that V2 definition levels agree with the header's non-null count.
-    /// V1 definition levels were already checked to determine that count.
+    /// Checks the level stream and the non-null count, if declared.
     pub fn validate_levels(&self) -> Result<()> {
-        if self.declared_values {
-            if let Some(mut levels) = self.levels() {
-                if count_valid_levels(&mut levels)? != self.values {
-                    return Err(general_err!(
-                        "Definition level count disagrees with DataPage V2"
-                    ));
-                }
-            }
+        if let Some(mut levels) = self.levels() {
+            self.check_count(count_valid_levels(&mut levels)?)?;
         }
         Ok(())
     }
 
-    /// The index stream, including only physical non-null values.
+    fn check_count(&self, count: usize) -> Result<()> {
+        if self.values.is_some_and(|expected| expected != count) {
+            return Err(general_err!(
+                "Definition level count disagrees with DataPage V2"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The index stream, including only physical non-null values. V1 optional
+    /// pages derive this count from their definition levels.
     pub fn indices(&self) -> Result<CodeCursor<'_>> {
-        if self.values == 0 && self.indices.is_empty() {
+        let count = match self.values {
+            Some(count) => count,
+            None => count_valid_levels(&mut self.levels().expect("optional V1 levels"))?,
+        };
+        self.indices_with_count(count)
+    }
+
+    fn indices_with_count(&self, count: usize) -> Result<CodeCursor<'_>> {
+        if count == 0 && self.indices.is_empty() {
             return CodeCursor::new(0, &[], 0, self.dictionary.entries as u64);
         }
         let (&width, bytes) = self
             .indices
             .split_first()
             .ok_or_else(|| general_err!("Missing dictionary index width"))?;
-        CodeCursor::new(width, bytes, self.values, self.dictionary.entries as u64)
+        CodeCursor::new(width, bytes, count, self.dictionary.entries as u64)
+    }
+
+    /// Builds a row validity bitmap and returns its non-null count.
+    /// Word bits are in row order, starting at the least significant bit.
+    pub fn validity(&self, out: &mut Vec<u64>) -> Result<usize> {
+        out.clear();
+        out.resize(self.rows.div_ceil(64), 0);
+        let mut sink = ValidityWriter {
+            writer: WordWriter::new(out),
+            valid: 0,
+        };
+        if let Some(mut levels) = self.levels() {
+            levels.drain(&mut sink)?;
+            self.check_count(sink.valid)?;
+        } else if self.rows != 0 {
+            sink.repeated(1, self.rows);
+        }
+        Ok(sink.valid)
+    }
+
+    /// Evaluates the dictionary verdict into a row bitmap with nulls cleared.
+    /// `validity` is reusable scratch. Discard `out` on error.
+    pub fn verdicts(
+        &self,
+        table: &mut VerdictTable,
+        validity: &mut Vec<u64>,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        let count = if self.levels.is_some() {
+            self.validity(validity)?
+        } else {
+            self.rows
+        };
+        self.indices_with_count(count)?.verdicts(table, out)?;
+        if count == self.rows {
+            return Ok(());
+        }
+
+        // Expand in reverse. A row word can only read dense words at or
+        // below its own position, so expansion can reuse the output buffer.
+        out.resize(validity.len(), 0);
+        let mut rank = count;
+        for (i, &mask) in validity.iter().enumerate().rev() {
+            let len = mask.count_ones() as usize;
+            rank -= len;
+            if len == 0 {
+                out[i] = 0;
+                continue;
+            }
+            let word = rank / 64;
+            let shift = rank % 64;
+            let mut bits = out[word] >> shift;
+            if len > 64 - shift {
+                bits |= out[word + 1] << (64 - shift);
+            }
+            out[i] = if mask == u64::MAX {
+                bits
+            } else {
+                expand(bits, mask)
+            };
+        }
+        Ok(())
     }
 
     /// Decode a strictly increasing selection of page-relative row offsets.
@@ -192,12 +306,15 @@ impl DictionaryCodePage {
                 len: self.rows,
             })?;
         }
-        if rows.next().is_some() || physical != self.values {
+        if rows.next().is_some() {
             return Err(general_err!(
                 "Invalid row selection or definition level count"
             ));
         }
-        let keys = self.indices()?.selected_keys(physical_offsets)?;
+        self.check_count(physical)?;
+        let keys = self
+            .indices_with_count(physical)?
+            .selected_keys(physical_offsets)?;
         let mut keys = keys.into_iter();
         let keys = PrimitiveArray::from_iter(
             valid
@@ -349,23 +466,17 @@ where
                 .clone()
                 .ok_or_else(|| general_err!("Missing column chunk dictionary"))?;
             if level_encoding == Encoding::RLE || levels.is_none() {
-                let values = match (non_null, &levels) {
-                    (Some(values), _) => values,
-                    (None, None) => rows,
-                    (None, Some(levels)) => {
-                        let mut levels = CodeCursor::new(1, levels, rows, 2)?;
-                        count_valid_levels(&mut levels)?
-                    }
-                };
+                let values = non_null.or_else(|| levels.is_none().then_some(rows));
                 let page = DictionaryCodePage {
                     dictionary,
                     rows,
                     values,
-                    declared_values: non_null.is_some(),
                     levels,
                     indices: data,
                 };
-                page.indices()?;
+                // Check the encoding width now. For V1 optional pages, an
+                // empty payload is only known to be valid after reading levels.
+                page.indices_with_count(values.unwrap_or(0))?;
                 return Ok(Some(CodeColumnPage::Dictionary(page)));
             }
             // The legacy BIT_PACKED level encoding falls back to value space.
@@ -373,8 +484,7 @@ where
             let page = DictionaryCodePage {
                 dictionary,
                 rows,
-                values: count,
-                declared_values: false,
+                values: Some(count),
                 levels: None,
                 indices: data,
             };
@@ -601,6 +711,26 @@ mod tests {
                                     cached_dictionary = Some(Arc::clone(selected.values()));
                                 }
                                 assert_eq!(page.dictionary().entry_count(), 2);
+                                let expected = &expected[row..row + page.num_rows()];
+                                let mut table = page.dictionary().verdict_table([false, true]);
+                                let mut valid = Vec::new();
+                                let mut verdicts = Vec::new();
+                                assert_eq!(
+                                    page.validity(&mut valid).unwrap(),
+                                    expected.iter().flatten().count()
+                                );
+                                page.verdicts(&mut table, &mut valid, &mut verdicts)
+                                    .unwrap();
+                                for (i, &value) in expected.iter().enumerate() {
+                                    assert_eq!(
+                                        (valid[i / 64] >> (i % 64)) & 1,
+                                        u64::from(value.is_some())
+                                    );
+                                    assert_eq!(
+                                        (verdicts[i / 64] >> (i % 64)) & 1,
+                                        u64::from(value == Some(43))
+                                    );
+                                }
                                 assert!(page.selected_keys([10, 2]).is_err());
                                 assert!(page.selected_keys([page.num_rows()]).is_err());
                                 row += page.num_rows();
@@ -619,6 +749,34 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn code_page_verdicts_check_deferred_level_and_index_counts() {
+        let mut v2 = data_page(true, &[true, false], Encoding::RLE_DICTIONARY, [0, 2]);
+        let Page::DataPageV2 { num_nulls, .. } = &mut v2 else {
+            unreachable!()
+        };
+        *num_nulls = 0;
+        let v1 = data_page(false, &[true], Encoding::RLE_DICTIONARY, []);
+        let pages = [dictionary(&[17]), v2, v1];
+        let mut reader = CodeColumnReader::<Int32Type, ArrowInt32>::new(
+            descriptor(),
+            Box::new(InMemoryPageReader::new(pages)),
+        )
+        .unwrap();
+        let mut validity = Vec::new();
+        let mut verdicts = Vec::new();
+        for _ in 0..2 {
+            let Some(CodeColumnPage::Dictionary(page)) = reader.next_page().unwrap() else {
+                panic!("expected dictionary page")
+            };
+            let mut table = page.dictionary().verdict_table([true]);
+            assert!(
+                page.verdicts(&mut table, &mut validity, &mut verdicts)
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -649,6 +807,13 @@ mod tests {
             assert_eq!(page.dictionary().entry_count(), 0);
             let selected = page.selected_keys([0, 7, 13]).unwrap();
             assert_eq!(selected.keys().null_count(), 3);
+            let mut table = page.dictionary().verdict_table([]);
+            let mut valid = Vec::new();
+            let mut verdicts = Vec::new();
+            page.verdicts(&mut table, &mut valid, &mut verdicts)
+                .unwrap();
+            assert_eq!(valid, vec![0; page.num_rows().div_ceil(64)]);
+            assert_eq!(verdicts, valid);
             let Some(CodeColumnPage::Dictionary(page)) = reader.next_page().unwrap() else {
                 panic!("expected dictionary page")
             };

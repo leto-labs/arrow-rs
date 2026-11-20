@@ -66,6 +66,15 @@ for 7%. The remaining samples covered shared definition-level handling and
 other scan work. See the lane's benchmark evidence in the consuming
 repository's benchmark data.
 
+The follow-up walker calls each sink directly. Its dense verdict sink checks
+packed codes in the lookup table through width 20 and tracks the maximum
+code at wider widths. It reads the packed page with unaligned little-endian
+loads and saves the final bytes once for padded loads at the boundary.
+The flat page builds its validity words once per verdict call, checks a V2
+declared count, then expands dense verdicts to row positions. Errors invalidate
+the caller's scratch output. The count-only push checkpoint measured
+10.51 user cycles per input row across the three columns on CPU 24.
+
 FUG requires Parquet MSRV 1.89 for stable AVX-512 intrinsics; other packages keep
 their upstream minimums. SIMD paths select instructions at run time and have
 scalar differential coverage. Z1-A borrows only aligned immutable dictionary
