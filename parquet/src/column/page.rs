@@ -433,6 +433,14 @@ pub trait PageReader: Iterator<Item = Result<Page>> + Send {
     /// column index information
     fn skip_next_page(&mut self) -> Result<()>;
 
+    /// Steps past a data page with no selected rows.
+    ///
+    /// The caller has already checked that the next page is a data page.
+    #[doc(hidden)]
+    fn skip_unselected_data_page(&mut self) -> Result<()> {
+        self.skip_next_page()
+    }
+
     /// Returns whether skipped dictionary pages can later be recovered with
     /// [`Self::take_deferred_dictionary`].
     ///

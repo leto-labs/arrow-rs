@@ -1057,6 +1057,123 @@ impl<R: ChunkReader> SerializedPageReader<R> {
         self
     }
 
+    // Unselected reads can fill an admitted compressed page without recording
+    // a read of an already resident or leased page. The full read path does
+    // not use this operation.
+    fn fill_skipped_data_page(&mut self) -> Result<()> {
+        let Some(cache) = &self.page_cache else {
+            return Ok(());
+        };
+        if self.decompressor.is_none() {
+            return Ok(());
+        }
+        let start = match &self.state {
+            SerializedPageReaderState::Values {
+                next_page_header, ..
+            } => {
+                let Some(header) = next_page_header.as_deref() else {
+                    // The preceding peek saw a resident page or no page.
+                    return Ok(());
+                };
+                if !matches!(header.r#type, PageType::DATA_PAGE | PageType::DATA_PAGE_V2)
+                    || !page_body_is_compressed(header)
+                {
+                    return Ok(());
+                }
+                let Some(start) = cache.peeked_start else {
+                    return Ok(());
+                };
+                start
+            }
+            SerializedPageReaderState::Pages {
+                dictionary_page,
+                page_locations,
+                ..
+            } => {
+                let Some(front) = page_locations.front().filter(|_| dictionary_page.is_none())
+                else {
+                    return Ok(());
+                };
+                u64::try_from(front.offset)?
+            }
+        };
+        if cache.is_pinned(start) {
+            return Ok(());
+        }
+        let PageLookup::Miss(Some(fill)) = cache.cache.get_with_accounting(start, true, |_| false)
+        else {
+            return Ok(());
+        };
+        let (header, data, page_index, stored_len) = match &self.state {
+            SerializedPageReaderState::Values {
+                offset,
+                remaining_bytes,
+                next_page_header,
+                page_index,
+                ..
+            } => {
+                let header = next_page_header.as_deref().expect("peeked header");
+                verify_page_size(
+                    header.compressed_page_size,
+                    header.uncompressed_page_size,
+                    *remaining_bytes,
+                )?;
+                let len = header.compressed_page_size as usize;
+                let data = self.reader.get_bytes(*offset, len)?;
+                (
+                    header.clone(),
+                    data,
+                    *page_index,
+                    *offset - start + len as u64,
+                )
+            }
+            SerializedPageReaderState::Pages {
+                page_locations,
+                page_index,
+                ..
+            } => {
+                let front = page_locations.front().expect("next data page");
+                let len = usize::try_from(front.compressed_page_size)?;
+                let buffer = self.reader.get_bytes(start, len)?;
+                let (header_len, header) = read_page_header_len_from_bytes(
+                    &self.context,
+                    buffer.as_ref(),
+                    *page_index,
+                    false,
+                )?;
+                if !matches!(header.r#type, PageType::DATA_PAGE | PageType::DATA_PAGE_V2)
+                    || !location_matches_header(header_len, &header, len)
+                    || !page_body_is_compressed(&header)
+                {
+                    return Ok(());
+                }
+                (header, buffer.slice(header_len..), *page_index, len as u64)
+            }
+        };
+        let data = self.context.decrypt_page_data(data, page_index, false)?;
+        let page = decode_page(header, data, self.physical_type, self.decompressor.as_mut())?;
+        if is_dictionary_encoded(page.encoding())
+            && self
+                .plain_chunk
+                .as_ref()
+                .is_some_and(PlainChunk::needs_dictionary)
+            && let Some(dictionary) = self.take_deferred_dictionary()?
+        {
+            self.deferred_dictionary = Some(DeferredDictionaryPage::Decoded(dictionary));
+        }
+        let codec = self.cache_codec();
+        publish_page(
+            Some(fill),
+            true,
+            page,
+            stored_len,
+            codec,
+            self.plain_chunk.as_mut(),
+            self.flat_nullable,
+        );
+        Ok(())
+    }
+
     /// The codec that cached pages of this chunk must have.
     fn cache_codec(&self) -> Compression {
         self.page_cache_codec.unwrap_or(Compression::UNCOMPRESSED)
@@ -1607,6 +1724,11 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                 }
             }
         }
+    }
+
+    fn skip_unselected_data_page(&mut self) -> Result<()> {
+        self.fill_skipped_data_page()?;
+        self.skip_next_page()
     }
 
     fn skip_next_page(&mut self) -> Result<()> {
@@ -3804,6 +3926,94 @@ mod tests {
         let (records, _, _) = reader.read_records(1, None, None, &mut values).unwrap();
         assert_eq!(records, 0, "chunk is exhausted");
         assert!(values.is_empty());
+    }
+
+    #[test]
+    fn unselected_page_default_still_calls_skip_next_page() {
+        let (bytes, _) = dict_column_file();
+        let reader = SerializedFileReader::new(bytes.clone()).unwrap();
+        let group = reader.metadata().row_group(0);
+        let pages = SerializedPageReader::new(Arc::new(bytes), group.column(0), 5, None).unwrap();
+        let mut pages = NonDeferringPageReader(pages);
+        assert!(pages.peek_next_page().unwrap().unwrap().is_dict);
+        pages.skip_unselected_data_page().unwrap();
+        assert!(!pages.peek_next_page().unwrap().unwrap().is_dict);
+        pages.skip_unselected_data_page().unwrap();
+        assert!(pages.peek_next_page().unwrap().is_none());
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn unselected_page_cache_fills_once_and_skips_hits_without_reading() {
+        use crate::file::page_cache::testing::MapPageCache;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let (bytes, _) = dict_column_file();
+        let reader = SerializedFileReader::new(bytes.clone()).unwrap();
+        let group = reader.metadata().row_group(0);
+        let cache = Arc::new(MapPageCache::with_leases());
+        let make = || {
+            SerializedPageReader::new(Arc::new(bytes.clone()), group.column(0), 5, None)
+                .unwrap()
+                .with_page_cache(Some(cache.clone()), None)
+        };
+        let mut pages = make();
+        assert!(pages.get_next_page().unwrap().unwrap().is_dictionary_page());
+        assert_eq!(cache.fills.load(Relaxed), 1);
+        assert!(!pages.peek_next_page().unwrap().unwrap().is_dict);
+        pages.skip_unselected_data_page().unwrap();
+        assert_eq!(cache.fills.load(Relaxed), 2);
+        assert_eq!(cache.hits.load(Relaxed), 0);
+
+        let mut pages = make();
+        assert!(pages.peek_next_page().unwrap().unwrap().is_dict);
+        pages.skip_next_page().unwrap();
+        pages.skip_unselected_data_page().unwrap();
+        assert_eq!(cache.fills.load(Relaxed), 2);
+        assert_eq!(cache.hits.load(Relaxed), 0);
+
+        let mut pages = make();
+        pages.skip_next_page().unwrap();
+        assert!(pages.get_next_page().unwrap().unwrap().is_data_page());
+        assert_eq!(cache.hits.load(Relaxed), 1);
+
+        let (start, len) = group.column(0).byte_range();
+        let chunk = start..start + len;
+        let lease = Arc::new(cache.lease(&[vec![chunk.clone()]]).unwrap());
+        let pinned = Arc::new(PinnedPages::new(lease, chunk));
+        let mut pages = SerializedPageReader::new(Arc::new(bytes), group.column(0), 5, None)
+            .unwrap()
+            .with_page_cache(Some(cache.clone()), Some(pinned));
+        pages.skip_next_page().unwrap();
+        pages.skip_unselected_data_page().unwrap();
+        drop(pages);
+        assert_eq!(cache.hits.load(Relaxed), 1);
+        assert_eq!(cache.lease_reads.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn unselected_page_skips_corrupt_compressed_body_until_read() {
+        let (bytes, _) = dict_column_file();
+        let reader = SerializedFileReader::new(bytes.clone()).unwrap();
+        let group = reader.metadata().row_group(0);
+        let column = group.column(0);
+        let start = column.data_page_offset() as usize;
+        let original = SerializedPageReader::new(Arc::new(bytes.clone()), column, 5, None).unwrap();
+        let (header_len, header) =
+            read_page_header_len_from_bytes(&original.context, &bytes[start..], 0, false).unwrap();
+        let mut corrupt = bytes.to_vec();
+        let start = start + header_len;
+        corrupt[start..start + header.compressed_page_size as usize].fill(0);
+        let corrupt = Arc::new(Bytes::from(corrupt));
+        let make = || SerializedPageReader::new(corrupt.clone(), column, 5, None).unwrap();
+        let mut pages = make();
+        assert!(pages.get_next_page().unwrap().unwrap().is_dictionary_page());
+        pages.skip_unselected_data_page().unwrap();
+        assert!(pages.get_next_page().unwrap().is_none());
+
+        let mut pages = make();
+        assert!(pages.get_next_page().unwrap().unwrap().is_dictionary_page());
+        assert!(pages.get_next_page().is_err());
     }
 
     /// The probe has to describe what the reader can actually do. Without page
