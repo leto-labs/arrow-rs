@@ -17,7 +17,7 @@
 
 //! Logic for reading into arrow arrays: [`ArrayReader`] and [`RowGroups`]
 
-use crate::errors::Result;
+use crate::errors::{ParquetError, Result};
 use arrow_array::ArrayRef;
 use arrow_schema::DataType as ArrowType;
 use std::any::Any;
@@ -46,6 +46,7 @@ mod primitive_array;
 mod row_group_cache;
 mod row_group_index;
 mod row_number;
+mod selected_primitive;
 mod struct_array;
 
 #[cfg(test)]
@@ -101,6 +102,16 @@ pub trait ArrayReader: Send {
     fn next_batch(&mut self, batch_size: usize) -> Result<ArrayRef> {
         self.read_records(batch_size)?;
         self.consume_batch()
+    }
+
+    /// Advances over exactly `rows` records and returns the selected rows.
+    ///
+    /// Bit zero of word zero selects the first row. Bits past `rows` are
+    /// ignored. Consume any buffered batch before calling this method.
+    fn read_selected(&mut self, words: &[u64], rows: usize) -> Result<ArrayRef> {
+        check_selection(words, rows)?;
+        self.read_records(rows)?;
+        filter_selection(self.consume_batch()?, words, rows)
     }
 
     /// Reads at most `batch_size` records' bytes into buffer
@@ -189,6 +200,30 @@ impl RowGroups for Arc<dyn FileReader> {
     fn metadata(&self) -> &ParquetMetaData {
         FileReader::metadata(self.as_ref())
     }
+}
+
+fn check_selection(words: &[u64], rows: usize) -> Result<()> {
+    if words.len() < rows.div_ceil(64) {
+        return Err(general_err!(
+            "Selection bitmap is too short for {rows} rows"
+        ));
+    }
+    Ok(())
+}
+
+fn filter_selection(array: ArrayRef, words: &[u64], rows: usize) -> Result<ArrayRef> {
+    if array.len() != rows {
+        return Err(eof_err!("not enough rows for selected vector"));
+    }
+    let words = &words[..rows.div_ceil(64)];
+    let bits = if cfg!(target_endian = "little") {
+        arrow_buffer::Buffer::from_vec(words.to_vec())
+    } else {
+        arrow_buffer::Buffer::from_vec(words.iter().flat_map(|word| word.to_le_bytes()).collect())
+    };
+    let mask =
+        arrow_array::BooleanArray::new(arrow_buffer::BooleanBuffer::new(bits, 0, rows), None);
+    Ok(arrow_select::filter::filter(array.as_ref(), &mask)?)
 }
 
 /// Uses `record_reader` to read up to `batch_size` records from `pages`

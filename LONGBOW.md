@@ -73,6 +73,15 @@ little-endian load per 64 levels. On the AVX-512 tier with BMI2 and POPCNT,
 row expansion uses hardware bit deposit. Errors invalidate the caller's
 scratch output.
 
+Selected reads of flat INT32, INT64, FLOAT and DOUBLE chunks use the same
+run walker. The reader keeps its current run boundary and reuses rank,
+validity and code buffers between vectors. It validates selected packed codes
+and skips unselected runs by their headers. The dictionary retains its PLAIN
+page bytes and can gather unaligned little-endian values directly. Fixed-width
+PLAIN data pages use the same gather. Legacy levels and other value encodings
+use the existing decoders. Unselected data pages are stepped over separately,
+with compressed bodies decoded only when the page cache offers a fill ticket.
+
 Before growing a bitmap, the reader checks that run lengths and payloads
 cover the declared count. A final packed group may pad up to seven slots.
 The reader also accepts trailing zero-byte padding emitted by fastparquet.

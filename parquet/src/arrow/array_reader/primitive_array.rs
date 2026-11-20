@@ -17,13 +17,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::arrow::array_reader::{ArrayReader, read_records, skip_records};
+use super::selected_primitive::SelectedPrimitive;
+use crate::arrow::array_reader::{
+    ArrayReader, check_selection, filter_selection, read_records, skip_records,
+};
 use crate::arrow::record_reader::RecordReader;
 use crate::arrow::schema::parquet_to_arrow_field;
 use crate::basic::Type as PhysicalType;
 use crate::column::page::PageIterator;
 use crate::data_type::{DataType, Int96};
-use crate::errors::Result;
+use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date64Array, Decimal64Array, Decimal128Array, Decimal256Array,
@@ -97,6 +100,9 @@ where
     def_levels_buffer: Option<Vec<i16>>,
     rep_levels_buffer: Option<Vec<i16>>,
     record_reader: RecordReader<T>,
+    selection_descr: Option<ColumnDescPtr>,
+    selected: Option<Box<SelectedPrimitive<T>>>,
+    full_started: bool,
 }
 
 impl<T> PrimitiveArrayReader<T>
@@ -126,6 +132,19 @@ where
                 .clone(),
         };
 
+        let selection_descr = (column_desc.max_rep_level() == 0
+            && (column_desc.max_def_level() == 0
+                || (column_desc.max_def_level() == 1 && column_desc.self_type().is_optional()))
+            && padding_threshold.is_none()
+            && matches!(
+                T::get_physical_type(),
+                PhysicalType::INT32
+                    | PhysicalType::INT64
+                    | PhysicalType::FLOAT
+                    | PhysicalType::DOUBLE
+            )
+            && !matches!(data_type, ArrowType::Dictionary(..)))
+        .then(|| column_desc.clone());
         let mut record_reader = RecordReader::<T>::new(column_desc, batch_size);
         if let Some(threshold) = padding_threshold {
             record_reader.set_padding_threshold(threshold);
@@ -137,48 +156,15 @@ where
             def_levels_buffer: None,
             rep_levels_buffer: None,
             record_reader,
+            selection_descr,
+            selected: None,
+            full_started: false,
         })
     }
-}
 
-/// Implementation of primitive array reader.
-impl<T> ArrayReader for PrimitiveArrayReader<T>
-where
-    T: DataType,
-    T::T: Copy + Default,
-    Vec<T::T>: IntoBuffer,
-{
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    /// Returns data type of primitive array.
-    fn get_data_type(&self) -> &ArrowType {
-        &self.data_type
-    }
-
-    fn read_records(&mut self, batch_size: usize) -> Result<usize> {
-        read_records(&mut self.record_reader, self.pages.as_mut(), batch_size)
-    }
-
-    fn consume_batch(&mut self) -> Result<ArrayRef> {
-        let target_type = &self.data_type;
-
-        // Convert physical data to equivalent arrow type, and then perform
-        // coercion as needed
-        let len = self.record_reader.values_written();
-
-        let record_data = self
-            .record_reader
-            .consume_record_data()
-            .into_buffer(target_type);
-
-        let nulls = self
-            .record_reader
-            .consume_compact_bitmap()
-            .and_then(|b| NullBuffer::from_unsliced_buffer(b, len));
-
-        let array: ArrayRef = match T::get_physical_type() {
+    #[inline]
+    fn native_array(record_data: Buffer, len: usize, nulls: Option<NullBuffer>) -> ArrayRef {
+        match T::get_physical_type() {
             PhysicalType::BOOLEAN => Arc::new(BooleanArray::new(
                 BooleanBuffer::new(record_data, 0, len),
                 nulls,
@@ -206,10 +192,118 @@ where
             PhysicalType::BYTE_ARRAY | PhysicalType::FIXED_LEN_BYTE_ARRAY => {
                 unreachable!("PrimitiveArrayReaders don't support complex physical types");
             }
-        };
+        }
+    }
 
-        // Coerce the arrow type to the desired array type
-        let array = coerce_array(array, target_type)?;
+    fn resume_full(&mut self) -> Result<()> {
+        if let Some(selected) = self.selected.take()
+            && let Some((pages, offset)) = selected.into_replay()
+        {
+            self.record_reader.set_page_reader(pages)?;
+            if offset != 0 && self.record_reader.skip_records(offset)? != offset {
+                return Err(eof_err!("Incomplete data page when resuming full decode"));
+            }
+        }
+        self.full_started = true;
+        Ok(())
+    }
+}
+
+/// Implementation of primitive array reader.
+impl<T> ArrayReader for PrimitiveArrayReader<T>
+where
+    T: DataType,
+    T::T: Copy + Default,
+    Vec<T::T>: IntoBuffer,
+{
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    /// Returns data type of primitive array.
+    fn get_data_type(&self) -> &ArrowType {
+        &self.data_type
+    }
+
+    fn read_records(&mut self, batch_size: usize) -> Result<usize> {
+        if batch_size == 0 {
+            return Ok(0);
+        }
+        if !self.full_started {
+            self.resume_full()?;
+        }
+        read_records(&mut self.record_reader, self.pages.as_mut(), batch_size)
+    }
+
+    fn read_selected(&mut self, words: &[u64], rows: usize) -> Result<ArrayRef> {
+        check_selection(words, rows)?;
+        if self.record_reader.num_records() != 0 {
+            return Err(general_err!(
+                "Consume the previous batch before reading a selected vector"
+            ));
+        }
+        if rows == 0 {
+            return Ok(arrow_array::new_empty_array(&self.data_type));
+        }
+        if self.selection_descr.is_none() {
+            self.read_records(rows)?;
+            return filter_selection(self.consume_batch()?, words, rows);
+        }
+
+        // A preceding ordinary read may own the current chunk. Its decoder
+        // finishes that chunk, then selected reads can start with the next.
+        let mut start = 0;
+        let mut prefix = None;
+        if self.full_started {
+            start = self.record_reader.read_records(rows)?;
+            let array = self.consume_batch()?;
+            if start == rows {
+                return filter_selection(array, words, rows);
+            }
+            if start != 0 {
+                prefix = Some(filter_selection(array, words, start)?);
+            }
+            self.full_started = false;
+        }
+
+        let selected = self.selected.get_or_insert_with(|| {
+            Box::new(SelectedPrimitive::new(
+                self.selection_descr.as_ref().unwrap().clone(),
+            ))
+        });
+        let (values, nulls) = selected.read(self.pages.as_mut(), words, start, rows)?;
+        let len = values.len();
+        let values = values.into_buffer(&self.data_type);
+        let array = coerce_array(Self::native_array(values, len, nulls), &self.data_type)?;
+        self.def_levels_buffer = None;
+        self.rep_levels_buffer = None;
+        if let Some(prefix) = prefix {
+            return Ok(arrow_select::concat::concat(&[
+                prefix.as_ref(),
+                array.as_ref(),
+            ])?);
+        }
+        Ok(array)
+    }
+
+    fn consume_batch(&mut self) -> Result<ArrayRef> {
+        let target_type = &self.data_type;
+
+        // Convert physical data to equivalent arrow type, and then perform
+        // coercion as needed
+        let len = self.record_reader.values_written();
+
+        let record_data = self
+            .record_reader
+            .consume_record_data()
+            .into_buffer(target_type);
+
+        let nulls = self
+            .record_reader
+            .consume_compact_bitmap()
+            .and_then(|b| NullBuffer::from_unsliced_buffer(b, len));
+
+        let array = coerce_array(Self::native_array(record_data, len, nulls), target_type)?;
 
         // save definition and repetition buffers
         self.def_levels_buffer = self.record_reader.consume_def_levels();
@@ -219,6 +313,12 @@ where
     }
 
     fn skip_records(&mut self, num_records: usize) -> Result<usize> {
+        if num_records == 0 {
+            return Ok(0);
+        }
+        if !self.full_started {
+            self.resume_full()?;
+        }
         skip_records(&mut self.record_reader, self.pages.as_mut(), num_records)
     }
 
@@ -714,6 +814,131 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn selected_vectors_match_full_with_plain_fallback_and_row_group_slices() {
+        use crate::arrow::ArrowWriter;
+        use crate::column::page::PageReader;
+        use crate::file::{
+            properties::{WriterProperties, WriterVersion},
+            reader::{FilePageIterator, FileReader, SerializedFileReader},
+        };
+        use arrow_array::{BooleanArray, RecordBatch};
+        use bytes::Bytes;
+        use rand::{RngExt, SeedableRng};
+
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(0x128);
+        for version in [WriterVersion::PARQUET_1_0, WriterVersion::PARQUET_2_0] {
+            for encoding in [Encoding::RLE_DICTIONARY, Encoding::DELTA_BINARY_PACKED] {
+                for pattern in 0..5 {
+                    let nullable = pattern != 0;
+                    let values = (0..2111)
+                        .map(|i| {
+                            let valid = match pattern {
+                                0 | 1 => true,
+                                2 => false,
+                                3 => rng.random_bool(0.7),
+                                _ => i % 2 == 0,
+                            };
+                            valid.then(|| if i % 701 < 74 { 42 } else { i as i64 })
+                        })
+                        .collect::<Vec<_>>();
+                    let schema =
+                        Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                            "value",
+                            ArrowType::Int64,
+                            nullable,
+                        )]));
+                    let batch = RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![Arc::new(Int64Array::from(values))],
+                    )
+                    .unwrap();
+                    let props = WriterProperties::builder()
+                        .set_writer_version(version)
+                        .set_dictionary_enabled(encoding == Encoding::RLE_DICTIONARY)
+                        .set_dictionary_page_size_limit(192)
+                        .set_encoding(if encoding == Encoding::RLE_DICTIONARY {
+                            Encoding::PLAIN
+                        } else {
+                            encoding
+                        })
+                        .set_max_row_group_row_count(Some(701))
+                        .set_data_page_row_count_limit(71)
+                        .set_write_batch_size(37)
+                        .build();
+                    let mut bytes = Vec::new();
+                    let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(props)).unwrap();
+                    writer.write(&batch).unwrap();
+                    writer.close().unwrap();
+                    let file = Arc::new(SerializedFileReader::new(Bytes::from(bytes)).unwrap());
+                    if encoding == Encoding::RLE_DICTIONARY && pattern != 2 {
+                        let mut pages: Box<dyn PageReader> = file
+                            .get_row_group(0)
+                            .unwrap()
+                            .get_column_page_reader(0)
+                            .unwrap();
+                        let mut encodings = Vec::new();
+                        while let Some(page) = pages.get_next_page().unwrap() {
+                            if page.is_data_page() {
+                                encodings.push(page.encoding());
+                            }
+                        }
+                        assert!(encodings.contains(&Encoding::RLE_DICTIONARY));
+                        assert!(encodings.contains(&Encoding::PLAIN));
+                    }
+                    let desc = file.metadata().file_metadata().schema_descr().column(0);
+                    let build = || {
+                        let pages = Box::new(FilePageIterator::new(0, file.clone()).unwrap());
+                        PrimitiveArrayReader::<Int64Type>::new(pages, desc.clone(), None, 79, None)
+                            .unwrap()
+                    };
+
+                    let mut full = build();
+                    let mut selected = build();
+                    assert!(selected.read_selected(&[], 65).is_err());
+                    let start = if pattern % 2 == 0 { 0 } else { 39 };
+                    assert_eq!(full.skip_records(start).unwrap(), start);
+                    assert_eq!(selected.skip_records(start).unwrap(), start);
+                    let mut offset = start;
+                    for vector in 0.. {
+                        if offset == batch.num_rows() {
+                            break;
+                        }
+                        let rows = [0usize, 1, 37, 79, 139, 507, 143][vector % 7]
+                            .min(batch.num_rows() - offset);
+                        let density = [0.0, 0.001, 0.02, 0.1, 0.5, 1.0][vector % 6];
+                        let mut words = vec![0; rows.div_ceil(64)];
+                        let mask = BooleanArray::from_iter((0..rows).map(|row| {
+                            let select = rng.random_bool(density);
+                            if select {
+                                words[row / 64] |= 1 << (row % 64);
+                            }
+                            Some(select)
+                        }));
+                        let reference = full.next_batch(rows).unwrap();
+                        let actual = if vector >= 11 && vector % 5 == 4 {
+                            // Full and selected reads share the same buffered page.
+                            selected.next_batch(rows).unwrap()
+                        } else {
+                            selected.read_selected(&words, rows).unwrap()
+                        };
+                        let expected = if vector >= 11 && vector % 5 == 4 {
+                            reference
+                        } else {
+                            arrow_select::filter::filter(reference.as_ref(), &mask).unwrap()
+                        };
+                        assert_eq!(
+                            actual.as_ref(),
+                            expected.as_ref(),
+                            "{version:?} {encoding:?} pattern={pattern} offset={offset}"
+                        );
+                        offset += rows;
+                    }
+                }
+            }
+        }
+    }
+
     use crate::arrow::array_reader::test_util::EmptyPageIterator;
     use crate::arrow::arrow_reader::DEFAULT_BATCH_SIZE;
     use crate::basic::Encoding;
