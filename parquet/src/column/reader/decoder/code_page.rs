@@ -34,7 +34,9 @@ use super::{ColumnLevelDecoder, DefinitionLevelDecoder, DefinitionLevelDecoderIm
 use crate::basic::Encoding;
 use crate::column::page::{Page, PageReader};
 use crate::data_type::DataType;
-use crate::encodings::rle::codes::{CodeCursor, CodeRun, RunSink, VerdictTable, low_mask};
+use crate::encodings::rle::codes::{
+    CodeCursor, CodeRun, RunSink, VerdictTable, WordWriter, load_padded, low_mask, padded_tail,
+};
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 
@@ -101,65 +103,35 @@ impl RunSink for LevelCount {
     }
 }
 
+/// Appends flat definition levels to row-ordered validity words.
 struct ValidityWriter<'a> {
-    words: &'a mut [u64],
-    position: usize,
-    nulls: usize,
-}
-
-impl ValidityWriter<'_> {
-    #[inline]
-    fn clear_bits(&mut self, bits: u64, len: usize) {
-        if bits != 0 {
-            let word = self.position / 64;
-            let shift = self.position % 64;
-            self.words[word] &= !(bits << shift);
-            if len > 64 - shift {
-                self.words[word + 1] &= !(bits >> (64 - shift));
-            }
-            self.nulls += bits.count_ones() as usize;
-        }
-        self.position += len;
-    }
+    writer: WordWriter<'a>,
+    tail: [u8; 16],
 }
 
 impl RunSink for ValidityWriter<'_> {
-    #[inline]
+    #[inline(always)]
     fn repeated(&mut self, code: u32, len: usize) {
-        let end = self.position + len;
-        if code == 0 {
-            let first = self.position / 64;
-            let last = (end - 1) / 64;
-            let head = u64::MAX << (self.position % 64);
-            let tail = low_mask((end - 1) % 64 + 1);
-            if first == last {
-                self.words[first] &= !(head & tail);
-            } else {
-                self.words[first] &= !head;
-                self.words[first + 1..last].fill(0);
-                self.words[last] &= !tail;
-            }
-            self.nulls += len;
-        }
-        self.position = end;
+        // The walk has checked `code < 2`.
+        self.writer.repeat(code != 0, len);
     }
 
-    #[inline]
+    /// `bytes` is the rest of the level stream (`drain_padded`), so each
+    /// group of 64 levels is one padded load masked to the run.
+    #[inline(always)]
     fn packed(&mut self, width: u8, bytes: &[u8], len: usize) {
         debug_assert_eq!(width, 1);
-        let (chunks, remainder) = bytes.as_chunks::<8>();
+        let mut offset = 0;
         let mut remaining = len;
-        for chunk in chunks {
+        loop {
             let count = remaining.min(64);
-            let word = u64::from_le_bytes(*chunk);
-            self.clear_bits(!word & low_mask(count), count);
+            let word = load_padded(bytes, offset, &self.tail);
+            self.writer.write(word & low_mask(count), count);
             remaining -= count;
-        }
-        if remaining != 0 {
-            let mut tail = [0; 8];
-            tail[..remainder.len()].copy_from_slice(remainder);
-            let word = u64::from_le_bytes(tail);
-            self.clear_bits(!word & low_mask(remaining), remaining);
+            if remaining == 0 {
+                break;
+            }
+            offset += 8;
         }
     }
 }
@@ -229,20 +201,29 @@ impl DictionaryCodePage {
     /// Builds a row validity bitmap and returns its non-null count.
     /// Word bits are in row order, starting at the least significant bit.
     pub fn validity(&self, out: &mut Vec<u64>) -> Result<usize> {
+        self.validity_inline(out)
+    }
+
+    #[inline(always)]
+    fn validity_inline(&self, out: &mut Vec<u64>) -> Result<usize> {
         out.clear();
-        out.resize(self.rows.div_ceil(64), u64::MAX);
-        if let Some(last) = out.last_mut() {
-            *last = low_mask((self.rows - 1) % 64 + 1);
-        }
-        let mut sink = ValidityWriter {
-            words: out,
-            position: 0,
-            nulls: 0,
+        let Some(levels) = &self.levels else {
+            out.resize(self.rows.div_ceil(64), u64::MAX);
+            if let Some(last) = out.last_mut() {
+                *last = low_mask((self.rows - 1) % 64 + 1);
+            }
+            return Ok(self.rows);
         };
-        if let Some(mut levels) = self.levels() {
-            levels.drain(&mut sink)?;
-        }
-        let count = self.rows - sink.nulls;
+        out.resize(self.rows.div_ceil(64), 0);
+        let mut sink = ValidityWriter {
+            writer: WordWriter::new(out),
+            tail: padded_tail(levels),
+        };
+        CodeCursor::new(1, levels, self.rows, 2)?.drain_padded(&mut sink)?;
+        sink.writer.finish();
+        // Packed loads are masked to their runs, so bits past the last row
+        // are zero.
+        let count = out.iter().map(|word| word.count_ones() as usize).sum();
         self.check_count(count)?;
         Ok(count)
     }
@@ -255,18 +236,55 @@ impl DictionaryCodePage {
         validity: &mut Vec<u64>,
         out: &mut Vec<u64>,
     ) -> Result<()> {
+        #[cfg(all(target_arch = "x86_64", not(miri)))]
+        if fast_bitmaps() {
+            // SAFETY: `fast_bitmaps` checked that the CPU has BMI2 and POPCNT.
+            return unsafe { self.verdicts_bmi2(table, validity, out) };
+        }
+        self.verdicts_with(table, validity, out, |bits, mask| {
+            if mask == u64::MAX {
+                bits
+            } else {
+                expand(bits, mask)
+            }
+        })
+    }
+
+    /// The whole page path compiled with BMI2 and POPCNT: the level walk,
+    /// the index walk, the non-null count and the row expansion.
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    #[target_feature(enable = "bmi2,popcnt")]
+    fn verdicts_bmi2(
+        &self,
+        table: &mut VerdictTable,
+        validity: &mut Vec<u64>,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        self.verdicts_with(table, validity, out, |bits, mask| {
+            std::arch::x86_64::_pdep_u64(bits, mask)
+        })
+    }
+
+    #[inline(always)]
+    fn verdicts_with(
+        &self,
+        table: &mut VerdictTable,
+        validity: &mut Vec<u64>,
+        out: &mut Vec<u64>,
+        deposit: impl Fn(u64, u64) -> u64,
+    ) -> Result<()> {
         let count = if self.levels.is_some() {
-            self.validity(validity)?
+            self.validity_inline(validity)?
         } else {
             self.rows
         };
-        self.indices_with_count(count)?.verdicts(table, out)?;
+        self.indices_with_count(count)?
+            .verdicts_inline(table, out)?;
         if count == self.rows {
             return Ok(());
         }
-
         out.resize(validity.len(), 0);
-        scatter_verdicts(out, validity, count);
+        scatter_verdicts_with(out, validity, count, deposit);
         Ok(())
     }
 
@@ -333,40 +351,20 @@ impl DictionaryCodePage {
     }
 }
 
-fn scatter_verdicts(out: &mut [u64], validity: &[u64], count: usize) {
-    #[cfg(all(target_arch = "x86_64", not(miri)))]
-    if std::is_x86_feature_detected!("avx512f")
+/// Whether to run the BMI2 page path. AVX-512 stands in for a fast `pdep`:
+/// AMD before Zen 3 implements it in microcode. Tests select by tier.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+fn fast_bitmaps() -> bool {
+    let detected = std::is_x86_feature_detected!("avx512f")
         && std::is_x86_feature_detected!("bmi2")
-        && std::is_x86_feature_detected!("popcnt")
-    {
-        #[cfg(test)]
-        let enabled = !matches!(
+        && std::is_x86_feature_detected!("popcnt");
+    #[cfg(test)]
+    let detected = detected
+        && !matches!(
             crate::util::native::dispatch::tier(),
             crate::util::native::dispatch::Tier::Scalar | crate::util::native::dispatch::Tier::Avx2
         );
-        #[cfg(not(test))]
-        let enabled = true;
-        if enabled {
-            // SAFETY: Both target features are enabled on this CPU.
-            unsafe { scatter_verdicts_bmi2(out, validity, count) };
-            return;
-        }
-    }
-    scatter_verdicts_with(out, validity, count, |bits, mask| {
-        if mask == u64::MAX {
-            bits
-        } else {
-            expand(bits, mask)
-        }
-    });
-}
-
-#[cfg(all(target_arch = "x86_64", not(miri)))]
-#[target_feature(enable = "bmi2,popcnt")]
-fn scatter_verdicts_bmi2(out: &mut [u64], validity: &[u64], count: usize) {
-    scatter_verdicts_with(out, validity, count, |bits, mask| {
-        std::arch::x86_64::_pdep_u64(bits, mask)
-    });
+    detected
 }
 
 #[inline(always)]
@@ -721,7 +719,7 @@ mod tests {
                     for i in 0..definition.iter().filter(|&&valid| valid).count() {
                         indices.put(u64::from(i % 21 < 13));
                     }
-                    let indices: Vec<_> = [width].into_iter().chain(indices.consume()).collect();
+                    let indices: Vec<_> = std::iter::once(width).chain(indices.consume()).collect();
                     let code = data_page(v2, &definition, Encoding::RLE_DICTIONARY, indices);
                     let plain = data_page(
                         v2,
@@ -818,6 +816,89 @@ mod tests {
                     }
                     assert_eq!(row, total);
                 }
+            }
+        });
+    }
+
+    #[test]
+    fn code_page_row_bitmaps_match_levels_for_random_null_patterns() {
+        crate::util::native::dispatch::for_each_tier(|| {
+            let mut seed = 0x9e37_79b9_u32;
+            let mut next = |bound: u32| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed % bound
+            };
+            let mut validity = Vec::new();
+            let mut verdicts = Vec::new();
+            for case in 0..400 {
+                let rows = 1 + next(if case % 4 == 0 { 700 } else { 140 }) as usize;
+                // Mix scattered nulls (packed level runs at every offset) with
+                // long valid and null runs (repeated runs, some over 64).
+                let density = next(5);
+                let mut definition = Vec::with_capacity(rows);
+                while definition.len() < rows {
+                    let long = next(3) == 0;
+                    let len =
+                        (1 + next(if long { 90 } else { 9 }) as usize).min(rows - definition.len());
+                    let valid = next(5) >= density;
+                    definition.extend(std::iter::repeat_n(valid, len));
+                }
+                let valid_count = definition.iter().filter(|&&valid| valid).count();
+                let entries = 1 + next(40) as usize;
+                let mut width = 1u8;
+                while 1usize << width < entries {
+                    width += 1;
+                }
+                let mut codes = Vec::with_capacity(valid_count);
+                while codes.len() < valid_count {
+                    let code = next(entries as u32);
+                    let len = (1 + next(14) as usize).min(valid_count - codes.len());
+                    codes.extend(std::iter::repeat_n(code, len));
+                }
+                let mut encoder = RleEncoder::new(width, 0);
+                for &code in &codes {
+                    encoder.put(u64::from(code));
+                }
+                let indices: Vec<_> = std::iter::once(width).chain(encoder.consume()).collect();
+                let dictionary_values: Vec<i32> = (0..entries as i32).collect();
+                let page = data_page(
+                    case % 2 == 1,
+                    &definition,
+                    Encoding::RLE_DICTIONARY,
+                    indices,
+                );
+                let mut reader = CodeColumnReader::<Int32Type, ArrowInt32>::new(
+                    descriptor(),
+                    Box::new(InMemoryPageReader::new([
+                        dictionary(&dictionary_values),
+                        page,
+                    ])),
+                )
+                .unwrap();
+                let Some(CodeColumnPage::Dictionary(page)) = reader.next_page().unwrap() else {
+                    panic!("expected dictionary page")
+                };
+                let pass = |code: u32| code % 3 == 1;
+                let mut table = page
+                    .dictionary()
+                    .verdict_table((0..entries as u32).map(pass));
+                assert_eq!(page.validity(&mut validity).unwrap(), valid_count);
+                page.verdicts(&mut table, &mut validity, &mut verdicts)
+                    .unwrap();
+                assert_eq!(validity.len(), rows.div_ceil(64));
+                assert_eq!(verdicts.len(), rows.div_ceil(64));
+                let mut codes = codes.iter();
+                for (row, &valid) in definition.iter().enumerate() {
+                    let bit = |words: &[u64]| (words[row / 64] >> (row % 64)) & 1;
+                    assert_eq!(bit(&validity), u64::from(valid), "case {case} row {row}");
+                    let expected = valid && pass(*codes.next().unwrap());
+                    assert_eq!(bit(&verdicts), u64::from(expected), "case {case} row {row}");
+                }
+                let unused = !low_mask((rows - 1) % 64 + 1);
+                assert_eq!(validity.last().unwrap() & unused, 0, "case {case}");
+                assert_eq!(verdicts.last().unwrap() & unused, 0, "case {case}");
             }
         });
     }

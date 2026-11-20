@@ -9,13 +9,22 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-parquet = { path = "../../../..", default-features = false, features = ["experimental"] }
+parquet = { path = "../../../..", default-features = false, features = ["experimental", "arrow"] }
+arrow-array = { path = "../../../../../arrow-array" }
+bytes = "1.1"
 
 [workspace]
 
 [[bin]]
 name = "code_cursor"
 path = "fuzz_targets/code_cursor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "code_page"
+path = "fuzz_targets/code_page.rs"
 test = false
 doc = false
 bench = false
