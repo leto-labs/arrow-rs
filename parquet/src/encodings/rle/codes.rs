@@ -73,7 +73,7 @@ impl CodeRun<'_> {
                 let bytes = bytes.get(group..group.checked_add(width)?)?;
                 Some(packed_code(bytes, width, offset % 8) as u32)
             }
-            _ => None,
+            Self::Packed { .. } => None,
         }
     }
 
@@ -103,7 +103,7 @@ impl CodeRun<'_> {
                         .sum::<usize>()
                     + (bytes[last] & last_mask).count_ones() as usize
             }
-            _ => unreachable!("flat definition levels use width 1"),
+            Self::Packed { .. } => unreachable!("flat definition levels use width 1"),
         }
     }
 }

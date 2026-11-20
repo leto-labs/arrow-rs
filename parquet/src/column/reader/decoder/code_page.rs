@@ -147,18 +147,17 @@ impl RunSink for ValidityWriter<'_> {
     #[inline]
     fn packed(&mut self, width: u8, bytes: &[u8], len: usize) {
         debug_assert_eq!(width, 1);
-        let mut chunks = bytes.chunks_exact(8);
+        let (chunks, remainder) = bytes.as_chunks::<8>();
         let mut remaining = len;
-        for chunk in &mut chunks {
+        for chunk in chunks {
             let count = remaining.min(64);
-            let word = u64::from_le_bytes(chunk.try_into().unwrap());
+            let word = u64::from_le_bytes(*chunk);
             self.clear_bits(!word & low_mask(count), count);
             remaining -= count;
         }
         if remaining != 0 {
             let mut tail = [0; 8];
-            let tail_len = chunks.remainder().len();
-            tail[..tail_len].copy_from_slice(chunks.remainder());
+            tail[..remainder.len()].copy_from_slice(remainder);
             let word = u64::from_le_bytes(tail);
             self.clear_bits(!word & low_mask(remaining), remaining);
         }
@@ -528,10 +527,10 @@ where
             encoding,
             Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
         ) {
-            if self.dictionary.is_none() {
-                if let Some(page) = self.reader.take_deferred_dictionary()? {
-                    self.install_dictionary(page)?;
-                }
+            if self.dictionary.is_none()
+                && let Some(page) = self.reader.take_deferred_dictionary()?
+            {
+                self.install_dictionary(page)?;
             }
             let dictionary = self
                 .dictionary
