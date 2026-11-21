@@ -42,7 +42,10 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use arrow_array::{Array, ArrayRef, BooleanArray, Int32Array, RecordBatch};
 use arrow_buffer::BooleanBuffer;
@@ -124,7 +127,7 @@ unsafe impl GlobalAlloc for LimitedAllocator {
 #[global_allocator]
 static ALLOCATOR: LimitedAllocator = LimitedAllocator;
 
-struct PassDictionary(ProjectionMask);
+struct PassDictionary(ProjectionMask, Arc<AtomicUsize>);
 
 impl ArrowPredicate for PassDictionary {
     fn projection(&self) -> &ProjectionMask {
@@ -155,17 +158,24 @@ impl ArrowPredicate for PassDictionary {
             null: false,
         }))
     }
+
+    fn record_dictionary_filter(
+        &mut self,
+        metrics: parquet::arrow::arrow_reader::DictionaryFilterMetrics,
+    ) {
+        self.1.store(metrics.rows_verdict, Ordering::Relaxed);
+    }
 }
 
 #[test]
 fn dictionary_filter_small_unit_does_not_allocate_a_group_bitmap() {
-    const UNIT_ROWS: usize = 256 * 1024;
-    const GROUP_ROWS: usize = 8 * UNIT_ROWS;
+    const WRITE_ROWS: usize = 256 * 1024;
+    const GROUP_ROWS: usize = 8 * WRITE_ROWS;
     let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![Arc::new(Int32Array::from_iter_values(
-            (0..UNIT_ROWS).map(|row| (row % 2) as i32),
+            (0..WRITE_ROWS).map(|row| (row % 2) as i32),
         ))],
     )
     .unwrap();
@@ -174,33 +184,42 @@ fn dictionary_filter_small_unit_does_not_allocate_a_group_bitmap() {
         .set_data_page_row_count_limit(4096)
         .build();
     let mut writer = ArrowWriter::try_new(Vec::new(), schema, Some(properties)).unwrap();
-    for _ in 0..GROUP_ROWS / UNIT_ROWS {
+    for _ in 0..GROUP_ROWS / WRITE_ROWS {
         writer.write(&batch).unwrap();
     }
     let file = Bytes::from(writer.into_inner().unwrap());
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
-    let projection = ProjectionMask::leaves(builder.parquet_schema(), [0]);
-    let builder = builder
-        .with_batch_size(1024)
-        .with_row_selection(RowSelection::from(vec![
-            RowSelector::skip(GROUP_ROWS - UNIT_ROWS),
-            RowSelector::select(UNIT_ROWS),
-        ]))
-        .with_row_filter(
-            RowFilter::new(vec![Box::new(PassDictionary(projection))]).with_dictionary_filter(),
+    for unit_rows in [512 * 1024, 256 * 1024] {
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file.clone()).unwrap();
+        let projection = ProjectionMask::leaves(builder.parquet_schema(), [0]);
+        let verdict_rows = Arc::new(AtomicUsize::new(0));
+        let builder = builder
+            .with_batch_size(1024)
+            .with_row_selection(RowSelection::from(vec![
+                RowSelector::skip(WRITE_ROWS),
+                RowSelector::select(unit_rows),
+                RowSelector::skip(GROUP_ROWS - WRITE_ROWS - unit_rows),
+            ]))
+            .with_row_filter(
+                RowFilter::new(vec![Box::new(PassDictionary(
+                    projection,
+                    Arc::clone(&verdict_rows),
+                ))])
+                .with_dictionary_filter(),
+            );
+        let (rows, largest) = with_limit(|| {
+            builder
+                .build()
+                .unwrap()
+                .map(|batch| batch.unwrap().num_rows())
+                .sum::<usize>()
+        });
+        assert_eq!(rows, unit_rows);
+        assert_eq!(verdict_rows.load(Ordering::Relaxed), unit_rows);
+        assert!(
+            largest <= unit_rows / 8,
+            "largest allocation was {largest} bytes for a {unit_rows}-row span"
         );
-    let (rows, largest) = with_limit(|| {
-        builder
-            .build()
-            .unwrap()
-            .map(|batch| batch.unwrap().num_rows())
-            .sum::<usize>()
-    });
-    assert_eq!(rows, UNIT_ROWS);
-    assert!(
-        largest < GROUP_ROWS / 8,
-        "largest allocation was {largest} bytes, enough for a full-group bitmap"
-    );
+    }
 }
 
 /// Runs `read` with the allocation limit and returns its result and the

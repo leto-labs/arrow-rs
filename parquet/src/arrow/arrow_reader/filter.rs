@@ -998,7 +998,120 @@ mod dictionary_tests {
     }
 
     #[test]
-    fn dictionary_filter_small_unit_uses_values_without_group_verdict_state() {
+    fn dictionary_filter_replays_unindexed_v2_with_mismatched_row_count() {
+        use crate::file::serialized_reader::{
+            SerializedPageReaderContext, read_page_header_len_from_bytes,
+        };
+        use crate::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("word", DataType::Utf8, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let values = (0..32)
+            .map(|row| Some(["no", "yes"][row % 2]))
+            .collect::<StringArray>();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(values),
+                Arc::new(Int32Array::from_iter_values(0..32)),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_writer_version(WriterVersion::PARQUET_2_0)
+            .set_offset_index_disabled(true)
+            .set_max_row_group_row_count(Some(16))
+            .build();
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        let mut file = writer.into_inner().unwrap();
+        let metadata =
+            ArrowReaderMetadata::load(&Bytes::copy_from_slice(&file), ArrowReaderOptions::new())
+                .unwrap();
+        assert_eq!(metadata.metadata().num_row_groups(), 2);
+        let column = metadata.metadata().row_group(0).column(0);
+        assert!(column.offset_index_offset().is_none());
+        let start = usize::try_from(column.data_page_offset()).unwrap();
+        let (len, mut header) = read_page_header_len_from_bytes(
+            &SerializedPageReaderContext::default(),
+            &file[start..],
+            0,
+            false,
+        )
+        .unwrap();
+        let v2 = header.data_page_header_v2.as_mut().unwrap();
+        assert_eq!((v2.num_values, v2.num_rows), (16, 16));
+        v2.num_rows = 15;
+        let mut changed = Vec::new();
+        header
+            .write_thrift(&mut ThriftCompactOutputProtocol::new(&mut changed))
+            .unwrap();
+        assert_eq!(changed.len(), len);
+        file[start..start + len].copy_from_slice(&changed);
+
+        let file = Bytes::from(file);
+        let read = |mode, skip_first_group| {
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file.clone()).unwrap();
+            let metrics = Arc::new(Mutex::new(DictionaryFilterMetrics::default()));
+            let predicate = StaticFilter {
+                projection: ProjectionMask::leaves(builder.parquet_schema(), [0]),
+                mode,
+                accept_null: false,
+                accept_yes: true,
+                fail_dictionary: false,
+                metrics: Arc::clone(&metrics),
+            };
+            let output = ProjectionMask::leaves(builder.parquet_schema(), [1]);
+            let builder = if skip_first_group {
+                builder.with_row_selection(RowSelection::from(vec![
+                    RowSelector::skip(16),
+                    RowSelector::select(2),
+                    RowSelector::skip(14),
+                ]))
+            } else {
+                builder
+            };
+            let rows = builder
+                .with_projection(output)
+                .with_row_filter(RowFilter::new(vec![Box::new(predicate)]).with_dictionary_filter())
+                .build()
+                .unwrap()
+                .flat_map(|batch| {
+                    let batch = batch.unwrap();
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect::<Vec<_>>();
+            let metrics = Arc::try_unwrap(metrics).unwrap().into_inner().unwrap();
+            (rows, metrics)
+        };
+        for skip_first_group in [false, true] {
+            let (ordinary, _) = read(DictionaryFilterMode::Off, skip_first_group);
+            let expected = if skip_first_group {
+                vec![17]
+            } else {
+                (1..32).step_by(2).collect()
+            };
+            assert_eq!(ordinary, expected);
+            for mode in [DictionaryFilterMode::On, DictionaryFilterMode::Verify] {
+                let (rows, metrics) = read(mode, skip_first_group);
+                assert_eq!(rows, ordinary, "{mode:?}");
+                assert_eq!(metrics.fallback_error, usize::from(!skip_first_group));
+                assert_eq!(metrics.rows_value, if skip_first_group { 0 } else { 16 });
+                assert_eq!(metrics.rows_verdict, if skip_first_group { 2 } else { 16 });
+            }
+        }
+    }
+
+    #[test]
+    fn dictionary_filter_sparse_span_uses_values_without_group_verdict_state() {
         const UNIT: usize = 256 * 1024;
         const GROUP: usize = 8 * UNIT;
         let schema = Arc::new(Schema::new(vec![Field::new("word", DataType::Utf8, false)]));
@@ -1034,8 +1147,9 @@ mod dictionary_tests {
         };
         let rows = builder
             .with_row_selection(RowSelection::from(vec![
+                RowSelector::select(UNIT / 2),
                 RowSelector::skip(GROUP - UNIT),
-                RowSelector::select(UNIT),
+                RowSelector::select(UNIT / 2),
             ]))
             .with_row_filter(RowFilter::new(vec![Box::new(predicate)]).with_dictionary_filter())
             .build()

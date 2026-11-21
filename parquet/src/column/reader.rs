@@ -357,12 +357,13 @@ where
 
                 // If page has less rows than the remaining records to
                 // be skipped, skip entire page
-                let rows = metadata.num_rows.or_else(|| {
-                    // If no repetition levels, num_levels == num_rows
-                    self.rep_level_decoder
-                        .is_none()
-                        .then_some(metadata.num_levels)?
-                });
+                // For flat columns use the level-slot count, matching the
+                // data-page decoder even if an unindexed V2 header disagrees.
+                // Indexed pages supply their span as num_rows only.
+                let rows = metadata
+                    .num_levels
+                    .filter(|_| self.rep_level_decoder.is_none())
+                    .or(metadata.num_rows);
 
                 if let Some(rows) = rows
                     && rows <= remaining_records
