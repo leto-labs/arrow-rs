@@ -30,6 +30,7 @@ use crate::arrow::schema::{ParquetField, ParquetFieldType};
 use crate::basic::{Encoding, EncodingMask, PageType, Type};
 use crate::column::page::{Page, PageIterator, PageMetadata, PageReader};
 use crate::column::reader::decoder::code_page::{ChunkDictionary, FlatDataPage};
+use crate::encodings::rle::codes::ExcessPackedPadding;
 use crate::errors::{ParquetError, Result};
 use crate::file::metadata::{ColumnChunkMetaData, ParquetMetaData, RowGroupMetaData};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer};
@@ -384,7 +385,15 @@ fn evaluate_chunk(
             continue;
         }
         let page = flat.into_dictionary(dictionary.clone())?;
-        page.verdicts(&mut table, &mut scratch.validity, &mut scratch.verdict)?;
+        match page.verdicts(&mut table, &mut scratch.validity, &mut scratch.verdict) {
+            Err(ParquetError::External(source)) if source.is::<ExcessPackedPadding>() => {
+                result.unsupported = true;
+                covered.append_n(rows, false);
+                passed.append_n(rows, false);
+                continue;
+            }
+            other => other?,
+        }
         if verdict.null && field.def_level != 0 {
             for (word, valid) in scratch.verdict.iter_mut().zip(&scratch.validity) {
                 *word |= !valid;
