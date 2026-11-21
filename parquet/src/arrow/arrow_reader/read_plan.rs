@@ -20,18 +20,27 @@
 //! [`ReadPlan`] and [`ReadPlanBuilder`] for determining which rows to read
 //! from a Parquet file
 
+use crate::arrow::ProjectionMask;
 use crate::arrow::array_reader::ArrayReader;
+use crate::arrow::array_reader::{ArrayReaderBuilder, RowGroups};
+use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use crate::arrow::arrow_reader::selection::{
     LoadedRowRanges, RowSelectionPolicy, RowSelectionStrategy,
 };
 use crate::arrow::arrow_reader::{
     ArrowPredicate, ParquetRecordBatchReader, RowSelection, RowSelectionCursor, RowSelector,
 };
+use crate::arrow::schema::{ParquetField, ParquetFieldType};
 use crate::errors::{ParquetError, Result};
+use crate::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
 use arrow_array::{Array, BooleanArray};
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions, StructArray};
 use arrow_buffer::BooleanBuffer;
+use arrow_schema::{DataType, Schema, SchemaRef};
+use arrow_select::filter::filter;
 use arrow_select::filter::prep_null_mask_filter;
 use std::sync::Arc;
+use std::time::Instant;
 mod dictionary;
 
 /// Options for [`ReadPlanBuilder::with_predicate_options`].
@@ -428,9 +437,676 @@ impl ReadPlan {
     }
 }
 
+/// One total Boolean expression and the Parquet leaves it reads in file order.
+#[derive(Clone)]
+pub struct StagedPredicate {
+    leaves: Vec<usize>,
+    evaluate: Arc<StagedEvaluator>,
+}
+
+type StagedEvaluator = dyn Fn(&RecordBatch) -> Result<BooleanArray> + Send + Sync;
+
+impl StagedPredicate {
+    /// The evaluator receives a batch of these leaves, in physical schema order.
+    pub fn new(
+        leaves: Vec<usize>,
+        evaluate: impl Fn(&arrow_array::RecordBatch) -> Result<BooleanArray> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            leaves,
+            evaluate: Arc::new(evaluate),
+        }
+    }
+}
+
+/// Work done by the staged reader on one input vector.
+#[derive(Default)]
+pub struct StagedScanWork {
+    /// Number of rows entering the filter stage.
+    pub input_rows: usize,
+    /// Number of rows passing every conjunct.
+    pub output_rows: usize,
+    /// Whether this vector used a selected read.
+    pub selected: bool,
+    /// Number of payload column slots decoded in full.
+    pub decoded_values: usize,
+    /// Number of payload column slots gathered by selected reads.
+    pub gathered_values: usize,
+    /// Elapsed time in predicate reads and evaluation.
+    pub filter_time: std::time::Duration,
+    /// Elapsed time in payload reads and output assembly.
+    pub payload_time: std::time::Duration,
+}
+
+/// Optional per-vector decoding for a projection of flat columns.
+pub struct StagedScan {
+    predicates: Vec<StagedPredicate>,
+    fully_matched: Option<Arc<[bool]>>,
+    observe: Arc<dyn Fn(StagedScanWork) + Send + Sync>,
+}
+
+impl std::fmt::Debug for StagedScan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagedScan")
+            .field("predicates", &self.predicates.len())
+            .finish()
+    }
+}
+
+impl StagedScan {
+    /// The caller keeps residual predicates. On a full vector the ordinary
+    /// iterator returns the entire vector, while the selection-aware reader
+    /// can also obtain the exact mask.
+    pub fn new(
+        predicates: Vec<StagedPredicate>,
+        observe: impl Fn(StagedScanWork) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            predicates,
+            fully_matched: None,
+            observe: Arc::new(observe),
+        }
+    }
+
+    /// Skip staging on physical row groups proved to match every predicate.
+    pub fn with_fully_matched(mut self, groups: Option<Arc<[bool]>>) -> Self {
+        self.fully_matched = groups;
+        self
+    }
+
+    pub(crate) fn applies_to(&self, group: usize) -> bool {
+        !self
+            .fully_matched
+            .as_ref()
+            .and_then(|groups| groups.get(group))
+            .copied()
+            .unwrap_or(false)
+    }
+}
+
+// Ratios from the SMT rows in the 5.12a cost table. Unknown encodings use
+// full decode. Footer metadata cannot identify individual index run widths.
+#[derive(Clone, Copy, Debug)]
+enum SelectionCost {
+    LargeDictionary,
+    DateDictionary,
+    NullableDictionary,
+    ViewDictionary,
+    PlainFixed,
+    Unknown,
+}
+
+impl SelectionCost {
+    fn for_column(column: &ColumnChunkMetaData, data_type: &DataType) -> Self {
+        use crate::basic::{Encoding, Type};
+        let primitive = matches!(column.column_type(), Type::INT32 | Type::INT64)
+            && matches!(
+                data_type,
+                DataType::Int32 | DataType::Int64 | DataType::Date32 | DataType::Decimal64(_, _)
+            );
+        let view = matches!(data_type, DataType::Utf8View | DataType::BinaryView);
+        let dictionary = column.page_encoding_stats_mask().is_some_and(|mask| {
+            mask.is_only(Encoding::RLE_DICTIONARY) || mask.is_only(Encoding::PLAIN_DICTIONARY)
+        });
+        let required = column.column_descr().max_def_level() == 0;
+        match (primitive, view, dictionary, required, data_type) {
+            (true, _, true, true, DataType::Date32) => Self::DateDictionary,
+            (true, _, true, true, _) => Self::LargeDictionary,
+            (true, _, true, false, _) => Self::NullableDictionary,
+            (_, true, true, true, _) => Self::ViewDictionary,
+            (true, _, false, true, _)
+                if column
+                    .page_encoding_stats_mask()
+                    .is_some_and(|mask| mask.is_only(Encoding::PLAIN)) =>
+            {
+                Self::PlainFixed
+            }
+            _ => Self::Unknown,
+        }
+    }
+
+    fn uses_kernel(self, fraction: f64) -> bool {
+        const FRACTIONS: [f64; 4] = [0.001, 0.02, 0.10, 0.20];
+        let ratios = match self {
+            Self::LargeDictionary => [0.105, 0.324, 0.740, 0.960],
+            Self::DateDictionary => [0.210, 0.472, 0.988, 2.0],
+            Self::NullableDictionary => [0.626, 0.922, 1.785, 3.0],
+            Self::ViewDictionary => [0.103, 0.361, 1.297, 2.5],
+            Self::PlainFixed => [0.106, 0.308, 0.993, 2.0],
+            Self::Unknown => return false,
+        };
+        if fraction >= FRACTIONS[3] {
+            return false;
+        }
+        let first = FRACTIONS.partition_point(|&bound| bound < fraction);
+        let ratio = if first == 0 {
+            ratios[0]
+        } else {
+            let low = first - 1;
+            let position = (fraction - FRACTIONS[low]) / (FRACTIONS[first] - FRACTIONS[low]);
+            ratios[low] + position * (ratios[first] - ratios[low])
+        };
+        ratio <= 0.80
+    }
+}
+
+struct StagedColumn {
+    reader: Box<dyn ArrayReader>,
+    cost: SelectionCost,
+    ordinary: bool,
+    payload: bool,
+}
+
+impl StagedColumn {
+    fn full(&mut self, rows: usize) -> Result<ArrayRef> {
+        self.ordinary = true;
+        let actual = self.reader.read_records(rows)?;
+        if actual != rows {
+            return Err(general_err!(
+                "Expected {rows} staged rows, decoded {actual}"
+            ));
+        }
+        self.reader.consume_batch()
+    }
+
+    fn skip(&mut self, rows: usize, empty: &[u64]) -> Result<()> {
+        if !self.ordinary && !matches!(self.cost, SelectionCost::Unknown) {
+            self.reader.read_selected(empty, rows)?;
+        } else {
+            self.ordinary = true;
+            let actual = self.reader.skip_records(rows)?;
+            if actual != rows {
+                return Err(general_err!(
+                    "Expected to skip {rows} staged rows, skipped {actual}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+struct StagedConjunct {
+    columns: Vec<usize>,
+    schema: SchemaRef,
+    predicate: StagedPredicate,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ObservedRank {
+    score: f64,
+    samples: usize,
+}
+
+impl ObservedRank {
+    fn observe(&mut self, nanos: f64, rejected: usize) {
+        let rank = nanos / rejected.max(1) as f64;
+        self.score = if self.samples == 0 {
+            rank
+        } else {
+            self.score * 0.75 + rank * 0.25
+        };
+        self.samples += 1;
+    }
+}
+
+struct StagedOrder {
+    indices: Vec<usize>,
+    ranks: Vec<ObservedRank>,
+    pending: Option<(usize, usize)>,
+    settled: Vec<(usize, usize)>,
+}
+
+impl StagedOrder {
+    fn new(initial_scores: &[f64]) -> Self {
+        let mut indices: Vec<_> = (0..initial_scores.len()).collect();
+        indices.sort_by(|&left, &right| initial_scores[left].total_cmp(&initial_scores[right]));
+        Self {
+            indices,
+            ranks: vec![ObservedRank::default(); initial_scores.len()],
+            pending: None,
+            settled: Vec::new(),
+        }
+    }
+
+    fn adapt(&mut self) {
+        let candidate = self
+            .indices
+            .windows(2)
+            .enumerate()
+            .find_map(|(position, pair)| {
+                let (left, right) = (&self.ranks[pair[0]], &self.ranks[pair[1]]);
+                (left.samples >= 2
+                    && right.samples >= 2
+                    && right.score < 0.8 * left.score
+                    && !self.settled.contains(&(pair[1], pair[0])))
+                .then_some((position, pair[1]))
+            });
+        if let Some((position, _)) = candidate.filter(|pair| self.pending == Some(*pair)) {
+            // Conditional pass rates may change after a swap. Keep the
+            // first stable change for this pair within the row group.
+            self.settled
+                .push((self.indices[position], self.indices[position + 1]));
+            self.indices.swap(position, position + 1);
+            self.ranks.fill(ObservedRank::default());
+            self.pending = None;
+        } else {
+            self.pending = candidate;
+        }
+    }
+}
+
+struct VectorColumn {
+    values: ArrayRef,
+    // A subset of the vector in original row order when read by the kernel.
+    selection: Option<BooleanBuffer>,
+}
+
+impl VectorColumn {
+    fn compact(&self, selection: &BooleanBuffer, kept: usize) -> Result<ArrayRef> {
+        if self.values.len() == kept {
+            return Ok(Arc::clone(&self.values));
+        }
+        let mask = match &self.selection {
+            Some(previous) => BooleanBuffer::collect_bool(previous.count_set_bits(), {
+                let mut indices = previous.set_indices();
+                move |_| selection.value(indices.next().unwrap())
+            }),
+            None => selection.clone(),
+        };
+        Ok(filter(&self.values, &BooleanArray::from(mask))?)
+    }
+}
+
+/// ArrayReader adapter for the record-batch reader's existing All cursor.
+/// Every read advances one physical vector, or skips rejected vectors until
+/// a vector with output is ready. A physical selection bounds each read.
+pub(crate) struct StagedArrayReader {
+    schema: SchemaRef,
+    data_type: DataType,
+    columns: Vec<StagedColumn>,
+    conjuncts: Vec<StagedConjunct>,
+    order: StagedOrder,
+    vectors: usize,
+    rows: std::collections::VecDeque<RowSelector>,
+    scan: Arc<StagedScan>,
+    batch: Option<ArrayRef>,
+    selection: Option<BooleanBuffer>,
+}
+
+impl StagedArrayReader {
+    pub(crate) fn try_new(
+        rows: &dyn RowGroups,
+        row_group: &RowGroupMetaData,
+        fields: Option<&ParquetField>,
+        projection: &ProjectionMask,
+        plan: &ReadPlanBuilder,
+        metrics: &ArrowReaderMetrics,
+        scan: &Arc<StagedScan>,
+    ) -> Result<Option<Self>> {
+        let Some(fields) = fields else {
+            return Ok(None);
+        };
+        let (ParquetFieldType::Group { children }, DataType::Struct(arrow_fields)) =
+            (&fields.field_type, &fields.arrow_type)
+        else {
+            return Ok(None);
+        };
+        let mut leaves = Vec::new();
+        for (field, arrow_field) in children.iter().zip(arrow_fields) {
+            let ParquetFieldType::Primitive { col_idx, .. } = field.field_type else {
+                // A mixed projection is left to the original reader.
+                return Ok(None);
+            };
+            if projection.leaf_included(col_idx) {
+                leaves.push((col_idx, field, Arc::clone(arrow_field)));
+            }
+        }
+        if leaves.is_empty() || scan.predicates.is_empty() {
+            return Ok(None);
+        }
+        let schema = Arc::new(Schema::new(
+            leaves
+                .iter()
+                .map(|(_, _, field)| Arc::clone(field))
+                .collect::<Vec<_>>(),
+        ));
+        let mut used = vec![false; leaves.len()];
+        let mut conjuncts = Vec::with_capacity(scan.predicates.len());
+        for predicate in &scan.predicates {
+            let Some(columns) = predicate
+                .leaves
+                .iter()
+                .map(|leaf| leaves.iter().position(|(index, _, _)| index == leaf))
+                .collect::<Option<Vec<_>>>()
+            else {
+                return Ok(None);
+            };
+            for &column in &columns {
+                used[column] = true;
+            }
+            let schema = Arc::new(schema.project(&columns)?);
+            conjuncts.push(StagedConjunct {
+                columns,
+                schema,
+                predicate: predicate.clone(),
+            });
+        }
+        let costs: Vec<_> = leaves
+            .iter()
+            .map(|(leaf, _, field)| {
+                let column = row_group.column(*leaf);
+                (
+                    SelectionCost::for_column(column, field.data_type()),
+                    column.uncompressed_size().max(0) as usize,
+                )
+            })
+            .collect();
+        let total = costs
+            .iter()
+            .fold(0usize, |total, (_, bytes)| total.saturating_add(*bytes));
+        let eligible_payload: usize = costs
+            .iter()
+            .zip(&used)
+            .filter_map(|(&(cost, bytes), &used)| {
+                (!used && !matches!(cost, SelectionCost::Unknown)).then_some(bytes)
+            })
+            .fold(0usize, usize::saturating_add);
+        if eligible_payload == 0 || eligible_payload < total.div_ceil(4) {
+            return Ok(None);
+        }
+        let initial_scores = conjuncts
+            .iter()
+            .map(|conjunct| {
+                // Until a vector is observed, assume a pass rate of one half.
+                let estimated_bytes = conjunct
+                    .columns
+                    .iter()
+                    .map(|&index| costs[index].1 as f64)
+                    .sum::<f64>();
+                2.0 * (1.0 + estimated_bytes / rows.num_rows().max(1) as f64)
+            })
+            .collect::<Vec<_>>();
+        let order = StagedOrder::new(&initial_scores);
+        let builder = ArrayReaderBuilder::new(rows, metrics)
+            .with_batch_size(plan.batch_size)
+            .with_parquet_metadata(rows.metadata());
+        let columns = leaves
+            .into_iter()
+            .zip(costs)
+            .zip(used)
+            .map(|(((_, field, _), (cost, _)), used)| {
+                Ok(StagedColumn {
+                    reader: builder.build_array_reader(Some(field), projection)?,
+                    cost,
+                    ordinary: false,
+                    payload: !used,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let rows = match plan.selection() {
+            Some(selection) => selection.clone().trim().into(),
+            None => std::collections::VecDeque::from([RowSelector::select(rows.num_rows())]),
+        };
+        Ok(Some(Self {
+            data_type: DataType::Struct(schema.fields().clone()),
+            schema,
+            columns,
+            order,
+            conjuncts,
+            vectors: 0,
+            rows,
+            scan: Arc::clone(scan),
+            batch: None,
+            selection: None,
+        }))
+    }
+
+    pub(crate) fn selection(&self) -> Option<BooleanBuffer> {
+        self.selection.clone()
+    }
+
+    fn read_vector(&mut self, rows: usize) -> Result<usize> {
+        let filter_start = Instant::now();
+        let mut selection = BooleanBuffer::new_set(rows);
+        let mut kept = rows;
+        let mut selected = false;
+        let mut arrays: Vec<Option<VectorColumn>> = (0..self.columns.len()).map(|_| None).collect();
+        let mut words = Vec::new();
+        let sample = self.vectors.is_multiple_of(4);
+        self.vectors = self.vectors.wrapping_add(1);
+        for &index in &self.order.indices {
+            let begin = sample.then(Instant::now);
+            let conjunct = &self.conjuncts[index];
+            let mut inputs = Vec::with_capacity(conjunct.columns.len());
+            let fraction = kept as f64 / rows as f64;
+            for &index in &conjunct.columns {
+                if let Some(array) = &arrays[index] {
+                    inputs.push(array.compact(&selection, kept)?);
+                    continue;
+                }
+                let column = &mut self.columns[index];
+                let array = if !column.ordinary && column.cost.uses_kernel(fraction) {
+                    fill_words(&mut words, &selection);
+                    selected = true;
+                    VectorColumn {
+                        values: column.reader.read_selected(&words, rows)?,
+                        selection: Some(selection.clone()),
+                    }
+                } else {
+                    VectorColumn {
+                        values: column.full(rows)?,
+                        selection: None,
+                    }
+                };
+                inputs.push(array.compact(&selection, kept)?);
+                arrays[index] = Some(array);
+            }
+            let options = RecordBatchOptions::new().with_row_count(Some(kept));
+            let batch =
+                RecordBatch::try_new_with_options(Arc::clone(&conjunct.schema), inputs, &options)?;
+            let result = (conjunct.predicate.evaluate)(&batch)?;
+            let result = if result.null_count() == 0 {
+                result
+            } else {
+                prep_null_mask_filter(&result)
+            };
+            if result.len() != kept {
+                return Err(general_err!("Staged predicate returned the wrong length"));
+            }
+            let before = kept;
+            kept = result.true_count();
+            if kept != before {
+                if before == rows {
+                    selection = result.values().clone();
+                } else {
+                    let previous = selection;
+                    let mut passed = result.values().iter();
+                    selection = BooleanBuffer::collect_bool(rows, |i| {
+                        previous.value(i) && passed.next().unwrap()
+                    });
+                }
+            }
+            if let Some(begin) = begin {
+                self.order.ranks[index].observe(begin.elapsed().as_nanos() as f64, before - kept);
+            }
+            if kept == 0 {
+                break;
+            }
+        }
+        if sample {
+            self.order.adapt();
+        }
+        let filter_time = filter_start.elapsed();
+        let payload_start = Instant::now();
+        let mut work = StagedScanWork {
+            input_rows: rows,
+            output_rows: kept,
+            filter_time,
+            ..Default::default()
+        };
+        if kept == 0 {
+            words.clear();
+            words.resize(rows.div_ceil(64), 0);
+            for (column, array) in self.columns.iter_mut().zip(&arrays) {
+                if array.is_none() {
+                    column.skip(rows, &words)?;
+                }
+            }
+            work.payload_time = payload_start.elapsed();
+            (self.scan.observe)(work);
+            return Ok(0);
+        }
+        let fraction = kept as f64 / rows as f64;
+        words.clear();
+        for (column, array) in self.columns.iter_mut().zip(&mut arrays) {
+            if array.is_some() {
+                continue;
+            }
+            *array = Some(if !column.ordinary && column.cost.uses_kernel(fraction) {
+                if words.is_empty() {
+                    fill_words(&mut words, &selection);
+                }
+                selected = true;
+                if column.payload {
+                    work.gathered_values += kept;
+                }
+                VectorColumn {
+                    values: column.reader.read_selected(&words, rows)?,
+                    selection: Some(selection.clone()),
+                }
+            } else {
+                if column.payload {
+                    work.decoded_values += rows;
+                }
+                VectorColumn {
+                    values: column.full(rows)?,
+                    selection: None,
+                }
+            });
+        }
+        let values = arrays
+            .into_iter()
+            .map(|array| {
+                let array = array.expect("every output column was read");
+                if selected {
+                    array.compact(&selection, kept)
+                } else {
+                    Ok(array.values)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.batch = Some(Arc::new(StructArray::try_new(
+            self.schema.fields().clone(),
+            values,
+            None,
+        )?));
+        self.selection = Some(if selected {
+            BooleanBuffer::new_set(kept)
+        } else {
+            selection
+        });
+        work.selected = selected;
+        work.payload_time = payload_start.elapsed();
+        (self.scan.observe)(work);
+        Ok(if selected { kept } else { rows })
+    }
+}
+
+fn fill_words(words: &mut Vec<u64>, selection: &BooleanBuffer) {
+    words.clear();
+    words.extend(selection.bit_chunks().iter_padded());
+}
+
+impl ArrayReader for StagedArrayReader {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn get_data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    fn read_records(&mut self, batch_size: usize) -> Result<usize> {
+        self.selection = None;
+        while let Some(mut run) = self.rows.pop_front() {
+            if run.skip {
+                // Offset-index readers skip unrequested pages without reading
+                // them. Small steps could try to load a missing page prefix.
+                let empty = vec![0; run.row_count.div_ceil(64)];
+                for column in &mut self.columns {
+                    column.skip(run.row_count, &empty)?;
+                }
+                continue;
+            }
+            let rows = run.row_count.min(batch_size);
+            if rows == 0 {
+                continue;
+            }
+            run.row_count -= rows;
+            if run.row_count != 0 {
+                self.rows.push_front(run);
+            }
+            let output = self.read_vector(rows)?;
+            if output != 0 {
+                return Ok(output);
+            }
+        }
+        Ok(0)
+    }
+
+    fn consume_batch(&mut self) -> Result<ArrayRef> {
+        Ok(self
+            .batch
+            .take()
+            .unwrap_or_else(|| arrow_array::new_empty_array(&self.data_type)))
+    }
+
+    fn skip_records(&mut self, _: usize) -> Result<usize> {
+        Err(general_err!(
+            "Staged record reader owns the physical cursor"
+        ))
+    }
+
+    fn get_def_levels(&self) -> Option<&[i16]> {
+        None
+    }
+
+    fn get_rep_levels(&self) -> Option<&[i16]> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staged_order_requires_a_stable_difference_and_cannot_swap_back() {
+        let mut order = StagedOrder::new(&[1.0, 2.0]);
+        for _ in 0..2 {
+            order.ranks[0].observe(600.0, 2);
+            order.ranks[1].observe(800.0, 8);
+        }
+        order.adapt();
+        assert_eq!(order.indices, [0, 1]);
+        order.adapt();
+        assert_eq!(order.indices, [1, 0]);
+        for _ in 0..8 {
+            order.ranks[0].observe(100.0, 8);
+            order.ranks[1].observe(900.0, 2);
+            order.adapt();
+            assert_eq!(order.indices, [1, 0]);
+        }
+    }
+
+    #[test]
+    fn staged_cost_table_reserves_twenty_percent() {
+        assert!(SelectionCost::LargeDictionary.uses_kernel(0.10));
+        assert!(!SelectionCost::LargeDictionary.uses_kernel(0.15));
+        assert!(SelectionCost::NullableDictionary.uses_kernel(0.001));
+        assert!(!SelectionCost::NullableDictionary.uses_kernel(0.02));
+        assert!(!SelectionCost::Unknown.uses_kernel(0.001));
+    }
 
     const DEFAULT_AUTO_THRESHOLD: usize = 32;
 

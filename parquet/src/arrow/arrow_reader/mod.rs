@@ -58,7 +58,10 @@ use crate::schema::types::SchemaDescriptor;
 
 use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 // Exposed so integration tests and benchmarks can temporarily override the threshold.
-pub use read_plan::{PredicateOptions, ReadPlan, ReadPlanBuilder};
+pub(crate) use read_plan::StagedArrayReader;
+pub use read_plan::{
+    PredicateOptions, ReadPlan, ReadPlanBuilder, StagedPredicate, StagedScan, StagedScanWork,
+};
 
 mod filter;
 pub mod metrics;
@@ -1876,6 +1879,30 @@ impl ParquetRecordBatchReader {
             schema: Arc::new(schema),
             read_plan,
         }
+    }
+
+    /// Whether this reader exposes per-batch predicate selections.
+    pub fn is_staged(&self) -> bool {
+        self.array_reader.as_any().is::<StagedArrayReader>()
+    }
+
+    /// Decode one batch and, for a staged reader, retain its selection.
+    ///
+    /// An all-true mask accompanies a dense staged result. Ordinary readers
+    /// return no mask and their caller still owns residual evaluation.
+    pub fn next_with_selection(
+        &mut self,
+    ) -> Option<Result<(RecordBatch, Option<BooleanBuffer>), ArrowError>> {
+        self.next().map(|result| {
+            result.map(|batch| {
+                let selection = self
+                    .array_reader
+                    .as_any()
+                    .downcast_ref::<StagedArrayReader>()
+                    .and_then(StagedArrayReader::selection);
+                (batch, selection)
+            })
+        })
     }
 
     #[inline(always)]

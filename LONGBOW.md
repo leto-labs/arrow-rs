@@ -37,7 +37,7 @@ in `third_party/README.md` and `docs/UPSTREAM_MATRIX.toml`.
 |---|---|---|---|
 | DCX | Read flat primitive chunk dictionaries, borrowed hybrid runs and selected nullable keys | DICTIONARY-CODE-EXECUTION | UPSTREAMABLE |
 | DV | Apply static Arrow predicate verdicts to selected Parquet rows using DCX index runs | DICTIONARY-CODE-EXECUTION | UPSTREAMABLE |
-| LMS | Materialize selected flat dictionary byte-array views with DCX ranks and reuse selected fixed-width reads | LATE-MATERIALIZED-SCAN | UPSTREAMABLE |
+| LMS | Materialize selected flat Parquet values with DCX ranks and adapt filter and payload reads per vector | LATE-MATERIALIZED-SCAN | UPSTREAMABLE |
 | DPC | Hook decompressed page caching and atomic page leases into PageIndexProvider and shared fetch planning | SCAN-PAGE-CACHE | UPSTREAMABLE |
 | DRL | Decode dictionary runs and definition levels with register cursors, SIMD lookup and in-place NULL expansion | NATIVE-PARQUET-DECODE | UPSTREAMABLE |
 | NPI | Classify repeated-leaf null pages by value count to preserve valid column indexes | DATA-SKIPPING | UPSTREAMABLE |
@@ -473,3 +473,23 @@ once across 128 partial batches. Both pass the same 2,646-case
 selector/queue/mask differential. Default SQL scans reach this cursor only when
 the Selectors strategy is chosen (`force_filter_selections` or a selector
 policy); no general speed claim is made.
+
+
+## LMS staged record-batch reader (leto-kce)
+
+Purpose: evaluate proven total predicates over a vector, then select the
+payload decode mode using the measured selection-cost curves. Dependent
+feature: LATE-MATERIALIZED-SCAN. Audit classification: UPSTREAMABLE.
+
+The staged reader wraps the array-reader interface for flat projections. It
+keeps the ordinary record-batch iterator and row-filter processing on their
+existing entry points. The push decoder carries an optional immutable stage
+plan across builder reuse. A nonempty row filter, offset or limit takes the
+ordinary path. A full-match proof supplied by the caller can bypass staging
+for a physical row group.
+
+The selected path retains the preceding LMS limitations: selecting no rows
+can still load a primitive page at a vector boundary, and a cache-admitted
+skip can still fill or transcode the page. A column that has entered ordinary
+mode stays there through its current chunk. The stage reports that full-read
+work separately from selected gathers.
