@@ -31,8 +31,10 @@ use crate::arrow::arrow_reader::{
     ArrowPredicate, ParquetRecordBatchReader, RowSelection, RowSelectionCursor, RowSelector,
 };
 use crate::arrow::schema::{ParquetField, ParquetFieldType};
+use crate::column::page::{Page, PageIterator, PageMetadata, PageReader};
 use crate::errors::{ParquetError, Result};
-use crate::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
+use crate::file::metadata::{ColumnChunkMetaData, ParquetMetaData, RowGroupMetaData};
+use crate::file::page_cache::PageWithValidity;
 use arrow_array::{Array, BooleanArray};
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions, StructArray};
 use arrow_buffer::BooleanBuffer;
@@ -40,6 +42,7 @@ use arrow_schema::{DataType, Schema, SchemaRef};
 use arrow_select::filter::filter;
 use arrow_select::filter::prep_null_mask_filter;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 mod dictionary;
 
@@ -717,6 +720,106 @@ impl VectorColumn {
     }
 }
 
+// External row selections restrict which pages the push decoder fetches.
+// Moving across those gaps uses a no-fill skip. Pages rejected by predicates
+// within fetched ranges keep the usual cache admission behavior.
+struct GapAwareRowGroups<'a> {
+    inner: &'a dyn RowGroups,
+    in_gap: Arc<AtomicBool>,
+}
+
+impl RowGroups for GapAwareRowGroups<'_> {
+    fn num_rows(&self) -> usize {
+        self.inner.num_rows()
+    }
+
+    fn column_chunks(&self, index: usize) -> Result<Box<dyn PageIterator>> {
+        Ok(Box::new(GapAwarePageIterator {
+            inner: self.inner.column_chunks(index)?,
+            in_gap: Arc::clone(&self.in_gap),
+        }))
+    }
+
+    fn row_groups(&self) -> Box<dyn Iterator<Item = &RowGroupMetaData> + '_> {
+        self.inner.row_groups()
+    }
+
+    fn metadata(&self) -> &ParquetMetaData {
+        self.inner.metadata()
+    }
+}
+
+struct GapAwarePageIterator {
+    inner: Box<dyn PageIterator>,
+    in_gap: Arc<AtomicBool>,
+}
+
+impl Iterator for GapAwarePageIterator {
+    type Item = Result<Box<dyn PageReader>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(self.inner.next()?.map(|inner| {
+            Box::new(GapAwarePageReader {
+                inner,
+                in_gap: Arc::clone(&self.in_gap),
+            }) as Box<dyn PageReader>
+        }))
+    }
+}
+
+impl PageIterator for GapAwarePageIterator {}
+
+struct GapAwarePageReader {
+    inner: Box<dyn PageReader>,
+    in_gap: Arc<AtomicBool>,
+}
+
+impl Iterator for GapAwarePageReader {
+    type Item = Result<Page>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+}
+
+impl PageReader for GapAwarePageReader {
+    fn get_next_page(&mut self) -> Result<Option<Page>> {
+        self.inner.get_next_page()
+    }
+
+    fn get_next_page_with_validity(&mut self) -> Result<Option<PageWithValidity>> {
+        self.inner.get_next_page_with_validity()
+    }
+
+    fn peek_next_page(&mut self) -> Result<Option<PageMetadata>> {
+        self.inner.peek_next_page()
+    }
+
+    fn skip_next_page(&mut self) -> Result<()> {
+        self.inner.skip_next_page()
+    }
+
+    fn skip_unselected_data_page(&mut self) -> Result<()> {
+        if self.in_gap.load(Ordering::Relaxed) {
+            self.inner.skip_next_page()
+        } else {
+            self.inner.skip_unselected_data_page()
+        }
+    }
+
+    fn supports_deferred_dictionary(&self) -> bool {
+        self.inner.supports_deferred_dictionary()
+    }
+
+    fn take_deferred_dictionary(&mut self) -> Result<Option<Page>> {
+        self.inner.take_deferred_dictionary()
+    }
+
+    fn at_record_boundary(&mut self) -> Result<bool> {
+        self.inner.at_record_boundary()
+    }
+}
+
 /// ArrayReader adapter for the record-batch reader's existing All cursor.
 /// Every read advances one physical vector, or skips rejected vectors until
 /// a vector with output is ready. A physical selection bounds each read.
@@ -728,6 +831,7 @@ pub(crate) struct StagedArrayReader {
     order: StagedOrder,
     vectors: usize,
     rows: std::collections::VecDeque<RowSelector>,
+    in_gap: Option<Arc<AtomicBool>>,
     scan: Arc<StagedScan>,
     batch: Option<ArrayRef>,
     selection: Option<BooleanBuffer>,
@@ -827,7 +931,19 @@ impl StagedArrayReader {
             })
             .collect::<Vec<_>>();
         let order = StagedOrder::new(&initial_scores);
-        let builder = ArrayReaderBuilder::new(rows, metrics)
+        let selected_rows = plan.selection().cloned().map(RowSelection::trim);
+        let gap_aware_rows = (rows.metadata().page_cache().is_some()
+            && selected_rows
+                .as_ref()
+                .is_some_and(|selection| selection.iter().any(|run| run.skip)))
+        .then(|| GapAwareRowGroups {
+            inner: rows,
+            in_gap: Arc::new(AtomicBool::new(false)),
+        });
+        let column_rows = gap_aware_rows
+            .as_ref()
+            .map_or(rows, |wrapper| wrapper as &dyn RowGroups);
+        let builder = ArrayReaderBuilder::new(column_rows, metrics)
             .with_batch_size(plan.batch_size)
             .with_parquet_metadata(rows.metadata());
         let columns = leaves
@@ -843,8 +959,8 @@ impl StagedArrayReader {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let rows = match plan.selection() {
-            Some(selection) => selection.clone().trim().into(),
+        let rows = match selected_rows {
+            Some(selection) => selection.into(),
             None => std::collections::VecDeque::from([RowSelector::select(rows.num_rows())]),
         };
         Ok(Some(Self {
@@ -855,6 +971,7 @@ impl StagedArrayReader {
             conjuncts,
             vectors: 0,
             rows,
+            in_gap: gap_aware_rows.map(|wrapper| wrapper.in_gap),
             scan: Arc::clone(scan),
             batch: None,
             selection: None,
@@ -1033,9 +1150,17 @@ impl ArrayReader for StagedArrayReader {
                 // Offset-index readers skip unrequested pages without reading
                 // them. Small steps could try to load a missing page prefix.
                 let empty = vec![0; run.row_count.div_ceil(64)];
-                for column in &mut self.columns {
-                    column.skip(run.row_count, &empty)?;
+                if let Some(in_gap) = &self.in_gap {
+                    in_gap.store(true, Ordering::Relaxed);
                 }
+                let skipped = self
+                    .columns
+                    .iter_mut()
+                    .try_for_each(|column| column.skip(run.row_count, &empty));
+                if let Some(in_gap) = &self.in_gap {
+                    in_gap.store(false, Ordering::Relaxed);
+                }
+                skipped?;
                 continue;
             }
             let rows = run.row_count.min(batch_size);
@@ -1082,6 +1207,16 @@ mod tests {
 
     #[test]
     fn staged_vectors_skip_gather_and_preserve_full_output_after_a_slice() {
+        check_staged_slice(3, false);
+    }
+
+    #[cfg(feature = "snap")]
+    #[test]
+    fn staged_sparse_slices_do_not_fill_unfetched_pages() {
+        check_staged_slice(51, true);
+    }
+
+    fn check_staged_slice(start: usize, cache_pages: bool) {
         use crate::arrow::ArrowWriter;
         use crate::arrow::arrow_reader::{ArrowReaderOptions, RowGroupSelection};
         use crate::arrow::push_decoder::ParquetPushDecoderBuilder;
@@ -1094,15 +1229,17 @@ mod tests {
             Field::new("keep", DataType::Boolean, true),
             Field::new("value", DataType::Int64, false),
         ]));
-        // The slice starts three rows into the group. Its first vector is
-        // all NULL, its second has one survivor, and its last is all true.
-        let values = (0..195_i64).collect::<Vec<_>>();
-        let pass = BooleanArray::from_iter(values.iter().map(|&row| match row {
-            3..=66 => None,
-            67 => Some(true),
-            131.. => Some(true),
-            _ => Some(false),
-        }));
+        // The first vector in the slice is all NULL, the second has one
+        // survivor, and the last is all true.
+        let values = (0..(start + 192) as i64).collect::<Vec<_>>();
+        let pass =
+            BooleanArray::from_iter(values.iter().map(
+                |&row| match (row as usize).checked_sub(start) {
+                    Some(0..=63) => None,
+                    Some(64 | 128..) => Some(true),
+                    _ => Some(false),
+                },
+            ));
         let input = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![Arc::new(pass), Arc::new(Int64Array::from(values))],
@@ -1110,18 +1247,30 @@ mod tests {
         .unwrap();
         let props = WriterProperties::builder()
             .set_dictionary_enabled(false)
+            .set_compression(if cache_pages {
+                crate::basic::Compression::SNAPPY
+            } else {
+                crate::basic::Compression::UNCOMPRESSED
+            })
             .set_data_page_row_count_limit(24)
             .set_write_batch_size(24)
             .build();
         let mut writer = ArrowWriter::try_new(Vec::new(), schema, Some(props)).unwrap();
         writer.write(&input).unwrap();
         let bytes = Bytes::from(writer.into_inner().unwrap());
-        let metadata = crate::arrow::arrow_reader::ArrowReaderMetadata::load(
-            &bytes,
-            ArrowReaderOptions::new()
-                .with_page_index_policy(crate::file::metadata::PageIndexPolicy::Optional),
-        )
-        .unwrap();
+        use crate::arrow::arrow_reader::ArrowReaderMetadata;
+        let options = ArrowReaderOptions::new()
+            .with_page_index_policy(crate::file::metadata::PageIndexPolicy::Required);
+        let mut metadata = ArrowReaderMetadata::load(&bytes, options.clone()).unwrap();
+        if cache_pages {
+            let cache = Arc::new(crate::file::page_cache::testing::MapPageCache::default());
+            let cached_metadata = metadata
+                .metadata()
+                .as_ref()
+                .clone()
+                .with_page_cache(Some(cache));
+            metadata = ArrowReaderMetadata::try_new(Arc::new(cached_metadata), options).unwrap();
+        }
         let work = Arc::new(std::sync::Mutex::new(Vec::new()));
         let observer = Arc::clone(&work);
         let scan = Arc::new(StagedScan::new(
@@ -1139,7 +1288,7 @@ mod tests {
             .with_row_group_selections(vec![RowGroupSelection::new(
                 0,
                 Some(RowSelection::from(vec![
-                    RowSelector::skip(3),
+                    RowSelector::skip(start),
                     RowSelector::select(192),
                 ])),
             )])
@@ -1153,10 +1302,10 @@ mod tests {
         };
         assert!(reader.is_staged());
         let (one, one_selection) = reader.next_with_selection().unwrap().unwrap();
-        assert_eq!(one, input.slice(67, 1));
+        assert_eq!(one, input.slice(start + 64, 1));
         assert_eq!(one_selection.unwrap().count_set_bits(), 1);
         let (full, full_selection) = reader.next_with_selection().unwrap().unwrap();
-        assert_eq!(full, input.slice(131, 64));
+        assert_eq!(full, input.slice(start + 128, 64));
         assert_eq!(full_selection.unwrap().count_set_bits(), 64);
         assert!(reader.next().is_none());
         let work = work.lock().unwrap();
