@@ -38,6 +38,13 @@ in `third_party/README.md` and `docs/UPSTREAM_MATRIX.toml`.
 | DCX | Read flat primitive chunk dictionaries, borrowed hybrid runs and selected nullable keys | DICTIONARY-CODE-EXECUTION | UPSTREAMABLE |
 | DPC | Hook decompressed page caching and atomic page leases into PageIndexProvider and shared fetch planning | SCAN-PAGE-CACHE | UPSTREAMABLE |
 | DRL | Decode dictionary runs and definition levels with register cursors, SIMD lookup and in-place NULL expansion | NATIVE-PARQUET-DECODE | UPSTREAMABLE |
+| NPI | Classify repeated-leaf null pages by value count to preserve valid column indexes | DATA-SKIPPING | UPSTREAMABLE |
+
+NPI covers two cases in one `List<Int64>` row group. A page containing
+`[NULL, NULL]` retains its column index and records two null entries. A page
+containing `[NULL, 7]` records its minimum and maximum as 7. The fix uses the
+same level-entry denominator as `null_count`. It does not change the offset
+index's row accounting and has no Longbow-specific dependencies.
 | FUG | Fuse primitive dictionary unpack and gather with runtime AVX2 and AVX-512 dispatch | NATIVE-PARQUET-DECODE | UPSTREAMABLE |
 | NEX | Decode flat nullable primitives into logical output slots with zero-filled NULL slots | NATIVE-PARQUET-DECODE | UPSTREAMABLE |
 | PAB | Bound page and encoded-block allocations by what their input can hold, including decompression | PARQUET-INVALID-INPUT | UPSTREAMABLE |

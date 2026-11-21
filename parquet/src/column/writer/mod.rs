@@ -1257,9 +1257,10 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         page_statistics: Option<&ValueStatistics<E::T>>,
         page_variable_length_bytes: Option<i64>,
     ) {
-        // update the column index
+        // Nulls and buffered values count level entries. A repeated row can
+        // contribute several entries to the same page.
         let null_page =
-            (self.page_metrics.num_buffered_rows as u64) == self.page_metrics.num_page_nulls;
+            (self.page_metrics.num_buffered_values as u64) == self.page_metrics.num_page_nulls;
         // a page contains only null values,
         // and writers have to set the corresponding entries in min_values and max_values to byte[0]
         if null_page && self.column_index_builder.valid() {

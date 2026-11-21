@@ -2134,6 +2134,43 @@ mod tests {
         statistics::Statistics,
     };
 
+    #[test]
+    fn repeated_leaf_null_pages_count_values() {
+        use crate::file::metadata::PageIndexPolicy;
+        use arrow_array::types::Int64Type;
+
+        let lists = ListArray::from_iter_primitive::<Int64Type, _, _>([
+            Some(vec![None, None]),
+            Some(vec![None, Some(7)]),
+        ]);
+        let batch = RecordBatch::try_from_iter([("list", Arc::new(lists) as ArrayRef)]).unwrap();
+        let properties = WriterProperties::builder()
+            .set_data_page_row_count_limit(1)
+            .set_write_batch_size(1)
+            .build();
+        let mut writer = ArrowWriter::try_new(Vec::new(), batch.schema(), Some(properties)).unwrap();
+        writer.write(&batch).unwrap();
+        let bytes = Bytes::from(writer.into_inner().unwrap());
+        let metadata = ParquetMetaDataReader::new()
+            .with_page_index_policy(PageIndexPolicy::Required)
+            .parse_and_finish(&bytes)
+            .unwrap();
+        let page_index = metadata.page_index().unwrap();
+        let Some(ColumnIndexMetaData::INT64(column)) = page_index.column_index(0, 0) else {
+            panic!("expected an INT64 column index for the repeated leaf");
+        };
+        assert_eq!(
+            page_index.offset_index(0, 0).unwrap().page_locations().len(),
+            2
+        );
+        assert!(column.is_null_page(0));
+        assert_eq!(column.null_count(0), Some(2));
+        assert!(!column.is_null_page(1));
+        assert_eq!(column.null_count(1), Some(1));
+        assert_eq!(column.min_value(1), Some(&7));
+        assert_eq!(column.max_value(1), Some(&7));
+    }
+
     /// A [`PageStore`] that allocates *sparse, non-contiguous* handles and keeps
     /// blobs in a `HashMap` — nothing like the default `Vec<Bytes>`. Used to
     /// prove the writer relies only on the opaque-handle contract and never on
