@@ -36,6 +36,7 @@ in `third_party/README.md` and `docs/UPSTREAM_MATRIX.toml`.
 | Family | Purpose in this stack | Dependent feature | Classification |
 |---|---|---|---|
 | DCX | Read flat primitive chunk dictionaries, borrowed hybrid runs and selected nullable keys | DICTIONARY-CODE-EXECUTION | UPSTREAMABLE |
+| DV | Apply static Arrow predicate verdicts to selected Parquet rows using DCX index runs | DICTIONARY-CODE-EXECUTION | UPSTREAMABLE |
 | DPC | Hook decompressed page caching and atomic page leases into PageIndexProvider and shared fetch planning | SCAN-PAGE-CACHE | UPSTREAMABLE |
 | DRL | Decode dictionary runs and definition levels with register cursors, SIMD lookup and in-place NULL expansion | NATIVE-PARQUET-DECODE | UPSTREAMABLE |
 | FUG | Fuse primitive dictionary unpack and gather with runtime AVX2 and AVX-512 dispatch | NATIVE-PARQUET-DECODE | UPSTREAMABLE |
@@ -51,6 +52,13 @@ in `third_party/README.md` and `docs/UPSTREAM_MATRIX.toml`.
 | Z1-B | Validate complete primitive ID batches and dispatch dictionary gathers through AVX2 | NATIVE-PARQUET-DECODE | UPSTREAMABLE |
 
 ## Decode and page-cache notes
+
+DV evaluates a flat column's dictionary once for each participating predicate and
+chunk selection. It uses the normal Arrow column reader to interpret PLAIN entries
+with the column's logical type and uses the DCX index walker for data pages. The
+NULL verdict is applied through the page's definition levels. Mixed pages and
+entry-evaluation errors use the existing value reader. In verify mode the original
+value predicate must select exactly the same rows wherever a verdict was used.
 
 DCX keeps code readers opt-in. The flat primitive reader owns the dictionary
 and checks the page encoding in its own path. On worker-01 the three hot PLAIN

@@ -30,6 +30,7 @@ use arrow_array::{Array, BooleanArray};
 use arrow_buffer::BooleanBuffer;
 use arrow_select::filter::prep_null_mask_filter;
 use std::sync::Arc;
+mod dictionary;
 
 /// Options for [`ReadPlanBuilder::with_predicate_options`].
 pub struct PredicateOptions<'a> {
@@ -183,7 +184,11 @@ impl ReadPlanBuilder {
     /// Like [`Self::with_predicate`], but allows additional options such as a
     /// match-count limit for early termination (see
     /// [`PredicateOptions::with_limit`]).
-    pub fn with_predicate_options(mut self, options: PredicateOptions<'_>) -> Result<Self> {
+    pub fn with_predicate_options(self, options: PredicateOptions<'_>) -> Result<Self> {
+        self.with_value_predicate(options).map(|(plan, _)| plan)
+    }
+
+    fn with_value_predicate(mut self, options: PredicateOptions<'_>) -> Result<(Self, usize)> {
         let PredicateOptions {
             array_reader,
             predicate,
@@ -260,7 +265,7 @@ impl ReadPlanBuilder {
         // selection.
         let all_selected = filters.iter().all(|f| f.true_count() == f.len());
         if all_selected {
-            return Ok(self);
+            return Ok((self, processed_rows));
         }
         let raw = match (self.selection.as_ref(), self.row_selection_policy) {
             (Some(selection), _) if selection.as_mask().is_some() => {
@@ -275,7 +280,7 @@ impl ReadPlanBuilder {
             Some(selection) => Some(selection.and_then(&raw)),
             None => Some(raw),
         };
-        Ok(self)
+        Ok((self, processed_rows))
     }
 
     /// Create a final `ReadPlan` the read plan for the scan
