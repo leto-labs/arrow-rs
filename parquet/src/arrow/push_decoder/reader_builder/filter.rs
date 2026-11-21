@@ -106,6 +106,10 @@ impl FilterInfo {
         }
     }
 
+    pub(super) fn dictionary_filter_enabled(&self) -> bool {
+        self.filter.dictionary_filter
+    }
+
     /// Return a mutable reference to the current predicate
     pub(super) fn current_mut(&mut self) -> &mut dyn ArrowPredicate {
         self.filter

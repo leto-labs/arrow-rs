@@ -119,8 +119,9 @@ pub trait ArrowPredicate: Send + 'static {
     /// * `false` or `null`: the row should not be returned
     fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError>;
 
-    /// Opt into dictionary filtering and its metrics. The projection must be
-    /// one flat leaf, and a verdict must be a deterministic function of its value.
+    /// Provide the policy for this predicate when its row filter enables
+    /// dictionary filtering. A verdict must be a deterministic function of
+    /// one flat leaf's value.
     fn dictionary_filter_options(&self) -> Option<DictionaryFilterOptions> {
         None
     }
@@ -278,6 +279,7 @@ where
 pub struct RowFilter {
     /// A list of [`ArrowPredicate`]
     pub(crate) predicates: Vec<Box<dyn ArrowPredicate>>,
+    pub(crate) dictionary_filter: bool,
 }
 
 impl Debug for RowFilter {
@@ -289,8 +291,25 @@ impl Debug for RowFilter {
 impl RowFilter {
     /// Create a new [`RowFilter`] from an array of [`ArrowPredicate`]
     pub fn new(predicates: Vec<Box<dyn ArrowPredicate>>) -> Self {
-        Self { predicates }
+        Self {
+            predicates,
+            dictionary_filter: false,
+        }
     }
+
+    /// Allow predicates in this filter to opt into dictionary verdicts.
+    pub fn with_dictionary_filter(mut self) -> Self {
+        self.dictionary_filter = true;
+        self
+    }
+
+    /// Append another filter's predicates and retain either filter's opt-in
+    /// to dictionary verdicts.
+    pub fn append(&mut self, other: Self) {
+        self.dictionary_filter |= other.dictionary_filter;
+        self.predicates.extend(other.predicates);
+    }
+
     /// Returns the inner predicates
     pub fn predicates(&self) -> &Vec<Box<dyn ArrowPredicate>> {
         &self.predicates
@@ -317,9 +336,10 @@ impl RowFilter {
         };
 
         for predicate in self.predicates {
-            if predicate
-                .dictionary_filter_options()
-                .is_some_and(|options| options.mode != DictionaryFilterMode::Off)
+            if self.dictionary_filter
+                && predicate
+                    .dictionary_filter_options()
+                    .is_some_and(|options| options.mode != DictionaryFilterMode::Off)
             {
                 flush_group(&mut predicates, &mut group);
                 predicates.push(predicate);
@@ -335,7 +355,10 @@ impl RowFilter {
         }
         flush_group(&mut predicates, &mut group);
 
-        Self { predicates }
+        Self {
+            predicates,
+            dictionary_filter: self.dictionary_filter,
+        }
     }
 }
 
@@ -396,22 +419,6 @@ impl Debug for FusedPredicate {
 impl ArrowPredicate for FusedPredicate {
     fn projection(&self) -> &ProjectionMask {
         self.predicates[0].projection()
-    }
-
-    fn dictionary_filter_options(&self) -> Option<DictionaryFilterOptions> {
-        self.predicates
-            .iter()
-            .find_map(|predicate| predicate.dictionary_filter_options())
-    }
-
-    fn record_dictionary_filter(&mut self, metrics: DictionaryFilterMetrics) {
-        if let Some(predicate) = self
-            .predicates
-            .iter_mut()
-            .find(|p| p.dictionary_filter_options().is_some())
-        {
-            predicate.record_dictionary_filter(metrics);
-        }
     }
 
     fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError> {
@@ -871,6 +878,178 @@ mod dictionary_tests {
         }
     }
 
+    struct ValuesOnly(ProjectionMask);
+
+    impl ArrowPredicate for ValuesOnly {
+        fn projection(&self) -> &ProjectionMask {
+            &self.0
+        }
+
+        fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError> {
+            Ok(BooleanArray::new(
+                BooleanBuffer::new_set(batch.num_rows()),
+                None,
+            ))
+        }
+
+        fn dictionary_filter_options(&self) -> Option<DictionaryFilterOptions> {
+            panic!("ordinary row filters must not consult dictionary policy")
+        }
+    }
+
+    #[test]
+    fn dictionary_filter_ordinary_row_filter_never_consults_verdict_policy() {
+        let schema = Arc::new(Schema::new(vec![Field::new("word", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec!["yes"; 16]))],
+        )
+        .unwrap();
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        let file = Bytes::from(writer.into_inner().unwrap());
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file.clone()).unwrap();
+        let projection = ProjectionMask::leaves(builder.parquet_schema(), [0]);
+        let filter = || {
+            RowFilter::new(vec![
+                Box::new(ValuesOnly(projection.clone())),
+                Box::new(ValuesOnly(projection.clone())),
+            ])
+        };
+        let rows = builder
+            .with_row_filter(filter())
+            .build()
+            .unwrap()
+            .map(|batch| batch.unwrap().num_rows())
+            .sum::<usize>();
+        assert_eq!(rows, 16);
+
+        let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new()).unwrap();
+        let mut decoder = ParquetPushDecoderBuilder::new_with_metadata(metadata)
+            .with_row_filter(filter())
+            .build()
+            .unwrap();
+        decoder.push_range(0..file.len() as u64, file).unwrap();
+        let mut rows = 0;
+        loop {
+            match decoder.try_next_reader().unwrap() {
+                DecodeResult::Data(reader) => {
+                    rows += reader.map(|batch| batch.unwrap().num_rows()).sum::<usize>();
+                }
+                DecodeResult::Finished => break,
+                DecodeResult::NeedsData(ranges) => panic!("unexpected data request: {ranges:?}"),
+            }
+        }
+        assert_eq!(rows, 16);
+    }
+
+    #[test]
+    fn dictionary_filter_replays_short_final_packed_run() {
+        let schema = Arc::new(Schema::new(vec![Field::new("word", DataType::Utf8, false)]));
+        let values = (0..16)
+            .map(|row| Some(["no", "yes"][row % 2]))
+            .collect::<StringArray>();
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(values)]).unwrap();
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        let mut file = writer.into_inner().unwrap();
+        let metadata =
+            ArrowReaderMetadata::load(&Bytes::copy_from_slice(&file), ArrowReaderOptions::new())
+                .unwrap();
+        let (start, length) = metadata.metadata().row_group(0).column(0).byte_range();
+        let end = usize::try_from(start + length).unwrap();
+        // Width one, two packed groups (16 indices), alternating codes.
+        assert_eq!(&file[end - 4..end], &[1, 5, 0xaa, 0xaa]);
+        // Advertise three groups while leaving just the 16 indices the page needs.
+        file[end - 3] = 7;
+        let file = Bytes::from(file);
+        for mode in [
+            DictionaryFilterMode::Off,
+            DictionaryFilterMode::On,
+            DictionaryFilterMode::Verify,
+        ] {
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file.clone()).unwrap();
+            let metrics = Arc::new(Mutex::new(DictionaryFilterMetrics::default()));
+            let predicate = StaticFilter {
+                projection: ProjectionMask::leaves(builder.parquet_schema(), [0]),
+                mode,
+                accept_null: false,
+                accept_yes: true,
+                fail_dictionary: false,
+                metrics: Arc::clone(&metrics),
+            };
+            let rows = builder
+                .with_row_filter(RowFilter::new(vec![Box::new(predicate)]).with_dictionary_filter())
+                .build()
+                .unwrap()
+                .map(|batch| batch.unwrap().num_rows())
+                .sum::<usize>();
+            assert_eq!(rows, 8, "{mode:?}");
+            let report = metrics.lock().unwrap();
+            assert_eq!(
+                report.fallback_error,
+                usize::from(mode != DictionaryFilterMode::Off)
+            );
+            if mode != DictionaryFilterMode::Off {
+                assert_eq!(report.rows_value, 16);
+            }
+        }
+    }
+
+    #[test]
+    fn dictionary_filter_small_unit_uses_values_without_group_verdict_state() {
+        const UNIT: usize = 256 * 1024;
+        const GROUP: usize = 8 * UNIT;
+        let schema = Arc::new(Schema::new(vec![Field::new("word", DataType::Utf8, false)]));
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(GROUP))
+            .set_data_page_row_count_limit(UNIT / 4)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(Vec::new(), Arc::clone(&schema), Some(props)).unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(
+                (0..UNIT)
+                    .map(|row| Some(["no", "yes"][row % 2]))
+                    .collect::<StringArray>(),
+            )],
+        )
+        .unwrap();
+        for _ in 0..8 {
+            writer.write(&batch).unwrap();
+        }
+        let file = Bytes::from(writer.into_inner().unwrap());
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        assert_eq!(builder.metadata().row_group(0).num_rows(), GROUP as i64);
+        let metrics = Arc::new(Mutex::new(DictionaryFilterMetrics::default()));
+        let predicate = StaticFilter {
+            projection: ProjectionMask::leaves(builder.parquet_schema(), [0]),
+            mode: DictionaryFilterMode::On,
+            accept_null: false,
+            accept_yes: true,
+            fail_dictionary: false,
+            metrics: Arc::clone(&metrics),
+        };
+        let rows = builder
+            .with_row_selection(RowSelection::from(vec![
+                RowSelector::skip(GROUP - UNIT),
+                RowSelector::select(UNIT),
+            ]))
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]).with_dictionary_filter())
+            .build()
+            .unwrap()
+            .map(|batch| batch.unwrap().num_rows())
+            .sum::<usize>();
+        assert_eq!(rows, UNIT / 2);
+        let report = metrics.lock().unwrap();
+        assert_eq!(report.chunks_verdict, 0);
+        assert_eq!(report.entries_tested, 0);
+        assert_eq!(report.runs_evaluated, 0);
+        assert_eq!(report.rows_value, UNIT);
+    }
+
     #[test]
     fn dictionary_filter_in_push_decoder_with_sparse_page_requests() {
         let schema = Arc::new(Schema::new(vec![
@@ -922,10 +1101,10 @@ mod dictionary_tests {
                 RowSelector::skip(32),
                 RowSelector::select(16),
                 RowSelector::skip(48),
-                RowSelector::select(96),
-                RowSelector::skip(320),
+                RowSelector::select(128),
+                RowSelector::skip(288),
             ]))
-            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]).with_dictionary_filter())
             .build()
             .unwrap();
         let mut ids = Vec::new();
@@ -955,11 +1134,11 @@ mod dictionary_tests {
             }
         }
         let expected = (32..48)
-            .chain(96..192)
+            .chain(96..224)
             .filter(|i| i % 3 != 2)
             .collect::<Vec<_>>();
         assert_eq!(ids, expected);
-        assert_eq!(metrics.lock().unwrap().rows_verified, 112);
+        assert_eq!(metrics.lock().unwrap().rows_verified, 144);
     }
 
     #[test]
@@ -984,7 +1163,7 @@ mod dictionary_tests {
                 metrics: Arc::clone(&metrics),
             };
             let rows = builder
-                .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+                .with_row_filter(RowFilter::new(vec![Box::new(predicate)]).with_dictionary_filter())
                 .build()
                 .unwrap()
                 .map(|batch| batch.unwrap().num_rows())
@@ -1061,7 +1240,10 @@ mod dictionary_tests {
                                     crate::arrow::arrow_reader::RowSelector::select(823),
                                     crate::arrow::arrow_reader::RowSelector::skip(168),
                                 ]))
-                                .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+                                .with_row_filter(
+                                    RowFilter::new(vec![Box::new(predicate)])
+                                        .with_dictionary_filter(),
+                                )
                                 .build()
                                 .unwrap()
                                 .flat_map(|batch| {

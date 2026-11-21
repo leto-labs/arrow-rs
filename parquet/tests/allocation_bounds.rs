@@ -44,14 +44,18 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::Arc;
 
-use arrow_array::{Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, BooleanArray, Int32Array, RecordBatch};
+use arrow_buffer::BooleanBuffer;
 use arrow_cast::display::array_value_to_string;
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{ArrowError, DataType, Field, Schema};
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::{
-    ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
+    ArrowPredicate, ArrowReaderOptions, DictionaryFilterMode, DictionaryFilterOptions,
+    DictionaryVerdict, ParquetRecordBatchReaderBuilder, RowFilter, RowSelection, RowSelector,
 };
+use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::errors::ParquetError;
+use parquet::file::properties::WriterProperties;
 
 /// The allocator refuses a larger allocation during a read.
 const REFUSED_ABOVE: usize = 64 << 20;
@@ -119,6 +123,85 @@ unsafe impl GlobalAlloc for LimitedAllocator {
 
 #[global_allocator]
 static ALLOCATOR: LimitedAllocator = LimitedAllocator;
+
+struct PassDictionary(ProjectionMask);
+
+impl ArrowPredicate for PassDictionary {
+    fn projection(&self) -> &ProjectionMask {
+        &self.0
+    }
+
+    fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError> {
+        Ok(BooleanArray::new(
+            BooleanBuffer::new_set(batch.num_rows()),
+            None,
+        ))
+    }
+
+    fn dictionary_filter_options(&self) -> Option<DictionaryFilterOptions> {
+        Some(DictionaryFilterOptions {
+            mode: DictionaryFilterMode::On,
+            max_percent: 25,
+        })
+    }
+
+    fn evaluate_dictionary(
+        &mut self,
+        _leaf: usize,
+        entries: &ArrayRef,
+    ) -> Result<Option<DictionaryVerdict>, ArrowError> {
+        Ok(Some(DictionaryVerdict {
+            entries: BooleanBuffer::new_set(entries.len()),
+            null: false,
+        }))
+    }
+}
+
+#[test]
+fn dictionary_filter_small_unit_does_not_allocate_a_group_bitmap() {
+    const UNIT_ROWS: usize = 256 * 1024;
+    const GROUP_ROWS: usize = 8 * UNIT_ROWS;
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int32Array::from_iter_values(
+            (0..UNIT_ROWS).map(|row| (row % 2) as i32),
+        ))],
+    )
+    .unwrap();
+    let properties = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(GROUP_ROWS))
+        .set_data_page_row_count_limit(4096)
+        .build();
+    let mut writer = ArrowWriter::try_new(Vec::new(), schema, Some(properties)).unwrap();
+    for _ in 0..GROUP_ROWS / UNIT_ROWS {
+        writer.write(&batch).unwrap();
+    }
+    let file = Bytes::from(writer.into_inner().unwrap());
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let projection = ProjectionMask::leaves(builder.parquet_schema(), [0]);
+    let builder = builder
+        .with_batch_size(1024)
+        .with_row_selection(RowSelection::from(vec![
+            RowSelector::skip(GROUP_ROWS - UNIT_ROWS),
+            RowSelector::select(UNIT_ROWS),
+        ]))
+        .with_row_filter(
+            RowFilter::new(vec![Box::new(PassDictionary(projection))]).with_dictionary_filter(),
+        );
+    let (rows, largest) = with_limit(|| {
+        builder
+            .build()
+            .unwrap()
+            .map(|batch| batch.unwrap().num_rows())
+            .sum::<usize>()
+    });
+    assert_eq!(rows, UNIT_ROWS);
+    assert!(
+        largest < GROUP_ROWS / 8,
+        "largest allocation was {largest} bytes, enough for a full-group bitmap"
+    );
+}
 
 /// Runs `read` with the allocation limit and returns its result and the
 /// largest allocation that it made.

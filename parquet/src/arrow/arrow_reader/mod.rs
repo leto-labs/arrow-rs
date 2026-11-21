@@ -1464,11 +1464,15 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
                     .with_parquet_metadata(&reader.metadata)
                     .build_array_reader(fields.as_deref(), predicate.projection())?;
 
-                plan_builder = plan_builder.with_dictionary_predicate(
-                    PredicateOptions::new(array_reader, predicate.as_mut()),
-                    &reader,
-                    fields.as_deref(),
-                )?;
+                plan_builder = if filter.dictionary_filter {
+                    plan_builder.with_dictionary_predicate(
+                        PredicateOptions::new(array_reader, predicate.as_mut()),
+                        &reader,
+                        fields.as_deref(),
+                    )?
+                } else {
+                    plan_builder.with_predicate(array_reader, predicate.as_mut())?
+                };
             }
         }
 

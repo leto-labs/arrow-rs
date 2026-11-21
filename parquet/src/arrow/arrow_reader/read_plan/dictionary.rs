@@ -30,7 +30,6 @@ use crate::arrow::schema::{ParquetField, ParquetFieldType};
 use crate::basic::{Encoding, EncodingMask, PageType, Type};
 use crate::column::page::{Page, PageIterator, PageMetadata, PageReader};
 use crate::column::reader::decoder::code_page::{ChunkDictionary, FlatDataPage};
-use crate::encodings::rle::codes::ExcessPackedPadding;
 use crate::errors::{ParquetError, Result};
 use crate::file::metadata::{ColumnChunkMetaData, ParquetMetaData, RowGroupMetaData};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer};
@@ -42,7 +41,11 @@ impl ReadPlanBuilder {
         groups: &dyn RowGroups,
         fields: Option<&ParquetField>,
     ) -> Result<Self> {
-        let Some(policy) = options.predicate.dictionary_filter_options() else {
+        let Some(policy) = options
+            .predicate
+            .dictionary_filter_options()
+            .filter(|policy| policy.mode != DictionaryFilterMode::Off)
+        else {
             return self.with_predicate_options(options);
         };
         let PredicateOptions {
@@ -52,8 +55,14 @@ impl ReadPlanBuilder {
             total_rows,
         } = options;
         let rows = groups.num_rows();
-        let enabled = policy.mode != DictionaryFilterMode::Off;
-        let use_codes = enabled && limit.is_none() && predicate.dictionary_filter_eligible();
+        // The verdict uses dense bitmaps over this reader's full row range.
+        // A native unit can cover a small part of a much larger row group.
+        // Refuse the verdict before allocating if its range exceeds four
+        // times the selected row count.
+        let bounded = self
+            .num_rows_selected()
+            .is_none_or(|selected| selected >= rows.div_ceil(4));
+        let use_codes = bounded && limit.is_none() && predicate.dictionary_filter_eligible();
         let leaf = use_codes
             .then(|| flat_leaf(fields, groups.metadata(), predicate))
             .flatten();
@@ -75,21 +84,21 @@ impl ReadPlanBuilder {
                 .filter(|&i| predicate.projection().leaf_included(i))
                 .nth(1)
                 .is_some();
-            let (result, rows_value) = self.with_value_predicate(PredicateOptions {
-                array_reader,
-                predicate: &mut *predicate,
-                limit,
-                total_rows,
-            })?;
+            let mut rows_value = 0;
+            let result = self.apply_predicate(
+                PredicateOptions {
+                    array_reader,
+                    predicate: &mut *predicate,
+                    limit,
+                    total_rows,
+                },
+                |rows| rows_value = rows,
+            )?;
             let metrics = DictionaryFilterMetrics {
                 chunks_value: chunks,
                 rows_value,
-                fallback_columns: if enabled && several_leaves { chunks } else { 0 },
-                fallback_unsupported: if enabled && !several_leaves {
-                    chunks
-                } else {
-                    0
-                },
+                fallback_columns: if several_leaves { chunks } else { 0 },
+                fallback_unsupported: if several_leaves { 0 } else { chunks },
                 ..Default::default()
             };
             predicate.record_dictionary_filter(metrics);
@@ -376,23 +385,29 @@ fn evaluate_chunk(
                 "Flat predicate page row count differs from page metadata"
             ));
         }
-        let flat = FlatDataPage::new(&page, field.def_level != 0)?;
-        if !dictionary_encoding(flat.encoding) || !flat.has_hybrid_levels() {
-            result.plain |= !dictionary_encoding(flat.encoding);
-            result.unsupported |= !flat.has_hybrid_levels();
+        if !dictionary_encoding(page.encoding()) {
+            result.plain = true;
             covered.append_n(rows, false);
             passed.append_n(rows, false);
             continue;
         }
-        let page = flat.into_dictionary(dictionary.clone())?;
-        match page.verdicts(&mut table, &mut scratch.validity, &mut scratch.verdict) {
-            Err(ParquetError::External(source)) if source.is::<ExcessPackedPadding>() => {
-                result.unsupported = true;
-                covered.append_n(rows, false);
-                passed.append_n(rows, false);
-                continue;
+        let decoded = FlatDataPage::new(&page, field.def_level != 0).and_then(|flat| {
+            if !flat.has_hybrid_levels() {
+                return Ok(false);
             }
-            other => other?,
+            let page = flat.into_dictionary(dictionary.clone())?;
+            page.verdicts(&mut table, &mut scratch.validity, &mut scratch.verdict)?;
+            Ok(true)
+        });
+        if !matches!(decoded, Ok(true)) {
+            // The ordinary reader's acceptance rules are authoritative. It
+            // can stop after the page's logical index count even when the
+            // final packed header advertises a larger run, for example.
+            result.error |= decoded.is_err();
+            result.unsupported |= decoded.is_ok();
+            covered.append_n(rows, false);
+            passed.append_n(rows, false);
+            continue;
         }
         if verdict.null && field.def_level != 0 {
             for (word, valid) in scratch.verdict.iter_mut().zip(&scratch.validity) {

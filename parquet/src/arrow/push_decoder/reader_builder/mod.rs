@@ -621,16 +621,21 @@ impl RowGroupReaderBuilder {
                 // Evaluate the filter via `with_predicate_options`, opting into
                 // early termination when this is the final predicate and an
                 // output limit was set.
+                let dictionary_filter = filter_info.dictionary_filter_enabled();
                 let mut predicate_options =
                     PredicateOptions::new(array_reader, filter_info.current_mut());
                 if let Some(limit) = predicate_limit {
                     predicate_options = predicate_options.with_limit(limit, row_count);
                 }
-                plan_builder = plan_builder.with_dictionary_predicate(
-                    predicate_options,
-                    &row_group,
-                    self.fields.as_deref(),
-                )?;
+                plan_builder = if dictionary_filter {
+                    plan_builder.with_dictionary_predicate(
+                        predicate_options,
+                        &row_group,
+                        self.fields.as_deref(),
+                    )?
+                } else {
+                    plan_builder.with_predicate_options(predicate_options)?
+                };
 
                 let row_group_info = RowGroupInfo {
                     row_group_idx,

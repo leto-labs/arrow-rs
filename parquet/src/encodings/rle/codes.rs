@@ -25,18 +25,6 @@ use crate::errors::{ParquetError, Result};
 const MAX_TABLE_WIDTH: u8 = 20;
 const INVALID_VERDICT: u8 = 2;
 
-/// The final packed run has a complete body but pads more than one group.
-#[derive(Debug)]
-pub(crate) struct ExcessPackedPadding;
-
-impl std::fmt::Display for ExcessPackedPadding {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Final packed code run contains excess group padding")
-    }
-}
-
-impl std::error::Error for ExcessPackedPadding {}
-
 /// A run of levels or non-null dictionary indices.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CodeRun<'a> {
@@ -363,17 +351,8 @@ impl<'a> CodeCursor<'a> {
                 .ok_or_else(|| general_err!("Packed code run byte length overflows usize"))?;
             let bytes = data
                 .get(..consumed)
+                .filter(|_| run - len < 8)
                 .ok_or_else(|| general_err!("Invalid packed code run length"))?;
-            if run - len >= 8 {
-                // Some writers, including DuckDB, pad the final packed run
-                // to a fixed block size. Keep the strict cursor contract.
-                // Decode this page in value space if the complete run is
-                // present and there are no later runs.
-                if data[consumed..].iter().all(|&byte| byte == 0) {
-                    return Err(ParquetError::External(Box::new(ExcessPackedPadding)));
-                }
-                return Err(general_err!("Invalid packed code run length"));
-            }
             if CHECK_PACKED && self.code_limit < 1u64 << width {
                 for index in 0..len {
                     self.validate_code(packed_code(bytes, width, index))?;
@@ -1021,28 +1000,6 @@ mod tests {
         let mut bitmap = Vec::new();
         cursor.verdicts(&mut table, &mut bitmap).unwrap();
         assert_eq!(bitmap, [0xff]);
-    }
-
-    #[test]
-    fn identifies_decoder_compatible_final_packed_padding() {
-        // A producer can emit an entire final block even when the page ends
-        // after the first group. The ordinary decoder uses the page count.
-        let complete = [5, 0b0101_0101, 0xff];
-        let error = CodeCursor::new(1, &complete, 8, 2)
-            .unwrap()
-            .next_run()
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            ParquetError::External(source) if source.is::<ExcessPackedPadding>()
-        ));
-        for malformed in [&complete[..2], &[5, 0b0101_0101, 0xff, 2, 0]] {
-            let error = CodeCursor::new(1, malformed, 8, 2)
-                .unwrap()
-                .next_run()
-                .unwrap_err();
-            assert!(matches!(error, ParquetError::General(_)));
-        }
     }
 
     #[test]

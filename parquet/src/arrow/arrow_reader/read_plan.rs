@@ -187,10 +187,14 @@ impl ReadPlanBuilder {
     /// match-count limit for early termination (see
     /// [`PredicateOptions::with_limit`]).
     pub fn with_predicate_options(self, options: PredicateOptions<'_>) -> Result<Self> {
-        self.with_value_predicate(options).map(|(plan, _)| plan)
+        self.apply_predicate(options, |_| {})
     }
 
-    fn with_value_predicate(mut self, options: PredicateOptions<'_>) -> Result<(Self, usize)> {
+    fn apply_predicate(
+        mut self,
+        options: PredicateOptions<'_>,
+        rows_evaluated: impl FnOnce(usize),
+    ) -> Result<Self> {
         let PredicateOptions {
             array_reader,
             predicate,
@@ -249,6 +253,8 @@ impl ReadPlanBuilder {
             }
         }
 
+        rows_evaluated(processed_rows);
+
         // Pad the tail so the filters cover `expected_rows` total. This keeps
         // the invariant that the resulting `RowSelection` spans every row the
         // reader would have produced — rows past the early break are marked
@@ -267,7 +273,7 @@ impl ReadPlanBuilder {
         // selection.
         let all_selected = filters.iter().all(|f| f.true_count() == f.len());
         if all_selected {
-            return Ok((self, processed_rows));
+            return Ok(self);
         }
         let raw = match (self.selection.as_ref(), self.row_selection_policy) {
             (Some(selection), _) if selection.as_mask().is_some() => {
@@ -282,7 +288,7 @@ impl ReadPlanBuilder {
             Some(selection) => Some(selection.and_then(&raw)),
             None => Some(raw),
         };
-        Ok((self, processed_rows))
+        Ok(self)
     }
 
     /// Create a final `ReadPlan` the read plan for the scan
