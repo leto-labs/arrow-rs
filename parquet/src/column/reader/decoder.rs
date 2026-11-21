@@ -498,12 +498,10 @@ impl BitPackedLevelDecoder {
     pub(crate) fn take_levels(&mut self, count: usize) -> impl ExactSizeIterator<Item = i16> + '_ {
         let width = u64::from(self.bit_width);
         let start = self.bit_offset;
-        let count = if width == 0 {
-            count
-        } else {
-            let available = (self.data.len() as u64 * 8 - start) / width;
-            (count as u64).min(available) as usize
-        };
+        let available = (self.data.len() as u64 * 8 - start)
+            .checked_div(width)
+            .unwrap_or(u64::MAX);
+        let count = (count as u64).min(available) as usize;
         self.bit_offset += count as u64 * width;
 
         let mask = (1u32 << width) - 1;
