@@ -996,18 +996,13 @@ mod tests {
     ) {
         use crate::encodings::levels::LevelEncoder;
         use crate::encodings::rle::RleEncoder;
-        use crate::util::bit_util::BitWriter;
 
         fn levels(data: &[i16], max: i16, v2: bool, encoding: Encoding) -> Vec<u8> {
             if max == 0 {
                 return vec![];
             }
             if encoding == Encoding::BIT_PACKED {
-                let mut encoder = BitWriter::new(data.len());
-                for &value in data {
-                    encoder.put_value(value as u64, num_required_bits(max as u64) as usize);
-                }
-                return encoder.consume();
+                return decoder::pack_legacy_levels(data, num_required_bits(max as u64));
             }
             let mut encoder = if v2 {
                 LevelEncoder::v2_streaming(max)

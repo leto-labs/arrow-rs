@@ -27,7 +27,7 @@ use crate::encodings::{
 };
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
-use crate::util::bit_util::{BitReader, num_required_bits};
+use crate::util::bit_util::num_required_bits;
 
 #[cfg(feature = "arrow")]
 pub(crate) mod code_page;
@@ -477,8 +477,68 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
     }
 }
 
+/// Decoder for V1 BIT_PACKED levels. Both the byte and the value start
+/// with their most significant bit.
+pub(crate) struct BitPackedLevelDecoder {
+    data: Bytes,
+    bit_offset: u64,
+    bit_width: u8,
+}
+
+impl BitPackedLevelDecoder {
+    pub(crate) fn new(data: Bytes, bit_width: u8) -> Self {
+        debug_assert!(bit_width <= 16);
+        Self {
+            data,
+            bit_offset: 0,
+            bit_width,
+        }
+    }
+
+    pub(crate) fn take_levels(&mut self, count: usize) -> impl ExactSizeIterator<Item = i16> + '_ {
+        let width = u64::from(self.bit_width);
+        let start = self.bit_offset;
+        let available = (self.data.len() as u64 * 8 - start)
+            .checked_div(width)
+            .unwrap_or(u64::MAX);
+        let count = (count as u64).min(available) as usize;
+        self.bit_offset += count as u64 * width;
+
+        let mask = (1u32 << width) - 1;
+        (0..count).map(move |index| {
+            let offset = start + index as u64 * width;
+            let byte = (offset / 8) as usize;
+            let get = |i| self.data.get(byte + i).copied().unwrap_or(0);
+            // A level of at most 16 bits can straddle up to three bytes.
+            let window = u32::from_be_bytes([0, get(0), get(1), get(2)]);
+            let shift = 24 - offset % 8 - width;
+            ((window >> shift) & mask) as i16
+        })
+    }
+
+    pub(crate) fn skip_and_count(&mut self, count: usize, max_level: i16) -> (usize, usize) {
+        let levels = self.take_levels(count);
+        let skipped = levels.len();
+        let values = levels.filter(|&level| level == max_level).count();
+        (values, skipped)
+    }
+}
+
+#[cfg(test)]
+pub(super) fn pack_legacy_levels(levels: &[i16], width: u8) -> Vec<u8> {
+    let mut bytes = vec![0; (levels.len() * width as usize).div_ceil(8)];
+    let mut bit = 0;
+    for &level in levels {
+        for shift in (0..width).rev() {
+            bytes[bit / 8] |= ((level >> shift) as u8 & 1) << (7 - bit % 8);
+            bit += 1;
+        }
+    }
+    bytes
+}
+
 enum LevelDecoder {
-    Packed(BitReader, u8),
+    Packed(BitPackedLevelDecoder),
     Rle(RleDecoder),
 }
 
@@ -491,15 +551,20 @@ impl LevelDecoder {
                 Ok(Self::Rle(decoder))
             }
             #[expect(deprecated)]
-            Encoding::BIT_PACKED => Ok(Self::Packed(BitReader::new(data), bit_width)),
+            Encoding::BIT_PACKED => Ok(Self::Packed(BitPackedLevelDecoder::new(data, bit_width))),
             _ => Err(general_err!("invalid level encoding: {}", encoding)),
         }
     }
 
     fn read(&mut self, out: &mut [i16]) -> Result<usize> {
         match self {
-            Self::Packed(reader, bit_width) => {
-                Ok(reader.get_batch::<i16>(out, *bit_width as usize))
+            Self::Packed(reader) => {
+                let levels = reader.take_levels(out.len());
+                let count = levels.len();
+                for (slot, level) in out.iter_mut().zip(levels) {
+                    *slot = level;
+                }
+                Ok(count)
             }
             Self::Rle(reader) => Ok(reader.get_batch(out)?),
         }
@@ -555,10 +620,7 @@ impl DefinitionLevelDecoder for DefinitionLevelDecoderImpl {
         }
         match self.decoder.as_mut().unwrap() {
             LevelDecoder::Rle(reader) => reader.skip_and_count(num_levels, self.max_level),
-            LevelDecoder::Packed(reader, 1) => Ok(reader.skip_and_count_ones(num_levels)),
-            LevelDecoder::Packed(reader, bit_width) => {
-                Ok(reader.skip_and_count(num_levels, *bit_width as usize, self.max_level))
-            }
+            LevelDecoder::Packed(reader) => Ok(reader.skip_and_count(num_levels, self.max_level)),
         }
     }
 }
@@ -814,10 +876,27 @@ mod tests {
     }
 
     #[test]
+    #[expect(deprecated, reason = "Exercise the Parquet V1 BIT_PACKED encoding")]
+    fn legacy_repetition_levels_cross_byte_boundaries() {
+        // Four records with repetition levels [0, 1, 2], [0], [0, 3, 1], [0].
+        // Three-bit fields packed consecutively from each byte's MSB.
+        let data = Bytes::from_static(&[0x05, 0x00, 0xc8]);
+        let mut decoder = RepetitionLevelDecoderImpl::new(7);
+        decoder.set_data(Encoding::BIT_PACKED, data).unwrap();
+
+        assert_eq!(decoder.skip_rep_levels(1, 8).unwrap(), (1, 3));
+        let mut levels = Vec::new();
+        assert_eq!(decoder.read_rep_levels(&mut levels, 2, 5).unwrap(), (2, 4));
+        assert_eq!(levels, [0, 0, 3, 1]);
+        levels.clear();
+        assert_eq!(decoder.read_rep_levels(&mut levels, 1, 1).unwrap(), (0, 1));
+        assert_eq!(levels, [0]);
+        assert!(decoder.flush_partial());
+    }
+
+    #[test]
     #[expect(deprecated, reason = "Cover legacy BIT_PACKED definition levels")]
     fn test_skip_def_levels() {
-        use crate::util::bit_util::BitWriter;
-
         // A multiple of eight avoids ambiguous padding in the final packed run.
         let num_levels = 2056;
         for max_level in [1, 2, 3, 7, 255, 32767] {
@@ -838,13 +917,7 @@ mod tests {
                             }
                             Bytes::from(encoder.consume())
                         }
-                        Encoding::BIT_PACKED => {
-                            let mut encoder = BitWriter::new(num_levels);
-                            for &level in &levels {
-                                encoder.put_value(level as u64, bit_width as usize);
-                            }
-                            Bytes::from(encoder.consume())
-                        }
+                        Encoding::BIT_PACKED => pack_legacy_levels(&levels, bit_width).into(),
                         _ => unreachable!(),
                     };
                     for requested in [

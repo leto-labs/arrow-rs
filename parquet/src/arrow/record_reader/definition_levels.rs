@@ -28,7 +28,7 @@ use crate::arrow::buffer::bit_util::count_set_bits;
 use crate::basic::Encoding;
 use crate::column::page::Page;
 use crate::column::reader::decoder::{
-    ColumnLevelDecoder, DefinitionLevelDecoder, DefinitionLevelDecoderImpl,
+    BitPackedLevelDecoder, ColumnLevelDecoder, DefinitionLevelDecoder, DefinitionLevelDecoderImpl,
 };
 use crate::column::reader::parse_v1_level;
 use crate::encodings::rle::run_len;
@@ -239,7 +239,7 @@ pub(crate) fn cache_validity(page: &Page) -> Option<CachedValidity> {
     };
 
     let mut decoder = PackedDecoder::new();
-    decoder.set_data(Encoding::RLE, data);
+    decoder.set_data(data);
     // The fill ticket already admitted this allocation and the retained copy.
     // PackedDecoder writes complete words and needs eight bytes past the end.
     let mut bitmap = BooleanBufferBuilder::new(len + 64);
@@ -292,6 +292,7 @@ impl ValidityCursor {
 enum MaybePacked {
     Cached(ValidityCursor),
     Packed(PackedDecoder),
+    Legacy(BitPackedLevelDecoder),
     Fallback(DefinitionLevelDecoderImpl),
 }
 
@@ -316,13 +317,20 @@ impl ColumnLevelDecoder for DefinitionLevelBufferDecoder {
 
     fn set_data(&mut self, encoding: Encoding, data: Bytes) -> Result<()> {
         match &mut self.decoder {
-            MaybePacked::Cached(_) => {
+            MaybePacked::Fallback(d) => d.set_data(encoding, data)?,
+            #[expect(deprecated)]
+            _ if encoding == Encoding::BIT_PACKED => {
+                self.decoder = MaybePacked::Legacy(BitPackedLevelDecoder::new(data, 1));
+            }
+            _ if encoding != Encoding::RLE => {
+                return Err(general_err!("invalid level encoding: {}", encoding));
+            }
+            MaybePacked::Packed(d) => d.set_data(data),
+            MaybePacked::Cached(_) | MaybePacked::Legacy(_) => {
                 let mut decoder = PackedDecoder::new();
-                decoder.set_data(encoding, data);
+                decoder.set_data(data);
                 self.decoder = MaybePacked::Packed(decoder);
             }
-            MaybePacked::Packed(d) => d.set_data(encoding, data),
-            MaybePacked::Fallback(d) => d.set_data(encoding, data)?,
         }
         Ok(())
     }
@@ -388,6 +396,17 @@ impl DefinitionLevelDecoder for DefinitionLevelBufferDecoder {
             (BufferInner::Mask { nulls }, MaybePacked::Cached(cursor)) => {
                 Ok(cursor.consume(num_levels, Some(nulls)))
             }
+            (BufferInner::Mask { nulls }, MaybePacked::Legacy(decoder)) => {
+                let levels = decoder.take_levels(num_levels);
+                let levels_read = levels.len();
+                let mut values_read = 0;
+                for level in levels {
+                    let valid = level == 1;
+                    nulls.append(valid);
+                    values_read += usize::from(valid);
+                }
+                Ok((values_read, levels_read))
+            }
             (BufferInner::Mask { nulls }, MaybePacked::Packed(decoder)) => {
                 assert_eq!(self.max_level, 1);
 
@@ -418,6 +437,7 @@ impl DefinitionLevelDecoder for DefinitionLevelBufferDecoder {
             MaybePacked::Cached(cursor) => Ok(cursor.consume(num_levels, None)),
             MaybePacked::Fallback(decoder) => decoder.skip_def_levels(num_levels),
             MaybePacked::Packed(decoder) => decoder.skip(num_levels),
+            MaybePacked::Legacy(decoder) => Ok(decoder.skip_and_count(num_levels, 1)),
         }
     }
 }
@@ -523,7 +543,7 @@ impl<'a> Appender<'a> {
     }
 }
 
-/// An optimized decoder for decoding [RLE] and [BIT_PACKED] data with a bit width of 1
+/// An optimized decoder for decoding [RLE] data with a bit width of 1
 /// directly into a bitmask
 ///
 /// This is significantly faster than decoding the data into `[i16]` and then computing
@@ -536,7 +556,6 @@ impl<'a> Appender<'a> {
 /// * Runs of 1 or 0 bits can be efficiently appended with byte (or larger) operations
 ///
 /// [RLE]: https://github.com/apache/parquet-format/blob/master/Encodings.md#run-length-encoding--bit-packing-hybrid-rle--3
-/// [BIT_PACKED]: https://github.com/apache/parquet-format/blob/master/Encodings.md#bit-packed-deprecated-bit_packed--4
 struct PackedDecoder {
     data: Bytes,
     data_offset: usize,
@@ -614,16 +633,11 @@ impl PackedDecoder {
         }
     }
 
-    fn set_data(&mut self, encoding: Encoding, data: Bytes) {
+    fn set_data(&mut self, data: Bytes) {
         self.rle_left = 0;
         self.rle_value = false;
         self.packed_offset = 0;
-        self.packed_count = match encoding {
-            Encoding::RLE => 0,
-            #[expect(deprecated)]
-            Encoding::BIT_PACKED => data.len() * 8,
-            _ => unreachable!("invalid level encoding: {}", encoding),
-        };
+        self.packed_count = 0;
         self.data = data;
         self.data_offset = 0;
     }
@@ -1083,7 +1097,7 @@ mod tests {
 
         let encoded = encoder.consume();
         let mut decoder = PackedDecoder::new();
-        decoder.set_data(Encoding::RLE, encoded.into());
+        decoder.set_data(encoded.into());
 
         // Decode data in random length intervals
         let mut decoded = BooleanBufferBuilder::new(len);
@@ -1122,7 +1136,7 @@ mod tests {
 
         let encoded = encoder.consume();
         let mut decoder = PackedDecoder::new();
-        decoder.set_data(Encoding::RLE, encoded.into());
+        decoder.set_data(encoded.into());
 
         let mut skip_value = 0;
         let mut read_value = 0;
@@ -1170,7 +1184,7 @@ mod tests {
         }
         let encoded = encoder.consume();
         let mut decoder = PackedDecoder::new();
-        decoder.set_data(Encoding::RLE, encoded.into());
+        decoder.set_data(encoded.into());
 
         // try_consume_all_valid now parses the RLE block itself, no need to read first
         let result = decoder.try_consume_all_valid(len).unwrap();
@@ -1183,7 +1197,7 @@ mod tests {
         }
         let encoded = encoder.consume();
         let mut decoder = PackedDecoder::new();
-        decoder.set_data(Encoding::RLE, encoded.into());
+        decoder.set_data(encoded.into());
 
         // Should return None because rle_value is false (all nulls)
         let result = decoder.try_consume_all_valid(len).unwrap();
@@ -1199,7 +1213,7 @@ mod tests {
         }
         let encoded = encoder.consume();
         let mut decoder = PackedDecoder::new();
-        decoder.set_data(Encoding::RLE, encoded.into());
+        decoder.set_data(encoded.into());
 
         // Request more than the valid run - should return None
         // (because we don't look ahead to next block)
@@ -1207,7 +1221,7 @@ mod tests {
         assert_eq!(result, None);
 
         // Reset decoder and try requesting within the run
-        decoder.set_data(Encoding::RLE, {
+        decoder.set_data({
             let mut encoder = RleEncoder::new(1, 1024);
             for _ in 0..10 {
                 encoder.put(1);
@@ -1235,7 +1249,7 @@ mod tests {
         let mut writer = BitWriter::new(16);
         writer.put_vlq_int(u64::MAX);
         let mut decoder = PackedDecoder::new();
-        decoder.set_data(Encoding::RLE, writer.consume().into());
+        decoder.set_data(writer.consume().into());
 
         let mut decoded = BooleanBufferBuilder::new(8);
         let err = decoder.read(&mut decoded, 8).unwrap_err();
@@ -1256,7 +1270,7 @@ mod tests {
             let mut data = header;
             data.push(0b0101_0101);
             let mut decoder = PackedDecoder::new();
-            decoder.set_data(Encoding::RLE, Bytes::from(data));
+            decoder.set_data(Bytes::from(data));
             let mut decoded = BooleanBufferBuilder::new(0);
             decoded.append_n(3, true);
             let err = decoder.read(&mut decoded, 32).unwrap_err();
@@ -1282,7 +1296,7 @@ mod invalid_input_tests {
             let mut data = header;
             data.push(0b0101_0101);
             let mut decoder = PackedDecoder::new();
-            decoder.set_data(Encoding::RLE, Bytes::from(data));
+            decoder.set_data(Bytes::from(data));
             let err = decoder.skip(32).unwrap_err();
             assert_eq!(
                 err.to_string(),
@@ -1292,7 +1306,7 @@ mod invalid_input_tests {
 
         // A skip within the data still works.
         let mut decoder = PackedDecoder::new();
-        decoder.set_data(Encoding::RLE, Bytes::from(vec![(1 << 1) | 1, 0b0101_0101]));
+        decoder.set_data(Bytes::from(vec![(1 << 1) | 1, 0b0101_0101]));
         assert_eq!(decoder.skip(8).unwrap(), (4, 8));
     }
 }
