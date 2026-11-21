@@ -85,8 +85,9 @@ with compressed bodies decoded only when the page cache offers a fill ticket.
 Before growing a bitmap, the reader checks that run lengths and payloads
 cover the declared count. A final packed group may pad up to seven slots.
 The reader also accepts trailing zero-byte padding emitted by fastparquet.
-V2 flat pages require equal row and value counts. The V1 value fallback
-reads deprecated BIT_PACKED levels in MSB-first order.
+V2 flat pages require equal row and value counts. Both full and selected DCX
+reads use the ordinary value reader's least-significant-bit-first order for
+legacy V1 BIT_PACKED definition levels.
 [Parquet encodings](https://parquet.apache.org/docs/file-format/data-pages/encodings/) ·
 [Parquet Thrift headers](https://github.com/apache/parquet-format/blob/master/src/main/thrift/parquet.thrift)
 

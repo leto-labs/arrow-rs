@@ -830,19 +830,7 @@ fn decode_levels(
     let Some(levels) = levels else {
         return Ok((None, rows));
     };
-    #[expect(deprecated, reason = "Read legacy V1 definition levels")]
-    if encoding == Encoding::BIT_PACKED {
-        // The deprecated bit-packing starts at the MSB, unlike hybrid RLE.
-        // https://parquet.apache.org/docs/file-format/data-pages/encodings/#bit-packed-deprecated-bit_packed--4
-        if levels.len() < rows.div_ceil(8) {
-            return Err(general_err!("Incomplete BIT_PACKED definition levels"));
-        }
-        let decoded: Vec<i16> = (0..rows)
-            .map(|row| i16::from((levels[row / 8] >> (7 - row % 8)) & 1))
-            .collect();
-        let values = decoded.iter().map(|&level| level as usize).sum();
-        return Ok((Some(decoded), values));
-    }
+    // Use the ordinary reader's BitReader order for legacy V1 levels.
     let mut decoder = DefinitionLevelDecoderImpl::new(1);
     decoder.set_data(encoding, levels)?;
     let mut decoded = Vec::new();
@@ -960,9 +948,10 @@ mod tests {
                 definition
                     .chunks(8)
                     .map(|chunk| {
-                        chunk.iter().enumerate().fold(0, |byte, (bit, &valid)| {
-                            byte | (u8::from(valid) << (7 - bit))
-                        })
+                        chunk
+                            .iter()
+                            .enumerate()
+                            .fold(0, |byte, (bit, &valid)| byte | (u8::from(valid) << bit))
                     })
                     .collect()
             }
@@ -1302,38 +1291,6 @@ mod tests {
                     .is_err()
             );
         }
-    }
-
-    #[test]
-    #[expect(deprecated, reason = "Exercise the Parquet V1 BIT_PACKED encoding")]
-    fn code_page_legacy_levels_are_msb_first() {
-        crate::util::native::dispatch::for_each_tier(|| {
-            // The specification's BIT_PACKED encoding starts in the high bit.
-            // There is no size prefix in V1. The two levels are 1 and 0.
-            for (encoding, payload) in [
-                (Encoding::PLAIN, &[0x80, 17, 0, 0, 0][..]),
-                (Encoding::RLE_DICTIONARY, &[0x80, 0, 2]),
-            ] {
-                let page = Page::DataPage {
-                    buf: Bytes::copy_from_slice(payload),
-                    num_values: 2,
-                    encoding,
-                    def_level_encoding: Encoding::BIT_PACKED,
-                    rep_level_encoding: Encoding::RLE,
-                    statistics: None,
-                };
-                let mut reader = CodeColumnReader::<Int32Type, ArrowInt32>::new(
-                    descriptor(),
-                    Box::new(InMemoryPageReader::new([dictionary(&[17]), page])),
-                )
-                .unwrap();
-                let Some(CodeColumnPage::Values { values, .. }) = reader.next_page().unwrap()
-                else {
-                    panic!("expected a value page")
-                };
-                assert_eq!(values.iter().collect::<Vec<_>>(), [Some(17), None]);
-            }
-        });
     }
 
     #[test]

@@ -939,6 +939,193 @@ mod tests {
         }
     }
 
+    #[test]
+    #[expect(deprecated, reason = "Exercise the Parquet V1 BIT_PACKED encoding")]
+    fn code_page_legacy_levels_match_ordinary_reader() {
+        use crate::column::reader::{CodeColumnPage, CodeColumnReader};
+        use crate::util::test_common::page_util::InMemoryPageReader;
+        use arrow_array::types::Int32Type as ArrowInt32;
+        use bytes::Bytes;
+
+        let schema = parse_message_type("message x { OPTIONAL INT32 value; }").unwrap();
+        let desc = SchemaDescriptor::new(Arc::new(schema)).column(0);
+        crate::util::native::dispatch::for_each_tier(|| {
+            let mut mismatches = Vec::new();
+            for (encoding, payload) in [
+                (Encoding::PLAIN, &[0x80, 17, 0, 0, 0][..]),
+                (Encoding::RLE_DICTIONARY, &[0x80, 0, 2]),
+            ] {
+                let page = Page::DataPage {
+                    buf: Bytes::copy_from_slice(payload),
+                    num_values: 8,
+                    encoding,
+                    def_level_encoding: Encoding::BIT_PACKED,
+                    rep_level_encoding: Encoding::RLE,
+                    statistics: None,
+                };
+                let mut pages = Vec::new();
+                if encoding == Encoding::RLE_DICTIONARY {
+                    pages.push(Page::DictionaryPage {
+                        buf: Bytes::copy_from_slice(&17i32.to_le_bytes()),
+                        num_values: 1,
+                        encoding: Encoding::PLAIN,
+                        is_sorted: false,
+                    });
+                }
+                pages.push(page);
+                let ordinary = || {
+                    PrimitiveArrayReader::<Int32Type>::new(
+                        Box::new(InMemoryPageIterator::new([pages.clone()])),
+                        desc.clone(),
+                        None,
+                        8,
+                        None,
+                    )
+                    .unwrap()
+                };
+                let full = ordinary().next_batch(8).unwrap();
+                let full = full.as_any().downcast_ref::<Int32Array>().unwrap();
+                assert_eq!(
+                    full.iter().collect::<Vec<_>>(),
+                    [None, None, None, None, None, None, None, Some(17)]
+                );
+                let mut code_reader = CodeColumnReader::<Int32Type, ArrowInt32>::new(
+                    desc.clone(),
+                    Box::new(InMemoryPageReader::new(pages.clone())),
+                )
+                .unwrap();
+                let Some(CodeColumnPage::Values { values, .. }) = code_reader.next_page().unwrap()
+                else {
+                    panic!("expected a value page")
+                };
+                if &values != full {
+                    mismatches.push(format!("{encoding:?} full: {values:?}"));
+                }
+                for row in [0, 7] {
+                    let mask = BooleanArray::from_iter((0..8).map(|i| Some(i == row)));
+                    let expected = arrow_select::filter::filter(full, &mask).unwrap();
+                    let actual = ordinary().read_selected(&[1 << row], 8).unwrap();
+                    if actual.as_ref() != expected.as_ref() {
+                        mismatches.push(format!("{encoding:?} selected row {row}: {actual:?}"));
+                    }
+                }
+            }
+            assert!(
+                mismatches.is_empty(),
+                "legacy level mismatches: {mismatches:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn selected_indexed_page_skip_loads_deferred_dictionary() {
+        use crate::arrow::ArrowWriter;
+        use crate::file::{
+            properties::WriterProperties,
+            reader::{ChunkReader, FilePageIterator, FileReader, Length, SerializedFileReader},
+            serialized_reader::ReadOptionsBuilder,
+        };
+        use arrow_array::{BooleanArray, Int32Array, RecordBatch};
+        use bytes::Bytes;
+        use std::sync::Mutex;
+
+        struct TrackedBytes {
+            data: Bytes,
+            reads: Arc<Mutex<Vec<u64>>>,
+        }
+
+        impl Length for TrackedBytes {
+            fn len(&self) -> u64 {
+                self.data.len() as u64
+            }
+        }
+
+        impl ChunkReader for TrackedBytes {
+            type T = <Bytes as ChunkReader>::T;
+
+            fn get_read(&self, start: u64) -> Result<Self::T> {
+                self.reads.lock().unwrap().push(start);
+                self.data.get_read(start)
+            }
+
+            fn get_bytes(&self, start: u64, length: usize) -> Result<Bytes> {
+                self.reads.lock().unwrap().push(start);
+                self.data.get_bytes(start, length)
+            }
+        }
+
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int32Array::from_iter_values((0..16).map(|i| 17 + i % 3))) as ArrayRef,
+        )])
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_dictionary_enabled(true)
+            .set_data_page_row_count_limit(8)
+            .set_write_batch_size(8)
+            .build();
+        let mut writer = ArrowWriter::try_new(Vec::new(), batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        let data = Bytes::from(writer.into_inner().unwrap());
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let file = Arc::new(
+            SerializedFileReader::new_with_options(
+                TrackedBytes {
+                    data,
+                    reads: reads.clone(),
+                },
+                ReadOptionsBuilder::new().with_page_index().build(),
+            )
+            .unwrap(),
+        );
+        let metadata = file.metadata();
+        let locations = metadata
+            .page_index()
+            .unwrap()
+            .offset_index(0, 0)
+            .unwrap()
+            .page_locations();
+        assert_eq!(locations.len(), 2);
+        assert_eq!(locations[0].first_row_index, 0);
+        assert_eq!(locations[1].first_row_index, 8);
+        let dictionary_offset = metadata
+            .row_group(0)
+            .column(0)
+            .dictionary_page_offset()
+            .unwrap();
+        let mut pages = file
+            .get_row_group(0)
+            .unwrap()
+            .get_column_page_reader(0)
+            .unwrap();
+        assert!(pages.get_next_page().unwrap().unwrap().is_dictionary_page());
+        for _ in 0..2 {
+            assert_eq!(
+                pages.get_next_page().unwrap().unwrap().encoding(),
+                Encoding::RLE_DICTIONARY
+            );
+        }
+
+        let desc = metadata.file_metadata().schema_descr().column(0);
+        let build = || {
+            let pages = Box::new(FilePageIterator::new(0, file.clone()).unwrap());
+            PrimitiveArrayReader::<Int32Type>::new(pages, desc.clone(), None, 16, None).unwrap()
+        };
+        let full = build().next_batch(16).unwrap();
+        let mask = BooleanArray::from_iter((0..16).map(|i| Some(i == 9)));
+        let expected = arrow_select::filter::filter(full.as_ref(), &mask).unwrap();
+        assert_eq!(expected.as_ref(), &Int32Array::from(vec![17]));
+
+        reads.lock().unwrap().clear();
+        let actual = build().read_selected(&[1 << 9], 16).unwrap();
+        assert_eq!(actual.as_ref(), expected.as_ref());
+        // The selected page is fetched first, then its deferred dictionary.
+        assert_eq!(
+            reads.lock().unwrap().as_slice(),
+            [locations[1].offset as u64, dictionary_offset as u64]
+        );
+    }
+
     use crate::arrow::array_reader::test_util::EmptyPageIterator;
     use crate::arrow::arrow_reader::DEFAULT_BATCH_SIZE;
     use crate::basic::Encoding;
