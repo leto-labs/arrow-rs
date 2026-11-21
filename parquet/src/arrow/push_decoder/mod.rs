@@ -26,6 +26,7 @@ use crate::DecodeResult;
 pub use crate::arrow::arrow_reader::RowGroupSelection;
 use crate::arrow::arrow_reader::{
     ArrowReaderBuilder, ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
+    StagedScan,
 };
 use crate::errors::ParquetError;
 use crate::file::metadata::ParquetMetaData;
@@ -210,6 +211,7 @@ pub struct PushDecoderInput {
     /// The caller's lease of cached pages (see
     /// [`ParquetPushDecoderBuilder::with_page_lease`]).
     page_lease: Option<Arc<PageLease>>,
+    staged_scan: Option<Arc<StagedScan>>,
 }
 
 /// Methods for building a ParquetDecoder. See the base [`ArrowReaderBuilder`] for
@@ -276,6 +278,15 @@ impl ParquetPushDecoderBuilder {
         self
     }
 
+    /// Install the staged record-batch reader for this decoder.
+    ///
+    /// A decoder with an offset, a limit or a nonempty row filter uses the
+    /// ordinary reader so that its row-budget and filter ownership stay intact.
+    pub fn with_staged_scan(mut self, staged_scan: Option<Arc<StagedScan>>) -> Self {
+        self.input.staged_scan = staged_scan;
+        self
+    }
+
     /// Select row groups and rows using row-group-local coordinates.
     ///
     /// Entries are decoded in the supplied order, and omitted row groups are
@@ -335,6 +346,7 @@ impl ParquetPushDecoderBuilder {
                 PushDecoderInput {
                     buffers,
                     page_lease,
+                    staged_scan,
                 },
             metadata: parquet_metadata,
             schema,
@@ -373,7 +385,10 @@ impl ParquetPushDecoderBuilder {
             buffers,
             row_selection_policy,
         )
-        .with_page_lease(page_lease);
+        .with_page_lease(page_lease)
+        .with_staged_scan(
+            staged_scan.filter(|_| !has_predicates && offset.is_none() && limit.is_none()),
+        );
 
         // Initialize the decoder with the configured options
         let mut remaining_row_groups = RemainingRowGroups::new(
@@ -420,6 +435,7 @@ fn builder_from_remaining(parts: RemainingRowGroupsParts) -> ParquetPushDecoderB
         row_selection_policy,
         buffers,
         page_lease,
+        staged_scan,
     } = reader_builder;
 
     // Carry the decoder's already-fetched bytes and page lease across the
@@ -428,6 +444,7 @@ fn builder_from_remaining(parts: RemainingRowGroupsParts) -> ParquetPushDecoderB
         input: PushDecoderInput {
             buffers,
             page_lease,
+            staged_scan,
         },
         metadata,
         schema,

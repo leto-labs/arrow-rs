@@ -27,7 +27,7 @@ use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use crate::arrow::arrow_reader::selection::{LoadedRowRanges, RowSelectionStrategy};
 use crate::arrow::arrow_reader::{
     ParquetRecordBatchReader, PredicateOptions, ReadPlanBuilder, RowFilter, RowSelection,
-    RowSelectionPolicy,
+    RowSelectionPolicy, StagedArrayReader, StagedScan,
 };
 use crate::arrow::in_memory_row_group::ColumnChunkData;
 use crate::arrow::push_decoder::reader_builder::data::DataRequestBuilder;
@@ -209,6 +209,7 @@ pub(crate) struct RowGroupReaderBuilder {
     /// The caller's lease of the pages of the row groups to read, if any.
     /// Fetch planning takes cached pages from it instead of the cache.
     page_lease: Option<Arc<PageLease>>,
+    staged_scan: Option<Arc<StagedScan>>,
 
     /// What each decoding stage fetches. Kept here because the filter is
     /// moved out of the builder while a row group is decoded.
@@ -234,6 +235,7 @@ pub(crate) struct RowGroupReaderBuilderParts {
     pub buffers: PushBuffers,
     /// The caller's page lease, carried across a rebuild like the buffers.
     pub page_lease: Option<Arc<PageLease>>,
+    pub staged_scan: Option<Arc<StagedScan>>,
 }
 
 impl RowGroupReaderBuilder {
@@ -280,6 +282,7 @@ impl RowGroupReaderBuilder {
             state: Some(RowGroupDecoderState::Finished),
             buffers,
             page_lease: None,
+            staged_scan: None,
             stages: Arc::new(stages),
         }
     }
@@ -288,6 +291,11 @@ impl RowGroupReaderBuilder {
     /// [`ParquetPushDecoderBuilder::with_page_lease`](crate::arrow::push_decoder::ParquetPushDecoderBuilder::with_page_lease)).
     pub(crate) fn with_page_lease(mut self, page_lease: Option<Arc<PageLease>>) -> Self {
         self.page_lease = page_lease;
+        self
+    }
+
+    pub(crate) fn with_staged_scan(mut self, staged_scan: Option<Arc<StagedScan>>) -> Self {
+        self.staged_scan = staged_scan;
         self
     }
 
@@ -309,6 +317,7 @@ impl RowGroupReaderBuilder {
             state: _,
             buffers,
             page_lease,
+            staged_scan,
             // Recomputed from `filter` when the builder is rebuilt.
             stages: _,
         } = self;
@@ -322,6 +331,7 @@ impl RowGroupReaderBuilder {
             row_selection_policy,
             buffers,
             page_lease,
+            staged_scan,
         }
     }
 
@@ -775,6 +785,30 @@ impl RowGroupReaderBuilder {
                     &self.projection,
                     &mut self.buffers,
                 )?;
+
+                if let Some(scan) = &self.staged_scan
+                    && scan.applies_to(row_group_idx)
+                    && let Some(reader) = StagedArrayReader::try_new(
+                        &row_group,
+                        self.metadata.row_group(row_group_idx),
+                        self.fields.as_deref(),
+                        &self.projection,
+                        &plan_builder,
+                        &self.metrics,
+                        scan,
+                    )?
+                {
+                    return Ok(NextState::result(
+                        RowGroupDecoderState::Finished,
+                        RowGroupBuildResult::Data {
+                            batch_reader: ParquetRecordBatchReader::new(
+                                Box::new(reader),
+                                ReadPlanBuilder::new(self.batch_size).build(),
+                            ),
+                            remaining_budget: budget,
+                        },
+                    ));
+                }
 
                 let plan = plan_builder.build();
 

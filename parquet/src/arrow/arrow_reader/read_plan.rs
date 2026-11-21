@@ -1081,6 +1081,96 @@ mod tests {
     use super::*;
 
     #[test]
+    fn staged_vectors_skip_gather_and_preserve_full_output_after_a_slice() {
+        use crate::arrow::ArrowWriter;
+        use crate::arrow::arrow_reader::{ArrowReaderOptions, RowGroupSelection};
+        use crate::arrow::push_decoder::ParquetPushDecoderBuilder;
+        use crate::file::properties::WriterProperties;
+        use arrow_array::Int64Array;
+        use arrow_schema::Field;
+        use bytes::Bytes;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("keep", DataType::Boolean, true),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        // The slice starts three rows into the group. Its first vector is
+        // all NULL, its second has one survivor, and its last is all true.
+        let values = (0..195_i64).collect::<Vec<_>>();
+        let pass = BooleanArray::from_iter(values.iter().map(|&row| match row {
+            3..=66 => None,
+            67 => Some(true),
+            131.. => Some(true),
+            _ => Some(false),
+        }));
+        let input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(pass), Arc::new(Int64Array::from(values))],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .set_data_page_row_count_limit(24)
+            .set_write_batch_size(24)
+            .build();
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema, Some(props)).unwrap();
+        writer.write(&input).unwrap();
+        let bytes = Bytes::from(writer.into_inner().unwrap());
+        let metadata = crate::arrow::arrow_reader::ArrowReaderMetadata::load(
+            &bytes,
+            ArrowReaderOptions::new()
+                .with_page_index_policy(crate::file::metadata::PageIndexPolicy::Optional),
+        )
+        .unwrap();
+        let work = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer = Arc::clone(&work);
+        let scan = Arc::new(StagedScan::new(
+            vec![StagedPredicate::new(vec![0], |batch| {
+                Ok(batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .unwrap()
+                    .clone())
+            })],
+            move |entry| observer.lock().unwrap().push(entry),
+        ));
+        let mut decoder = ParquetPushDecoderBuilder::new_with_metadata(metadata)
+            .with_row_group_selections(vec![RowGroupSelection::new(
+                0,
+                Some(RowSelection::from(vec![
+                    RowSelector::skip(3),
+                    RowSelector::select(192),
+                ])),
+            )])
+            .with_batch_size(64)
+            .with_staged_scan(Some(scan))
+            .build()
+            .unwrap();
+        decoder.push_range(0..bytes.len() as u64, bytes).unwrap();
+        let crate::DecodeResult::Data(mut reader) = decoder.try_next_reader().unwrap() else {
+            panic!("expected a row-group reader");
+        };
+        assert!(reader.is_staged());
+        let (one, one_selection) = reader.next_with_selection().unwrap().unwrap();
+        assert_eq!(one, input.slice(67, 1));
+        assert_eq!(one_selection.unwrap().count_set_bits(), 1);
+        let (full, full_selection) = reader.next_with_selection().unwrap().unwrap();
+        assert_eq!(full, input.slice(131, 64));
+        assert_eq!(full_selection.unwrap().count_set_bits(), 64);
+        assert!(reader.next().is_none());
+        let work = work.lock().unwrap();
+        assert_eq!(
+            work.iter()
+                .map(|w| (w.input_rows, w.output_rows, w.selected))
+                .collect::<Vec<_>>(),
+            [(64, 0, false), (64, 1, true), (64, 64, false)]
+        );
+        assert_eq!(work[1].gathered_values, 1);
+        assert_eq!(work[2].decoded_values, 64);
+    }
+
+    #[test]
     fn staged_order_requires_a_stable_difference_and_cannot_swap_back() {
         let mut order = StagedOrder::new(&[1.0, 2.0]);
         for _ in 0..2 {
