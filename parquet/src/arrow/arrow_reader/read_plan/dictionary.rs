@@ -530,9 +530,16 @@ fn scan_chunk(
         if window.is_none() {
             pages.skip_next_page()?;
         } else {
-            let Ok(Some(page)) = pages.get_next_page() else {
+            let Some(page) = pages
+                .get_next_page()
+                .ok()
+                .flatten()
+                .filter(Page::is_dictionary_page)
+            else {
                 // An ordinary read might only touch selected PLAIN pages in
-                // this chunk, and it decides whether they read.
+                // this chunk. A cached dictionary marker can also advance
+                // directly to a data page. Leave row positioning to the
+                // ordinary reader in either case.
                 return Ok(None);
             };
             dictionary = Some(page);
@@ -900,5 +907,62 @@ impl PageReader for EntryPage {
     fn skip_next_page(&mut self) -> Result<()> {
         self.0.take();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Indexed page headers still advertise the dictionary range when the
+    // page cache has replaced it with a marker. Reading the marker can yield
+    // the next data page, and unselected data pages need not be pinned.
+    struct CachedMarkerReader(Option<Page>);
+
+    impl Iterator for CachedMarkerReader {
+        type Item = Result<Page>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.get_next_page().transpose()
+        }
+    }
+
+    impl PageReader for CachedMarkerReader {
+        fn peek_next_page(&mut self) -> Result<Option<PageMetadata>> {
+            Ok(Some(PageMetadata {
+                num_rows: self.0.is_none().then_some(2),
+                num_levels: None,
+                is_dict: self.0.is_some(),
+            }))
+        }
+
+        fn get_next_page(&mut self) -> Result<Option<Page>> {
+            self.0.take().map_or_else(
+                || Err(general_err!("Unselected page was not pinned")),
+                |page| Ok(Some(page)),
+            )
+        }
+
+        fn skip_next_page(&mut self) -> Result<()> {
+            unreachable!("The walker must decline the chunk before skipping a page");
+        }
+    }
+
+    #[test]
+    fn dictionary_filter_declines_cached_marker_that_advances_to_data() {
+        let mut pages = CachedMarkerReader(Some(Page::DataPage {
+            buf: bytes::Bytes::new(),
+            num_values: 2,
+            encoding: Encoding::PLAIN,
+            def_level_encoding: Encoding::RLE,
+            rep_level_encoding: Encoding::RLE,
+            statistics: None,
+        }));
+        let window = ChunkWindow {
+            rows: 4,
+            start: 0,
+            selection: BooleanBuffer::new_set(2),
+        };
+        assert!(scan_chunk(&mut pages, 4, Some(&window)).unwrap().is_none());
     }
 }

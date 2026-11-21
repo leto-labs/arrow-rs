@@ -460,6 +460,7 @@ policy); no general speed claim is made.
 Purpose: pin a runtime predicate before the first filter in a decoder unit.
 The verdict carries the publication generation and exactness, and verify
 uses decoded rows against the same publication. PLAIN and other uncovered
-rows retain their normal value evaluator. Dependent feature:
-DICTIONARY-CODE-EXECUTION (ADR 0060 decision 5).
+rows use their normal value evaluator. If a cached dictionary marker advances
+directly to a data page, the verdict walker leaves row positioning to the
+value reader. Dependent feature: DICTIONARY-CODE-EXECUTION (ADR 0060 decision 5).
 Audit classification: UPSTREAMABLE.
