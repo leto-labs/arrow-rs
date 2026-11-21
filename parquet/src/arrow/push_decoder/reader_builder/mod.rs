@@ -624,7 +624,11 @@ impl RowGroupReaderBuilder {
                 if let Some(limit) = predicate_limit {
                     predicate_options = predicate_options.with_limit(limit, row_count);
                 }
-                plan_builder = plan_builder.with_predicate_options(predicate_options)?;
+                plan_builder = plan_builder.with_dictionary_predicate(
+                    predicate_options,
+                    &row_group,
+                    self.fields.as_deref(),
+                )?;
 
                 let row_group_info = RowGroupInfo {
                     row_group_idx,

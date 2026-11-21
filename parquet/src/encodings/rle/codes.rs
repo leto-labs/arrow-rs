@@ -406,6 +406,7 @@ impl<'a> CodeCursor<'a> {
             invalid: 0,
             max_code: 0,
             has_packed: false,
+            runs: 0,
         };
         self.drain_impl::<_, false>(&mut sink, 0)?;
         if sink.invalid != 0 || (sink.has_packed && sink.max_code as usize >= limit) {
@@ -413,6 +414,7 @@ impl<'a> CodeCursor<'a> {
             return Err(invalid_packed_code());
         }
         sink.writer.finish();
+        table.runs += sink.runs;
         Ok(())
     }
 
@@ -582,6 +584,7 @@ impl RunSink for RankSink<'_> {
 pub struct VerdictTable {
     flags: Vec<u8>,
     entries: usize,
+    runs: usize,
 }
 
 impl VerdictTable {
@@ -589,7 +592,16 @@ impl VerdictTable {
     pub fn new(verdicts: impl IntoIterator<Item = bool>) -> Self {
         let flags: Vec<_> = verdicts.into_iter().map(u8::from).collect();
         let entries = flags.len();
-        Self { flags, entries }
+        Self {
+            flags,
+            entries,
+            runs: 0,
+        }
+    }
+
+    /// Number of index runs evaluated with this table so far.
+    pub fn runs_evaluated(&self) -> usize {
+        self.runs
     }
 }
 
@@ -605,11 +617,13 @@ struct VerdictSink<'a> {
     invalid: u8,
     max_code: u32,
     has_packed: bool,
+    runs: usize,
 }
 
 impl RunSink for VerdictSink<'_> {
     #[inline(always)]
     fn repeated(&mut self, code: u32, len: usize) {
+        self.runs += 1;
         // Table entries are 0 or 1 below the dictionary size; the walk has
         // checked the code against it.
         self.writer
@@ -618,6 +632,7 @@ impl RunSink for VerdictSink<'_> {
 
     #[inline(always)]
     fn packed(&mut self, width: u8, bytes: &[u8], len: usize) {
+        self.runs += 1;
         self.has_packed = true;
         let mask = low_mask(width as usize);
         if width <= MAX_TABLE_WIDTH {

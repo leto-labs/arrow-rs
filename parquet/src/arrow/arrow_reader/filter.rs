@@ -18,11 +18,79 @@
 use crate::arrow::ProjectionMask;
 use crate::arrow::arrow_reader::{RowSelection, RowSelectionPolicy};
 use crate::schema::types::SchemaDescriptor;
-use arrow_array::{Array, BooleanArray, RecordBatch};
+use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch};
 use arrow_buffer::BooleanBuffer;
 use arrow_schema::ArrowError;
 use arrow_select::filter::{SlicesIterator, filter_record_batch, prep_null_mask_filter};
 use std::fmt::{Debug, Formatter};
+
+/// Whether to evaluate a Parquet row filter in dictionary code space.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DictionaryFilterMode {
+    /// Evaluate only decoded rows.
+    #[default]
+    Off,
+    /// Evaluate eligible chunks in code space.
+    On,
+    /// Check the code-space selection against ordinary value evaluation.
+    Verify,
+}
+
+/// Per-predicate dictionary filter policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DictionaryFilterOptions {
+    /// Execution mode.
+    pub mode: DictionaryFilterMode,
+    /// Maximum dictionary entries as a percentage of the chunk's row count.
+    pub max_percent: u8,
+}
+
+/// Predicate result for the dictionary entries, in code order, and for NULL.
+#[derive(Debug)]
+pub struct DictionaryVerdict {
+    /// One bit per dictionary entry.
+    pub entries: BooleanBuffer,
+    /// Whether a row with a NULL value passes.
+    pub null: bool,
+}
+
+/// Work performed while applying a dictionary-aware predicate.
+/// Chunk counts refer to predicate evaluations. A mixed chunk may count once
+/// under each of the verdict and value paths.
+#[derive(Debug, Default)]
+pub struct DictionaryFilterMetrics {
+    /// Chunks for which code space supplied a selection.
+    pub chunks_verdict: usize,
+    /// Selected input rows tested in code space.
+    pub rows_verdict: usize,
+    /// Code-space rows that passed.
+    pub rows_verdict_matched: usize,
+    /// Chunks for which selected rows were evaluated as values.
+    pub chunks_value: usize,
+    /// Selected input rows evaluated in value space, excluding the verify oracle.
+    pub rows_value: usize,
+    /// Rows evaluated by the verify oracle, including any value fallback.
+    pub rows_verified: usize,
+    /// Chunks with selected data in a non-dictionary encoding.
+    pub fallback_plain: usize,
+    /// Chunks whose dictionary exceeds the configured percentage.
+    pub fallback_limit: usize,
+    /// Predicate/chunk evaluations with more than one projected leaf.
+    pub fallback_columns: usize,
+    /// Chunks where dictionary evaluation failed.
+    pub fallback_error: usize,
+    /// Chunks refused for other reasons (e.g. applicability or legacy levels).
+    pub fallback_unsupported: usize,
+    /// Dictionary entries presented to predicate evaluation.
+    pub entries_tested: usize,
+    /// Dictionary index runs evaluated, counting a packed run as one.
+    pub runs_evaluated: usize,
+    /// Row groups discarded by a verdict that rejects the entire dictionary.
+    pub row_groups_pruned_dictionary: usize,
+    /// First data-page offsets identifying those row groups within a file.
+    /// A prepared scan can evaluate the same row group in several units.
+    pub pruned_row_group_offsets: Vec<i64>,
+}
 
 /// A predicate operating on [`RecordBatch`]
 ///
@@ -48,6 +116,30 @@ pub trait ArrowPredicate: Send + 'static {
     /// * `true`:the row should be returned
     /// * `false` or `null`: the row should not be returned
     fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError>;
+
+    /// Opt into dictionary filtering and its metrics. The projection must be
+    /// one flat leaf, and a verdict must be a deterministic function of its value.
+    fn dictionary_filter_options(&self) -> Option<DictionaryFilterOptions> {
+        None
+    }
+
+    /// Whether this predicate can evaluate dictionary entries in this scan.
+    fn dictionary_filter_eligible(&self) -> bool {
+        true
+    }
+
+    /// Evaluate a chunk's dictionary and NULL. Return `None` when the predicate
+    /// cannot evaluate dictionary entries. Errors are retried through values.
+    fn evaluate_dictionary(
+        &mut self,
+        _leaf: usize,
+        _dictionary: &ArrayRef,
+    ) -> Result<Option<DictionaryVerdict>, ArrowError> {
+        Ok(None)
+    }
+
+    /// Report the dictionary and value work for this predicate.
+    fn record_dictionary_filter(&mut self, _metrics: DictionaryFilterMetrics) {}
 }
 
 /// An [`ArrowPredicate`] created from an [`FnMut`] and a [`ProjectionMask`]
@@ -212,7 +304,8 @@ impl RowFilter {
         let mut predicates: Vec<Box<dyn ArrowPredicate>> =
             Vec::with_capacity(self.predicates.len());
         let mut group: Vec<Box<dyn ArrowPredicate>> = Vec::new();
-        let mut flush_group = |group: &mut Vec<Box<dyn ArrowPredicate>>| {
+        let flush_group = |predicates: &mut Vec<Box<dyn ArrowPredicate>>,
+                           group: &mut Vec<Box<dyn ArrowPredicate>>| {
             if group.len() > 1 && can_fuse_projection(group[0].projection(), parquet_schema) {
                 let group = std::mem::take(group);
                 predicates.push(Box::new(FusedPredicate::new(group)));
@@ -222,15 +315,23 @@ impl RowFilter {
         };
 
         for predicate in self.predicates {
+            if predicate
+                .dictionary_filter_options()
+                .is_some_and(|options| options.mode != DictionaryFilterMode::Off)
+            {
+                flush_group(&mut predicates, &mut group);
+                predicates.push(predicate);
+                continue;
+            }
             if group
                 .last()
                 .is_some_and(|last| last.projection() != predicate.projection())
             {
-                flush_group(&mut group);
+                flush_group(&mut predicates, &mut group);
             }
             group.push(predicate);
         }
-        flush_group(&mut group);
+        flush_group(&mut predicates, &mut group);
 
         Self { predicates }
     }
@@ -293,6 +394,22 @@ impl Debug for FusedPredicate {
 impl ArrowPredicate for FusedPredicate {
     fn projection(&self) -> &ProjectionMask {
         self.predicates[0].projection()
+    }
+
+    fn dictionary_filter_options(&self) -> Option<DictionaryFilterOptions> {
+        self.predicates
+            .iter()
+            .find_map(|predicate| predicate.dictionary_filter_options())
+    }
+
+    fn record_dictionary_filter(&mut self, metrics: DictionaryFilterMetrics) {
+        if let Some(predicate) = self
+            .predicates
+            .iter_mut()
+            .find(|p| p.dictionary_filter_options().is_some())
+        {
+            predicate.record_dictionary_filter(metrics);
+        }
     }
 
     fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError> {
@@ -675,6 +792,309 @@ mod tests {
                     .with_predicate(make_reader(), &mut fused)
                     .unwrap();
                 assert_eq!(plan.selection(), sequential.selection(), "{policy:?}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod dictionary_tests {
+    use super::*;
+    use crate::DecodeResult;
+    use crate::arrow::ArrowWriter;
+    use crate::arrow::arrow_reader::{
+        ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelector,
+    };
+    use crate::arrow::push_decoder::ParquetPushDecoderBuilder;
+    use crate::file::metadata::PageIndexPolicy;
+    use crate::file::properties::{WriterProperties, WriterVersion};
+    use arrow_array::{ArrayRef, Int32Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use bytes::Bytes;
+    use std::sync::{Arc, Mutex};
+
+    struct StaticFilter {
+        projection: ProjectionMask,
+        mode: DictionaryFilterMode,
+        accept_null: bool,
+        accept_yes: bool,
+        fail_dictionary: bool,
+        metrics: Arc<Mutex<DictionaryFilterMetrics>>,
+    }
+
+    impl ArrowPredicate for StaticFilter {
+        fn projection(&self) -> &ProjectionMask {
+            &self.projection
+        }
+
+        fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError> {
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            Ok(values
+                .iter()
+                .map(|v| v.map_or(self.accept_null, |v| self.accept_yes && v == "yes"))
+                .collect())
+        }
+
+        fn dictionary_filter_options(&self) -> Option<DictionaryFilterOptions> {
+            Some(DictionaryFilterOptions {
+                mode: self.mode,
+                max_percent: 25,
+            })
+        }
+
+        fn evaluate_dictionary(
+            &mut self,
+            leaf: usize,
+            dictionary: &ArrayRef,
+        ) -> Result<Option<DictionaryVerdict>, ArrowError> {
+            assert_eq!(leaf, 0);
+            if self.fail_dictionary {
+                return Err(ArrowError::ComputeError("entry evaluation failed".into()));
+            }
+            let values = dictionary.as_any().downcast_ref::<StringArray>().unwrap();
+            Ok(Some(DictionaryVerdict {
+                entries: BooleanBuffer::collect_bool(values.len(), |i| {
+                    self.accept_yes && values.value(i) == "yes"
+                }),
+                null: self.accept_null,
+            }))
+        }
+
+        fn record_dictionary_filter(&mut self, metrics: DictionaryFilterMetrics) {
+            *self.metrics.lock().unwrap() = metrics;
+        }
+    }
+
+    #[test]
+    fn dictionary_filter_in_push_decoder_with_sparse_page_requests() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("word", DataType::Utf8, true),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let words = (0..512)
+            .map(|i| match i % 3 {
+                0 => None,
+                1 => Some("yes"),
+                _ => Some("no"),
+            })
+            .collect::<StringArray>();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(words),
+                Arc::new(Int32Array::from_iter_values(0..512)),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_data_page_row_count_limit(32)
+            .set_write_batch_size(32)
+            .build();
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        let file = Bytes::from(writer.into_inner().unwrap());
+        let metadata = ArrowReaderMetadata::load(
+            &file,
+            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required),
+        )
+        .unwrap();
+        let builder = ParquetPushDecoderBuilder::new_with_metadata(metadata);
+        let schema = builder.metadata().file_metadata().schema_descr();
+        let output = ProjectionMask::leaves(schema, [1]);
+        let metrics = Arc::new(Mutex::new(DictionaryFilterMetrics::default()));
+        let predicate = StaticFilter {
+            projection: ProjectionMask::leaves(schema, [0]),
+            mode: DictionaryFilterMode::Verify,
+            accept_null: true,
+            accept_yes: true,
+            fail_dictionary: false,
+            metrics: Arc::clone(&metrics),
+        };
+        let mut decoder = builder
+            .with_projection(output)
+            .with_row_selection(RowSelection::from(vec![
+                RowSelector::skip(32),
+                RowSelector::select(16),
+                RowSelector::skip(48),
+                RowSelector::select(96),
+                RowSelector::skip(320),
+            ]))
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .build()
+            .unwrap();
+        let mut ids = Vec::new();
+        loop {
+            match decoder.try_next_reader().unwrap() {
+                DecodeResult::Data(reader) => {
+                    for batch in reader {
+                        let batch = batch.unwrap();
+                        ids.extend_from_slice(
+                            batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int32Array>()
+                                .unwrap()
+                                .values(),
+                        );
+                    }
+                }
+                DecodeResult::NeedsData(ranges) => {
+                    let bytes = ranges
+                        .iter()
+                        .map(|range| file.slice(range.start as usize..range.end as usize))
+                        .collect();
+                    decoder.push_ranges(ranges, bytes).unwrap();
+                }
+                DecodeResult::Finished => break,
+            }
+        }
+        let expected = (32..48)
+            .chain(96..192)
+            .filter(|i| i % 3 != 2)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, expected);
+        assert_eq!(metrics.lock().unwrap().rows_verified, 112);
+    }
+
+    #[test]
+    fn dictionary_filter_prunes_empty_verdict_without_filtering_nulls_by_accident() {
+        let schema = Arc::new(Schema::new(vec![Field::new("word", DataType::Utf8, true)]));
+        let values = (0..128)
+            .map(|i| (i % 2 == 0).then_some("no"))
+            .collect::<StringArray>();
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(values)]).unwrap();
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        let file = Bytes::from(writer.into_inner().unwrap());
+        for (accept_null, expected) in [(false, 0), (true, 64)] {
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file.clone()).unwrap();
+            let metrics = Arc::new(Mutex::new(DictionaryFilterMetrics::default()));
+            let predicate = StaticFilter {
+                projection: ProjectionMask::leaves(builder.parquet_schema(), [0]),
+                mode: DictionaryFilterMode::Verify,
+                accept_null,
+                accept_yes: false,
+                fail_dictionary: false,
+                metrics: Arc::clone(&metrics),
+            };
+            let rows = builder
+                .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+                .build()
+                .unwrap()
+                .map(|batch| batch.unwrap().num_rows())
+                .sum::<usize>();
+            assert_eq!(rows, expected);
+            let metrics = metrics.lock().unwrap();
+            assert_eq!(
+                metrics.row_groups_pruned_dictionary,
+                usize::from(!accept_null)
+            );
+            assert_eq!(metrics.rows_verified, 128);
+        }
+    }
+
+    #[test]
+    fn dictionary_filter_matches_values_for_nulls_mixed_pages_and_errors() {
+        for version in [WriterVersion::PARQUET_1_0, WriterVersion::PARQUET_2_0] {
+            for mixed in [false, true] {
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("word", DataType::Utf8, true),
+                    Field::new("id", DataType::Int32, false),
+                ]));
+                let values = (0..1024)
+                    .map(|i| match i % 8 {
+                        0 => None,
+                        1 if mixed && i > 512 => Some(format!("other-{i}")),
+                        2 => Some("yes".into()),
+                        _ => Some("no".into()),
+                    })
+                    .collect::<StringArray>();
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(values),
+                        Arc::new(Int32Array::from_iter_values(0..1024)),
+                    ],
+                )
+                .unwrap();
+                let properties = WriterProperties::builder()
+                    .set_writer_version(version)
+                    .set_data_page_row_count_limit(64)
+                    .set_write_batch_size(64)
+                    .set_dictionary_page_size_limit(if mixed { 100 } else { 1024 })
+                    .build();
+                let mut writer =
+                    ArrowWriter::try_new(Vec::new(), schema, Some(properties)).unwrap();
+                writer.write(&batch).unwrap();
+                let file = Bytes::from(writer.into_inner().unwrap());
+                for accept_null in [false, true] {
+                    for mode in [
+                        DictionaryFilterMode::Off,
+                        DictionaryFilterMode::On,
+                        DictionaryFilterMode::Verify,
+                    ] {
+                        for fail_dictionary in [false, true] {
+                            let builder =
+                                ParquetRecordBatchReaderBuilder::try_new(file.clone()).unwrap();
+                            let projected = ProjectionMask::leaves(builder.parquet_schema(), [1]);
+                            let projection = ProjectionMask::leaves(builder.parquet_schema(), [0]);
+                            let metrics = Arc::new(Mutex::new(DictionaryFilterMetrics::default()));
+                            let predicate = StaticFilter {
+                                projection,
+                                mode,
+                                accept_null,
+                                accept_yes: true,
+                                fail_dictionary,
+                                metrics: Arc::clone(&metrics),
+                            };
+                            let ids = builder
+                                .with_projection(projected)
+                                .with_batch_size(73)
+                                .with_row_selection(RowSelection::from(vec![
+                                    crate::arrow::arrow_reader::RowSelector::skip(33),
+                                    crate::arrow::arrow_reader::RowSelector::select(823),
+                                    crate::arrow::arrow_reader::RowSelector::skip(168),
+                                ]))
+                                .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+                                .build()
+                                .unwrap()
+                                .flat_map(|batch| {
+                                    let batch = batch.unwrap();
+                                    batch
+                                        .column(0)
+                                        .as_any()
+                                        .downcast_ref::<Int32Array>()
+                                        .unwrap()
+                                        .values()
+                                        .to_vec()
+                                })
+                                .collect::<Vec<_>>();
+                            let expected = (33..856)
+                                .filter(|i| i % 8 == 2 || (accept_null && i % 8 == 0))
+                                .collect::<Vec<_>>();
+                            assert_eq!(
+                                ids, expected,
+                                "{version:?}, mixed={mixed}, {mode:?}, error={fail_dictionary}"
+                            );
+                            let metrics = metrics.lock().unwrap();
+                            if mode != DictionaryFilterMode::Off && !fail_dictionary {
+                                assert_eq!(metrics.chunks_verdict, 1);
+                                assert!(metrics.runs_evaluated > 0);
+                                if mixed {
+                                    assert_eq!(metrics.fallback_plain, 1);
+                                }
+                            }
+                            if mode != DictionaryFilterMode::Off && fail_dictionary {
+                                assert_eq!(metrics.fallback_error, 1);
+                                assert_eq!(metrics.rows_value, 823);
+                            }
+                        }
+                    }
+                }
             }
         }
     }

@@ -22,7 +22,10 @@ use arrow_array::{BooleanArray, RecordBatch, RecordBatchReader};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use arrow_schema::{ArrowError, DataType as ArrowType, FieldRef, Schema, SchemaRef};
 use arrow_select::filter::filter_record_batch;
-pub use filter::{ArrowPredicate, ArrowPredicateFn, RowFilter};
+pub use filter::{
+    ArrowPredicate, ArrowPredicateFn, DictionaryFilterMetrics, DictionaryFilterMode,
+    DictionaryFilterOptions, DictionaryVerdict, RowFilter,
+};
 use selection::MaskCursor;
 pub use selection::{
     MaskRunIter, RowSelection, RowSelectionCursor, RowSelectionPolicy, RowSelector,
@@ -1459,7 +1462,11 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
                     .with_parquet_metadata(&reader.metadata)
                     .build_array_reader(fields.as_deref(), predicate.projection())?;
 
-                plan_builder = plan_builder.with_predicate(array_reader, predicate.as_mut())?;
+                plan_builder = plan_builder.with_dictionary_predicate(
+                    PredicateOptions::new(array_reader, predicate.as_mut()),
+                    &reader,
+                    fields.as_deref(),
+                )?;
             }
         }
 

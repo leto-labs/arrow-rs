@@ -95,6 +95,19 @@ impl ChunkDictionary {
         }
     }
 
+    // The scan materializes entries with the Arrow reader's logical-type
+    // conversions. The run walker needs their count, never their bytes.
+    pub(crate) fn for_verdict(values: ArrayRef, physical_type: Type) -> Self {
+        let entries = values.len();
+        Self {
+            plain: Bytes::new(),
+            entries,
+            physical_type,
+            values: Arc::new(OnceLock::from(values)),
+            materialize: |_, _| unreachable!("verdict dictionary already materialized"),
+        }
+    }
+
     /// The chunk's single values allocation. Its pointer identifies this dictionary.
     pub fn values(&self) -> &ArrayRef {
         self.values
