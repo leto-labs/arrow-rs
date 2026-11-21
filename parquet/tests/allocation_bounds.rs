@@ -155,6 +155,7 @@ impl ArrowPredicate for PassDictionary {
         entries: &ArrayRef,
     ) -> Result<Option<DictionaryVerdict>, ArrowError> {
         Ok(Some(DictionaryVerdict {
+            runtime: None,
             entries: BooleanBuffer::new_set(entries.len()),
             null: false,
         }))

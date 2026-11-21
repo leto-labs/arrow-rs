@@ -129,7 +129,25 @@ impl ReadPlanBuilder {
         let verify = policy.mode == DictionaryFilterMode::Verify && metrics.chunks_verdict != 0;
         let result = if verify {
             metrics.rows_verified = span.selected;
-            let oracle = self.clone().with_predicate(array_reader, predicate)?;
+            let mut coverage = BooleanBufferBuilder::new(span.selected);
+            span.append_selected(&covered, &mut coverage);
+            let coverage = coverage.finish();
+            let mut offset = 0;
+            let oracle = self.clone().apply_predicate_with(
+                PredicateOptions::new(array_reader, predicate),
+                |predicate, batch| {
+                    let count = batch.num_rows();
+                    if count > coverage.len() - offset {
+                        return Err(arrow_schema::ArrowError::ComputeError(
+                            "Dictionary verification read past the selected span".into(),
+                        ));
+                    }
+                    let batch_coverage = coverage.slice(offset, count);
+                    offset += count;
+                    predicate.evaluate_dictionary_oracle(batch, &batch_coverage)
+                },
+                |_| {},
+            )?;
             if (&span.window(oracle.selection(), rows) & &covered) != passed {
                 return Err(general_err!(
                     "Dictionary and value predicate selections differ"
@@ -219,9 +237,7 @@ impl SelectedSpan {
         // Gather the bits of the selected rows only, as a predicate result
         // does, so the plan's own selection keeps its representation.
         let mut kept = BooleanBufferBuilder::new(self.selected);
-        for (start, end) in self.mask.set_slices() {
-            kept.append_buffer(&rows.slice(start, end - start));
-        }
+        self.append_selected(rows, &mut kept);
         match plan.selection() {
             Some(selection) => {
                 // A selection can extend past the reader's rows; it reads
@@ -230,6 +246,12 @@ impl SelectedSpan {
                 selection.and_then(&RowSelection::from_boolean_buffer(kept.finish()))
             }
             None => RowSelection::from_boolean_buffer(kept.finish()),
+        }
+    }
+
+    fn append_selected(&self, rows: &BooleanBuffer, kept: &mut BooleanBufferBuilder) {
+        for (start, end) in self.mask.set_slices() {
+            kept.append_buffer(&rows.slice(start, end - start));
         }
     }
 }
@@ -414,6 +436,13 @@ fn evaluate_chunks(
         let value_rows = selected_rows - chunk_result.rows;
         metrics.chunks_verdict += usize::from(chunk_result.rows > 0);
         metrics.rows_verdict += chunk_result.rows;
+        if let Some(runtime) = chunk_result.runtime {
+            if runtime.exact {
+                metrics.rows_runtime_exact += chunk_result.rows;
+            } else {
+                metrics.rows_runtime_conservative += chunk_result.rows;
+            }
+        }
         metrics.chunks_value += usize::from(value_rows > 0);
         metrics.rows_value += value_rows;
         metrics.fallback_plain += usize::from(chunk_result.plain);
@@ -567,6 +596,7 @@ fn scan_chunk(
 
 #[derive(Default)]
 struct ChunkResult {
+    runtime: Option<crate::arrow::arrow_reader::RuntimeVerdict>,
     rows: usize,
     plain: bool,
     limit: bool,
@@ -636,6 +666,7 @@ fn evaluate_chunk(
         covered.append_buffer(&window.selection);
         passed.append_n(window.selection.len(), false);
         result.rows = window.selection.count_set_bits();
+        result.runtime = verdict.runtime;
         metrics.row_groups_pruned_dictionary += 1;
         metrics
             .pruned_row_group_offsets
@@ -691,6 +722,7 @@ fn evaluate_chunk(
         passed.append_buffer(&(&page_mask & &selection));
         result.rows += selected_rows;
     }
+    result.runtime = verdict.runtime;
     metrics.runs_evaluated += table.runs_evaluated();
     Ok(result)
 }

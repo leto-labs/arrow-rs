@@ -26,7 +26,7 @@ use arrow_schema::{ArrowError, DataType as ArrowType, FieldRef, Schema, SchemaRe
 use arrow_select::filter::filter_record_batch;
 pub use filter::{
     ArrowPredicate, ArrowPredicateFn, DictionaryFilterMetrics, DictionaryFilterMode,
-    DictionaryFilterOptions, DictionaryVerdict, RowFilter,
+    DictionaryFilterOptions, DictionaryVerdict, RowFilter, RuntimeVerdict,
 };
 use selection::MaskCursor;
 pub use selection::{
@@ -1450,6 +1450,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
 
         // Update selection based on any filters
         if let Some(filter) = filter.as_mut() {
+            filter.begin_dictionary_filter_unit();
             for predicate in &mut filter.predicates {
                 // break early if we have ruled out all rows
                 if !plan_builder.selects_any() {
@@ -1474,6 +1475,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
                     plan_builder.with_predicate(array_reader, predicate.as_mut())?
                 };
             }
+            filter.end_dictionary_filter_unit();
         }
 
         let array_reader = ArrayReaderBuilder::new(&reader, &metrics)

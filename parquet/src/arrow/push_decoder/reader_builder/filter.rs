@@ -98,6 +98,7 @@ impl FilterInfo {
     ///   if there are no more predicates
     pub(super) fn advance(mut self) -> AdvanceResult {
         if self.next_predicate.get() >= self.filter.predicates.len() {
+            self.filter.end_dictionary_filter_unit();
             AdvanceResult::Done(self.filter, self.cache_info)
         } else {
             self.next_predicate = self
@@ -150,7 +151,8 @@ impl FilterInfo {
     }
 
     /// Returns the inner filter, consuming this FilterInfo
-    pub(super) fn into_filter(self) -> RowFilter {
+    pub(super) fn into_filter(mut self) -> RowFilter {
+        self.filter.end_dictionary_filter_unit();
         self.filter
     }
 }

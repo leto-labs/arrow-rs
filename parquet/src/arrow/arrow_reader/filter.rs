@@ -54,6 +54,17 @@ pub struct DictionaryVerdict {
     pub entries: BooleanBuffer,
     /// Whether a row with a NULL value passes.
     pub null: bool,
+    /// The runtime filter publication that supplied this verdict, if any.
+    pub runtime: Option<RuntimeVerdict>,
+}
+
+/// Provenance of a runtime dictionary verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeVerdict {
+    /// Publication observed when the decoder claimed the unit.
+    pub generation: u64,
+    /// Whether the verdict is exact for the published key set.
+    pub exact: bool,
 }
 
 /// Work performed while applying a dictionary-aware predicate.
@@ -67,6 +78,10 @@ pub struct DictionaryFilterMetrics {
     pub rows_verdict: usize,
     /// Code-space rows that passed.
     pub rows_verdict_matched: usize,
+    /// Input rows tested with a complete, exact runtime filter.
+    pub rows_runtime_exact: usize,
+    /// Input rows tested with a partial or approximate runtime filter.
+    pub rows_runtime_conservative: usize,
     /// Chunks for which selected rows were evaluated as values.
     pub chunks_value: usize,
     /// Selected input rows evaluated in value space, excluding the verify oracle.
@@ -124,6 +139,23 @@ pub trait ArrowPredicate: Send + 'static {
     /// one flat leaf's value.
     fn dictionary_filter_options(&self) -> Option<DictionaryFilterOptions> {
         None
+    }
+
+    /// Snapshot optional runtime state before this unit evaluates any filter.
+    fn begin_dictionary_filter_unit(&mut self) {}
+
+    /// Release state pinned for the preceding decoder unit.
+    fn end_dictionary_filter_unit(&mut self) {}
+
+    /// Evaluate decoded values for dictionary verification. Covered rows must
+    /// use the publication that produced the verdict. Other rows take the
+    /// ordinary value path. The default handles static predicates.
+    fn evaluate_dictionary_oracle(
+        &mut self,
+        batch: RecordBatch,
+        _covered: &BooleanBuffer,
+    ) -> Result<BooleanArray, ArrowError> {
+        self.evaluate(batch)
     }
 
     /// Whether this predicate can evaluate dictionary entries in this scan.
@@ -294,6 +326,22 @@ impl RowFilter {
         Self {
             predicates,
             dictionary_filter: false,
+        }
+    }
+
+    pub(crate) fn begin_dictionary_filter_unit(&mut self) {
+        if self.dictionary_filter {
+            for predicate in &mut self.predicates {
+                predicate.begin_dictionary_filter_unit();
+            }
+        }
+    }
+
+    pub(crate) fn end_dictionary_filter_unit(&mut self) {
+        if self.dictionary_filter {
+            for predicate in &mut self.predicates {
+                predicate.end_dictionary_filter_unit();
+            }
         }
     }
 
@@ -866,6 +914,7 @@ mod dictionary_tests {
             }
             let values = dictionary.as_any().downcast_ref::<StringArray>().unwrap();
             Ok(Some(DictionaryVerdict {
+                runtime: None,
                 entries: BooleanBuffer::collect_bool(values.len(), |i| {
                     self.accept_yes && values.value(i) == "yes"
                 }),

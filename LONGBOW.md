@@ -454,3 +454,12 @@ once across 128 partial batches. Both pass the same 2,646-case
 selector/queue/mask differential. Default SQL scans reach this cursor only when
 the Selectors strategy is chosen (`force_filter_selections` or a selector
 policy); no general speed claim is made.
+
+### RV: unit-scoped Parquet dictionary verdicts
+
+Purpose: pin a runtime predicate before the first filter in a decoder unit.
+The verdict carries the publication generation and exactness, and verify
+uses decoded rows against the same publication. PLAIN and other uncovered
+rows retain their normal value evaluator. Dependent feature:
+DICTIONARY-CODE-EXECUTION (ADR 0060 decision 5).
+Audit classification: UPSTREAMABLE.

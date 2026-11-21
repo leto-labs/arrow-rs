@@ -28,8 +28,9 @@ use crate::arrow::arrow_reader::{
     ArrowPredicate, ParquetRecordBatchReader, RowSelection, RowSelectionCursor, RowSelector,
 };
 use crate::errors::{ParquetError, Result};
-use arrow_array::{Array, BooleanArray};
+use arrow_array::{Array, BooleanArray, RecordBatch};
 use arrow_buffer::BooleanBuffer;
+use arrow_schema::ArrowError;
 use arrow_select::filter::prep_null_mask_filter;
 use std::sync::Arc;
 mod dictionary;
@@ -191,8 +192,24 @@ impl ReadPlanBuilder {
     }
 
     fn apply_predicate(
+        self,
+        options: PredicateOptions<'_>,
+        rows_evaluated: impl FnOnce(usize),
+    ) -> Result<Self> {
+        self.apply_predicate_with(
+            options,
+            |predicate, batch| predicate.evaluate(batch),
+            rows_evaluated,
+        )
+    }
+
+    fn apply_predicate_with(
         mut self,
         options: PredicateOptions<'_>,
+        mut evaluate: impl FnMut(
+            &mut dyn ArrowPredicate,
+            RecordBatch,
+        ) -> std::result::Result<BooleanArray, ArrowError>,
         rows_evaluated: impl FnOnce(usize),
     ) -> Result<Self> {
         let PredicateOptions {
@@ -220,7 +237,7 @@ impl ReadPlanBuilder {
         for maybe_batch in reader {
             let maybe_batch = maybe_batch?;
             let input_rows = maybe_batch.num_rows();
-            let filter = predicate.evaluate(maybe_batch)?;
+            let filter = evaluate(predicate, maybe_batch)?;
             // Since user supplied predicate, check error here to catch bugs quickly
             if filter.len() != input_rows {
                 return Err(arrow_err!(

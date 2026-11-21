@@ -457,7 +457,7 @@ impl RowGroupReaderBuilder {
 
                 let column_chunks = None; // no prior column chunks
 
-                let Some(filter) = self.filter.take() else {
+                let Some(mut filter) = self.filter.take() else {
                     // no filter, start trying to read data immediately
                     return Ok(NextState::again(RowGroupDecoderState::StartData {
                         row_group_info,
@@ -486,6 +486,7 @@ impl RowGroupReaderBuilder {
                     ))),
                 );
 
+                filter.begin_dictionary_filter_unit();
                 let filter_info = FilterInfo::new(filter, cache_info);
                 NextState::again(RowGroupDecoderState::Filters {
                     row_group_info,
