@@ -36,7 +36,7 @@ use crate::schema::types::ColumnDescPtr;
 use crate::util::utf8::check_valid_utf8;
 use arrow_array::{ArrayRef, BinaryViewArray, StringViewArray, UInt32Array, builder::make_view};
 use arrow_buffer::{BooleanBufferBuilder, Buffer, NullBuffer, ScalarBuffer};
-use arrow_data::ByteView;
+use arrow_data::{ByteView, validate_string_view};
 use arrow_schema::DataType as ArrowType;
 use bytes::Bytes;
 use std::any::Any;
@@ -121,7 +121,7 @@ impl ByteViewArrayReader {
             && let Some(tail) = selected.chunk.take()
         {
             let replay = FlatPageReplay {
-                dictionary: selected.dictionary.map(|(page, _)| page),
+                dictionary: selected.dictionary.map(|dictionary| dictionary.page),
                 data: selected.page.map(|page| page.original),
                 tail,
             };
@@ -240,7 +240,7 @@ impl ArrayReader for ByteViewArrayReader {
 #[derive(Default)]
 struct SelectedViews {
     chunk: Option<Box<dyn PageReader>>,
-    dictionary: Option<(Page, ViewBuffer)>,
+    dictionary: Option<SelectedDictionary>,
     page: Option<ViewPage>,
     // This can be nonzero even before a page has been loaded. A rejected
     // prefix in one vector need not fetch the page for the next vector.
@@ -248,6 +248,12 @@ struct SelectedViews {
     validity: FlatValidityRanks,
     ranks: Vec<u32>,
     codes: Vec<u32>,
+}
+
+struct SelectedDictionary {
+    page: Page,
+    buffer: ViewBuffer,
+    validated_utf8: bool,
 }
 
 struct ViewPage {
@@ -323,7 +329,7 @@ impl SelectedViews {
                             &mut self.codes,
                             position,
                         )?;
-                        let (_, dictionary) = self.dictionary.as_ref().unwrap();
+                        let dictionary = self.dictionary.as_ref().unwrap();
                         gather_views(dictionary, &self.codes, nulls, view_type)?
                     }
                     ViewPageValues::Full(values) => {
@@ -392,7 +398,9 @@ impl SelectedViews {
             match chunk.get_next_page()? {
                 None if self.offset != 0 => return Err(eof_err!("Missing buffered view page")),
                 None => self.chunk = None,
-                Some(page) if page.is_dictionary_page() => self.install_dictionary(page)?,
+                Some(page) if page.is_dictionary_page() => {
+                    self.install_dictionary(page, view_type)?;
+                }
                 Some(page) => {
                     self.load(page, span, nullable, view_type)?;
                     return Ok(0);
@@ -401,11 +409,11 @@ impl SelectedViews {
         }
     }
 
-    fn install_dictionary(&mut self, page: Page) -> Result<()> {
+    fn install_dictionary(&mut self, page: Page, view_type: SelectedViewType) -> Result<()> {
         if self.dictionary.is_some() {
             return Err(general_err!("Unexpected dictionary page"));
         }
-        // Build binary views now and validate UTF-8 only for retained values.
+        // Decode as binary so an invalid, unreferenced entry remains legal.
         let mut decoder = ByteViewArrayColumnValueDecoder {
             dict: None,
             decoder: None,
@@ -417,7 +425,14 @@ impl SelectedViews {
             page.encoding(),
             false,
         )?;
-        self.dictionary = Some((page, decoder.dict.unwrap()));
+        let buffer = decoder.dict.unwrap();
+        let validated_utf8 =
+            view_type.validate_utf8 && validate_string_view(&buffer.views, &buffer.buffers).is_ok();
+        self.dictionary = Some(SelectedDictionary {
+            page,
+            buffer,
+            validated_utf8,
+        });
         Ok(())
     }
 
@@ -449,7 +464,7 @@ impl SelectedViews {
                 .unwrap()
                 .take_deferred_dictionary()?
                 .ok_or_else(|| general_err!("Missing column chunk dictionary"))?;
-            self.install_dictionary(dict)?;
+            self.install_dictionary(dict, view_type)?;
         }
         let values = if dictionary && page.has_hybrid_levels() {
             ViewPageValues::Dictionary {
@@ -465,8 +480,10 @@ impl SelectedViews {
                 view_type.validate_utf8,
             )?;
             let mut dense = ViewBuffer::default();
-            let dict = self.dictionary.as_ref().map(|(_, dict)| dict);
-            if decoder.read(&mut dense, physical_values, dict)? != physical_values {
+            let dict = self.dictionary.as_ref();
+            if decoder.read(&mut dense, physical_values, dict.map(|dict| &dict.buffer))?
+                != physical_values
+            {
                 return Err(eof_err!("Incomplete view value page"));
             }
             let nulls = nullable.then(|| {
@@ -485,7 +502,8 @@ impl SelectedViews {
                     .collect();
                 NullBuffer::new(valid.finish())
             });
-            ViewPageValues::Full(finish_views(dense, nulls, view_type)?)
+            let validated_utf8 = dictionary && dict.is_some_and(|dict| dict.validated_utf8);
+            ViewPageValues::Full(finish_views(dense, nulls, view_type, validated_utf8)?)
         };
         self.page = Some(ViewPage {
             original,
@@ -498,7 +516,7 @@ impl SelectedViews {
 }
 
 fn gather_views(
-    dictionary: &ViewBuffer,
+    dictionary: &SelectedDictionary,
     codes: &[u32],
     mut validity: Option<BooleanBufferBuilder>,
     view_type: SelectedViewType,
@@ -508,7 +526,7 @@ fn gather_views(
         .map(|builder| NullBuffer::new(builder.finish()));
     let len = validity.as_ref().map_or(codes.len(), NullBuffer::len);
     let mut out = ViewBuffer::with_capacity(len);
-    out.buffers.clone_from(&dictionary.buffers);
+    out.buffers.clone_from(&dictionary.buffer.buffers);
     let mut codes = codes.iter();
     for row in 0..len {
         let view = if validity.as_ref().is_some_and(|valid| valid.is_null(row)) {
@@ -516,24 +534,34 @@ fn gather_views(
         } else {
             let key = *codes.next().unwrap();
             *dictionary
+                .buffer
                 .views
                 .get(key as usize)
                 .ok_or_else(|| general_err!("invalid key={key} for dictionary"))?
         };
         out.views.push(view);
     }
-    finish_views(out, validity, view_type)
+    finish_views(out, validity, view_type, dictionary.validated_utf8)
 }
 
 fn finish_views(
     values: ViewBuffer,
     nulls: Option<NullBuffer>,
     view_type: SelectedViewType,
+    validated_utf8: bool,
 ) -> Result<ArrayRef> {
     let views = ScalarBuffer::from(values.views);
     let nulls = nulls.filter(|nulls| nulls.null_count() != 0);
     if view_type.validate_utf8 {
-        let strings = StringViewArray::try_new(views, values.buffers, nulls)?;
+        let strings = if validated_utf8 {
+            // SAFETY: install_dictionary validated every view against its immutable
+            // buffers. Both callers copy dictionary views using bounds-checked
+            // indices and preserve the backing buffers. They insert a zero view
+            // for each null and build exactly one validity bit per output view.
+            unsafe { StringViewArray::new_unchecked(views, values.buffers.into(), nulls) }
+        } else {
+            StringViewArray::try_new(views, values.buffers, nulls)?
+        };
         if view_type.utf8 {
             Ok(Arc::new(strings))
         } else {
@@ -1306,21 +1334,17 @@ mod tests {
             encoding: Encoding::PLAIN,
             is_sorted: false,
         };
-        let page = Page::DataPage {
-            // Width one, one packed group, codes [0, 1] with six padding slots.
-            buf: Bytes::from_static(&[1, 3, 2]),
-            num_values: 2,
-            encoding: Encoding::RLE_DICTIONARY,
-            def_level_encoding: Encoding::RLE,
-            rep_level_encoding: Encoding::RLE,
-            statistics: None,
-        };
-        let build = || {
+        let build = |codes: &'static [u8]| {
+            let page = Page::DataPage {
+                buf: Bytes::from_static(codes),
+                num_values: 2,
+                encoding: Encoding::RLE_DICTIONARY,
+                def_level_encoding: Encoding::RLE,
+                rep_level_encoding: Encoding::RLE,
+                statistics: None,
+            };
             make_byte_view_array_reader(
-                Box::new(InMemoryPageIterator::new([vec![
-                    dictionary.clone(),
-                    page.clone(),
-                ]])),
+                Box::new(InMemoryPageIterator::new([vec![dictionary.clone(), page]])),
                 desc.clone(),
                 None,
                 2,
@@ -1329,11 +1353,113 @@ mod tests {
             .unwrap()
         };
 
-        let valid = build().read_selected(&[1], 2).unwrap();
+        // Width one and one packed group, with six padding slots.
+        let unreferenced = build(&[1, 3, 0]).read_selected(&[3], 2).unwrap();
+        assert_eq!(
+            unreferenced
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap(),
+            &StringViewArray::from(vec!["a", "a"])
+        );
+
+        let codes = &[1, 3, 2]; // [0, 1]
+        let valid = build(codes).read_selected(&[1], 2).unwrap();
         let valid = valid.as_any().downcast_ref::<StringViewArray>().unwrap();
         assert_eq!(valid, &StringViewArray::from(vec!["a"]));
-        assert!(build().read_selected(&[2], 2).is_err());
-        assert!(build().next_batch(2).is_err());
+        let err = build(codes).read_selected(&[2], 2).unwrap_err();
+        assert!(matches!(&err, ParquetError::External(error)
+            if error.is::<arrow_schema::ArrowError>()));
+        assert_eq!(
+            err.to_string(),
+            "External: Invalid argument error: Encountered non-UTF-8 data at index 0: invalid utf-8 sequence of 1 bytes from index 0"
+        );
+        assert!(build(codes).next_batch(2).is_err());
+    }
+
+    #[test]
+    fn selected_dictionary_views_preserve_validation_at_plain_fallback() {
+        use crate::schema::{parser::parse_message_type, types::SchemaDescriptor};
+        use crate::util::test_common::page_util::InMemoryPageIterator;
+
+        let schema = parse_message_type("message x { REQUIRED BYTE_ARRAY s (UTF8); }").unwrap();
+        let desc = SchemaDescriptor::new(Arc::new(schema)).column(0);
+        let dictionary = Page::DictionaryPage {
+            buf: Bytes::from_static(b"\x02\0\0\0\xc3\xa9\x0f\0\0\0long value \xf0\x9f\xa5\xad"),
+            num_values: 2,
+            encoding: Encoding::PLAIN,
+            is_sorted: false,
+        };
+        let page = |encoding, buf, num_values| Page::DataPage {
+            buf: Bytes::from_static(buf),
+            num_values,
+            encoding,
+            def_level_encoding: Encoding::RLE,
+            rep_level_encoding: Encoding::RLE,
+            statistics: None,
+        };
+        let encoded = page(Encoding::RLE_DICTIONARY, &[1, 3, 2], 2);
+        let build = |plain| {
+            make_byte_view_array_reader(
+                Box::new(InMemoryPageIterator::new([vec![
+                    dictionary.clone(),
+                    encoded.clone(),
+                    plain,
+                ]])),
+                desc.clone(),
+                None,
+                3,
+                None,
+            )
+            .unwrap()
+        };
+
+        let mut reader = build(page(Encoding::PLAIN, b"\x05\0\0\0plain", 1));
+        let actual = reader.read_selected(&[7], 3).unwrap();
+        assert_eq!(
+            actual.as_any().downcast_ref::<StringViewArray>().unwrap(),
+            &StringViewArray::from(vec!["é", "long value 🥭", "plain"])
+        );
+
+        let mut reader = build(page(Encoding::PLAIN, b"\x01\0\0\0\xff", 1));
+        assert_eq!(reader.read_selected(&[3], 2).unwrap().len(), 2);
+        let err = reader.read_selected(&[1], 1).unwrap_err();
+        assert!(err.to_string().contains("non UTF-8 data"));
+    }
+
+    #[test]
+    #[expect(deprecated, reason = "Exercise legacy V1 BIT_PACKED definition levels")]
+    fn selected_dictionary_views_with_legacy_null_levels() {
+        use crate::util::test_common::page_util::InMemoryPageIterator;
+
+        let dictionary = Page::DictionaryPage {
+            buf: encode_byte_array(Encoding::PLAIN, &["é".into(), "long value 🥭".into()]),
+            num_values: 2,
+            encoding: Encoding::PLAIN,
+            is_sorted: false,
+        };
+        let data = Page::DataPage {
+            // Levels [1, 0, 1] in MSB order, followed by dictionary codes [0, 1].
+            buf: Bytes::from_static(&[0b1010_0000, 1, 3, 2]),
+            num_values: 3,
+            encoding: Encoding::RLE_DICTIONARY,
+            def_level_encoding: Encoding::BIT_PACKED,
+            rep_level_encoding: Encoding::RLE,
+            statistics: None,
+        };
+        let mut reader = make_byte_view_array_reader(
+            Box::new(InMemoryPageIterator::new([vec![dictionary, data]])),
+            utf8_column(),
+            None,
+            3,
+            None,
+        )
+        .unwrap();
+        let actual = reader.read_selected(&[7], 3).unwrap();
+        assert_eq!(
+            actual.as_any().downcast_ref::<StringViewArray>().unwrap(),
+            &StringViewArray::from(vec![Some("é"), None, Some("long value 🥭")])
+        );
     }
 
     #[test]

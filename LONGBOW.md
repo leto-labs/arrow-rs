@@ -38,6 +38,7 @@ in `third_party/README.md` and `docs/UPSTREAM_MATRIX.toml`.
 | DCX | Read flat primitive chunk dictionaries, borrowed hybrid runs and selected nullable keys | DICTIONARY-CODE-EXECUTION | UPSTREAMABLE |
 | DV | Apply static Arrow predicate verdicts to selected Parquet rows using DCX index runs | DICTIONARY-CODE-EXECUTION | UPSTREAMABLE |
 | LMS | Materialize selected flat dictionary byte-array views with DCX ranks and reuse selected fixed-width reads | LATE-MATERIALIZED-SCAN | UPSTREAMABLE |
+| DUV | Validate a selected byte-view dictionary once per chunk and reuse validated views | LATE-MATERIALIZED-SCAN | UPSTREAMABLE |
 | DPC | Hook decompressed page caching and atomic page leases into PageIndexProvider and shared fetch planning | SCAN-PAGE-CACHE | UPSTREAMABLE |
 | DRL | Decode dictionary runs and definition levels with register cursors, SIMD lookup and in-place NULL expansion | NATIVE-PARQUET-DECODE | UPSTREAMABLE |
 | NPI | Classify repeated-leaf null pages by value count to preserve valid column indexes | DATA-SKIPPING | UPSTREAMABLE |
@@ -67,8 +68,11 @@ PLAIN_DICTIONARY data pages with required or hybrid-coded flat nullable
 levels. It uses the DCX run cursor and the existing validity bitmap from
 definition levels, then gathers the selected dictionary views by their
 physical ranks. The returned views share the raw dictionary buffers.
-UTF-8 validation checks the selected entries. Byte-array pages with other
-encodings or legacy BIT_PACKED levels use full decode and compaction.
+DUV validates the installed dictionary once when the reader requires UTF-8.
+If validation fails, the reader keeps the existing checks on decoded values.
+Byte-array pages with other encodings or legacy BIT_PACKED levels use full
+decode and compaction. A PLAIN page validates its own values after dictionary
+fallback.
 The existing DCX fixed-width path covers INT32, INT64, FLOAT and DOUBLE
 dictionary and PLAIN pages, including date and Decimal64 conversions.
 
