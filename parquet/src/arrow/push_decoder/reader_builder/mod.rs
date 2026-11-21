@@ -1019,7 +1019,9 @@ mod tests {
     #[test]
     // Verify that the size of RowGroupDecoderState does not grow too large
     fn test_structure_size() {
-        assert_eq!(std::mem::size_of::<RowGroupDecoderState>(), 240);
+        // Longbow family DV adds `RowFilter::dictionary_filter`, which pads
+        // the filter by one word.
+        assert_eq!(std::mem::size_of::<RowGroupDecoderState>(), 248);
     }
 
     #[test]
