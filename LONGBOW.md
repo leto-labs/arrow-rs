@@ -37,6 +37,7 @@ in `third_party/README.md` and `docs/UPSTREAM_MATRIX.toml`.
 |---|---|---|---|
 | DCX | Read flat primitive chunk dictionaries, borrowed hybrid runs and selected nullable keys | DICTIONARY-CODE-EXECUTION | UPSTREAMABLE |
 | DV | Apply static Arrow predicate verdicts to selected Parquet rows using DCX index runs | DICTIONARY-CODE-EXECUTION | UPSTREAMABLE |
+| LMS | Materialize selected flat dictionary byte-array views with DCX ranks and reuse selected fixed-width reads | LATE-MATERIALIZED-SCAN | UPSTREAMABLE |
 | DPC | Hook decompressed page caching and atomic page leases into PageIndexProvider and shared fetch planning | SCAN-PAGE-CACHE | UPSTREAMABLE |
 | DRL | Decode dictionary runs and definition levels with register cursors, SIMD lookup and in-place NULL expansion | NATIVE-PARQUET-DECODE | UPSTREAMABLE |
 | NPI | Classify repeated-leaf null pages by value count to preserve valid column indexes | DATA-SKIPPING | UPSTREAMABLE |
@@ -59,6 +60,24 @@ index's row accounting and has no Longbow-specific dependencies.
 | Z1-B | Validate complete primitive ID batches and dispatch dictionary gathers through AVX2 | NATIVE-PARQUET-DECODE | UPSTREAMABLE |
 
 ## Decode and page-cache notes
+
+LMS extends the opt-in `ArrayReader::read_selected` path to flat byte-array
+columns read as Utf8View or BinaryView. It covers RLE_DICTIONARY and
+PLAIN_DICTIONARY data pages with required or hybrid-coded flat nullable
+levels. It uses the DCX run cursor and the existing validity bitmap from
+definition levels, then gathers the selected dictionary views by their
+physical ranks. The returned views share the raw dictionary buffers.
+UTF-8 validation checks the selected entries. Byte-array pages with other
+encodings or legacy BIT_PACKED levels use full decode and compaction.
+The existing DCX fixed-width path covers INT32, INT64, FLOAT and DOUBLE
+dictionary and PLAIN pages, including date and Decimal64 conversions.
+
+On the LMS byte-view path, an unselected data page with a known row span
+can be skipped across vector boundaries without loading its body. The
+serialized page reader fills a skipped compressed page when the file cache
+admits it. Ordinary byte-view reads keep their existing decoder, including
+when selected mode hands the active page back to it. The DV row-filter plan
+continues to use its own dispatch.
 
 DV evaluates a flat column's dictionary once for each participating predicate and
 chunk selection. It uses the normal Arrow column reader to interpret PLAIN entries

@@ -110,6 +110,12 @@ pub trait ArrayReader: Send {
     ///
     /// Bit zero of word zero selects the first row. Bits past `rows` are
     /// ignored. Consume any buffered batch before calling this method.
+    ///
+    /// The opt-in page kernels cover RLE_DICTIONARY and PLAIN_DICTIONARY for
+    /// flat INT32, INT64, FLOAT and DOUBLE columns and for flat byte-array
+    /// columns read as views. For those primitive types they also cover
+    /// PLAIN. Other encodings use full decode and compaction. A column
+    /// reader already on the ordinary path finishes its current chunk there.
     fn read_selected(&mut self, words: &[u64], rows: usize) -> Result<ArrayRef> {
         check_selection(words, rows)?;
         self.read_records(rows)?;
@@ -211,6 +217,26 @@ fn check_selection(words: &[u64], rows: usize) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Visits set bits in order, ignoring bits outside the requested interval.
+fn selected_rows(words: &[u64], start: usize, end: usize) -> impl Iterator<Item = usize> + '_ {
+    words[start / 64..end.div_ceil(64)]
+        .iter()
+        .enumerate()
+        .flat_map(move |(index, &word)| {
+            let base = (start / 64 + index) * 64;
+            let limit = (end - base).min(64);
+            let mut bits = word & (u64::MAX << start.saturating_sub(base));
+            bits &= crate::encodings::rle::codes::low_mask(limit);
+            std::iter::from_fn(move || {
+                (bits != 0).then(|| {
+                    let row = base + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    row
+                })
+            })
+        })
 }
 
 fn filter_selection(array: ArrayRef, words: &[u64], rows: usize) -> Result<ArrayRef> {

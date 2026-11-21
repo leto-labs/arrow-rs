@@ -42,6 +42,8 @@ pub use decoder::code_page::{
 };
 mod legacy_fixed_len_byte_array;
 mod spaced;
+#[cfg(feature = "arrow")]
+pub(crate) use spaced::{FlatPageReplay, FlatValidityRanks};
 
 /// Column reader for a Parquet type.
 pub enum ColumnReader {

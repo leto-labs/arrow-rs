@@ -27,6 +27,10 @@ use std::mem::MaybeUninit;
 use super::{RleDecoder, fused};
 use crate::errors::{ParquetError, Result};
 
+#[path = "selected.rs"]
+#[cfg(feature = "arrow")]
+mod selected;
+
 /// Values stored for a repeated run without a length check when the output
 /// has room. Most repeated runs of surrogate keys are shorter.
 const SHORT: usize = 16;

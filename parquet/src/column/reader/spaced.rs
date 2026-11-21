@@ -24,6 +24,102 @@ use std::mem::MaybeUninit;
 
 use crate::errors::{ParquetError, Result};
 
+#[cfg(feature = "arrow")]
+use crate::column::page::{Page, PageMetadata, PageReader};
+#[cfg(feature = "arrow")]
+use crate::column::reader::decoder::code_page::FlatDataPage;
+#[cfg(feature = "arrow")]
+use crate::file::page_cache::PageWithValidity;
+
+/// Maps logical rows to non-null value ranks in a flat data page.
+#[cfg(feature = "arrow")]
+#[derive(Default)]
+pub(crate) struct FlatValidityRanks {
+    words: Vec<u64>,
+    prefix: Vec<u32>,
+}
+
+#[cfg(feature = "arrow")]
+impl FlatValidityRanks {
+    pub(crate) fn load(&mut self, page: &FlatDataPage) -> Result<usize> {
+        let count = page.validity(&mut self.words)?;
+        self.prefix.clear();
+        let mut preceding = 0;
+        self.prefix.extend(self.words.iter().map(|word| {
+            let start = preceding;
+            preceding += word.count_ones();
+            start
+        }));
+        Ok(count)
+    }
+
+    pub(crate) fn rank(&self, row: u32) -> Option<u32> {
+        let (word, bit) = (row as usize / 64, row as usize % 64);
+        let valid = self.words[word];
+        ((valid >> bit) & 1 != 0).then(|| self.prefix[word] + (valid & low_mask(bit)).count_ones())
+    }
+}
+
+/// Restores the dictionary and active page when a selected read hands the
+/// remainder of a column chunk back to the ordinary reader.
+#[cfg(feature = "arrow")]
+pub(crate) struct FlatPageReplay {
+    pub(crate) dictionary: Option<Page>,
+    pub(crate) data: Option<Page>,
+    pub(crate) tail: Box<dyn PageReader>,
+}
+
+#[cfg(feature = "arrow")]
+impl Iterator for FlatPageReplay {
+    type Item = Result<Page>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.get_next_page().transpose()
+    }
+}
+
+#[cfg(feature = "arrow")]
+impl PageReader for FlatPageReplay {
+    fn get_next_page(&mut self) -> Result<Option<Page>> {
+        self.get_next_page_with_validity()
+            .map(|page| page.map(|(page, _)| page))
+    }
+
+    fn get_next_page_with_validity(&mut self) -> Result<Option<PageWithValidity>> {
+        match self.dictionary.take().or_else(|| self.data.take()) {
+            Some(page) => Ok(Some((page, None))),
+            None => self.tail.get_next_page_with_validity(),
+        }
+    }
+
+    fn peek_next_page(&mut self) -> Result<Option<PageMetadata>> {
+        match self.dictionary.as_ref().or(self.data.as_ref()) {
+            Some(page) => Ok(Some(PageMetadata {
+                num_rows: None,
+                num_levels: Some(page.num_values() as usize),
+                is_dict: page.is_dictionary_page(),
+            })),
+            None => self.tail.peek_next_page(),
+        }
+    }
+
+    fn skip_next_page(&mut self) -> Result<()> {
+        if self
+            .dictionary
+            .take()
+            .or_else(|| self.data.take())
+            .is_none()
+        {
+            self.tail.skip_next_page()?;
+        }
+        Ok(())
+    }
+
+    fn take_deferred_dictionary(&mut self) -> Result<Option<Page>> {
+        self.tail.take_deferred_dictionary()
+    }
+}
+
 fn low_mask(count: usize) -> u64 {
     if count == 64 {
         u64::MAX

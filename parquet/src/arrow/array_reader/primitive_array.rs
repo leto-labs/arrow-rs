@@ -29,10 +29,10 @@ use crate::data_type::{DataType, Int96};
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Date64Array, Decimal64Array, Decimal128Array, Decimal256Array,
-    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, PrimitiveArray,
-    UInt8Array, UInt16Array, builder::PrimitiveDictionaryBuilder, cast::AsArray, downcast_integer,
-    types::*,
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Decimal64Array, Decimal128Array,
+    Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    PrimitiveArray, UInt8Array, UInt16Array, builder::PrimitiveDictionaryBuilder, cast::AsArray,
+    downcast_integer, types::*,
 };
 use arrow_array::{
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
@@ -207,6 +207,30 @@ where
         self.full_started = true;
         Ok(())
     }
+
+    fn selected_array(&self, values: Vec<T::T>, nulls: Option<NullBuffer>) -> Result<ArrayRef> {
+        let len = values.len();
+        let values = values.into_buffer(&self.data_type);
+        match (T::get_physical_type(), &self.data_type) {
+            (PhysicalType::INT32, ArrowType::Int32) => Ok(Arc::new(Int32Array::new(
+                ScalarBuffer::new(values, 0, len),
+                nulls,
+            ))),
+            (PhysicalType::INT32, ArrowType::Date32) => Ok(Arc::new(Date32Array::new(
+                ScalarBuffer::new(values, 0, len),
+                nulls,
+            ))),
+            (PhysicalType::INT64, ArrowType::Int64) => Ok(Arc::new(Int64Array::new(
+                ScalarBuffer::new(values, 0, len),
+                nulls,
+            ))),
+            (PhysicalType::INT64, ArrowType::Decimal64(p, s)) => Ok(Arc::new(
+                Decimal64Array::new(ScalarBuffer::new(values, 0, len), nulls)
+                    .with_precision_and_scale(*p, *s)?,
+            )),
+            _ => coerce_array(Self::native_array(values, len, nulls), &self.data_type),
+        }
+    }
 }
 
 /// Implementation of primitive array reader.
@@ -272,9 +296,7 @@ where
             ))
         });
         let (values, nulls) = selected.read(self.pages.as_mut(), words, start, rows)?;
-        let len = values.len();
-        let values = values.into_buffer(&self.data_type);
-        let array = coerce_array(Self::native_array(values, len, nulls), &self.data_type)?;
+        let array = self.selected_array(values, nulls)?;
         self.def_levels_buffer = None;
         self.rep_levels_buffer = None;
         if let Some(prefix) = prefix {
