@@ -50,8 +50,9 @@ use arrow_cast::display::array_value_to_string;
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::{
-    ArrowPredicate, ArrowReaderOptions, DictionaryFilterMode, DictionaryFilterOptions,
-    DictionaryVerdict, ParquetRecordBatchReaderBuilder, RowFilter, RowSelection, RowSelector,
+    ArrowPredicate, ArrowReaderOptions, DictionaryFilterMetrics, DictionaryFilterMode,
+    DictionaryFilterOptions, DictionaryVerdict, ParquetRecordBatchReaderBuilder, RowFilter,
+    RowSelection, RowSelector,
 };
 use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::errors::ParquetError;
@@ -69,6 +70,9 @@ thread_local! {
     static LIMIT: Cell<usize> = const { Cell::new(usize::MAX) };
     /// The largest allocation that the allocator granted on this thread.
     static LARGEST: Cell<usize> = const { Cell::new(0) };
+    /// The rows that the last dictionary filter on this thread decided from
+    /// verdicts.
+    static VERDICT_ROWS: Cell<usize> = const { Cell::new(0) };
 }
 
 struct LimitedAllocator;
@@ -155,40 +159,51 @@ impl ArrowPredicate for PassDictionary {
             null: false,
         }))
     }
+
+    fn record_dictionary_filter(&mut self, metrics: DictionaryFilterMetrics) {
+        VERDICT_ROWS.with(|rows| rows.set(metrics.rows_verdict));
+    }
 }
 
-#[test]
-fn dictionary_filter_small_unit_does_not_allocate_a_group_bitmap() {
-    const UNIT_ROWS: usize = 256 * 1024;
-    const GROUP_ROWS: usize = 8 * UNIT_ROWS;
+/// Reads the selected unit, a contiguous run that ends `tail_rows` before
+/// the end of one row group, with a dictionary filter. Returns the rows
+/// read, the rows decided from verdicts and the largest allocation.
+fn read_unit_of_group(
+    unit_rows: usize,
+    group_rows: usize,
+    tail_rows: usize,
+) -> (usize, usize, usize) {
     let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![Arc::new(Int32Array::from_iter_values(
-            (0..UNIT_ROWS).map(|row| (row % 2) as i32),
+            (0..unit_rows).map(|row| (row % 2) as i32),
         ))],
     )
     .unwrap();
     let properties = WriterProperties::builder()
-        .set_max_row_group_row_count(Some(GROUP_ROWS))
+        .set_max_row_group_row_count(Some(group_rows))
         .set_data_page_row_count_limit(4096)
         .build();
     let mut writer = ArrowWriter::try_new(Vec::new(), schema, Some(properties)).unwrap();
-    for _ in 0..GROUP_ROWS / UNIT_ROWS {
+    for _ in 0..group_rows / unit_rows {
         writer.write(&batch).unwrap();
     }
     let file = Bytes::from(writer.into_inner().unwrap());
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    assert_eq!(builder.metadata().num_row_groups(), 1);
     let projection = ProjectionMask::leaves(builder.parquet_schema(), [0]);
     let builder = builder
         .with_batch_size(1024)
         .with_row_selection(RowSelection::from(vec![
-            RowSelector::skip(GROUP_ROWS - UNIT_ROWS),
-            RowSelector::select(UNIT_ROWS),
+            RowSelector::skip(group_rows - unit_rows - tail_rows),
+            RowSelector::select(unit_rows),
+            RowSelector::skip(tail_rows),
         ]))
         .with_row_filter(
             RowFilter::new(vec![Box::new(PassDictionary(projection))]).with_dictionary_filter(),
         );
+    VERDICT_ROWS.with(|rows| rows.set(0));
     let (rows, largest) = with_limit(|| {
         builder
             .build()
@@ -196,10 +211,35 @@ fn dictionary_filter_small_unit_does_not_allocate_a_group_bitmap() {
             .map(|batch| batch.unwrap().num_rows())
             .sum::<usize>()
     });
+    (rows, VERDICT_ROWS.with(|rows| rows.get()), largest)
+}
+
+#[test]
+fn dictionary_filter_small_unit_does_not_allocate_a_group_bitmap() {
+    const UNIT_ROWS: usize = 256 * 1024;
+    const GROUP_ROWS: usize = 8 * UNIT_ROWS;
+    let (rows, _, largest) = read_unit_of_group(UNIT_ROWS, GROUP_ROWS, 0);
     assert_eq!(rows, UNIT_ROWS);
     assert!(
         largest < GROUP_ROWS / 8,
         "largest allocation was {largest} bytes, enough for a full-group bitmap"
+    );
+}
+
+#[test]
+fn dictionary_filter_bitmaps_cover_only_the_selected_span() {
+    // A contiguous unit of a quarter of the group passes the density guard.
+    // Its verdict bitmaps cover 512 Ki rows (64 KiB each), not the 2 Mi-row
+    // group (256 KiB each).
+    const UNIT_ROWS: usize = 512 * 1024;
+    const GROUP_ROWS: usize = 4 * UNIT_ROWS;
+    const SPAN_BITMAP: usize = UNIT_ROWS / 8;
+    let (rows, verdict_rows, largest) = read_unit_of_group(UNIT_ROWS, GROUP_ROWS, 1000);
+    assert_eq!(rows, UNIT_ROWS);
+    assert_eq!(verdict_rows, UNIT_ROWS, "the unit must use verdicts");
+    assert!(
+        largest <= SPAN_BITMAP + 64,
+        "largest allocation was {largest} bytes; a span bitmap needs {SPAN_BITMAP}"
     );
 }
 

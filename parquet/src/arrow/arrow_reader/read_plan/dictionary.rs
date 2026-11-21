@@ -55,24 +55,23 @@ impl ReadPlanBuilder {
             total_rows,
         } = options;
         let rows = groups.num_rows();
-        // The verdict uses dense bitmaps over this reader's full row range.
-        // A native unit can cover a small part of a much larger row group.
-        // Refuse the verdict before allocating if its range exceeds four
+        // The verdict uses dense bitmaps over the span from the first to the
+        // last selected row. A native unit can cover a small part of a much
+        // larger row group, so the bitmaps never cover the whole group for
+        // it. Refuse the verdict before allocating if the span exceeds four
         // times the selected row count.
-        let bounded = self
-            .num_rows_selected()
-            .is_none_or(|selected| selected >= rows.div_ceil(4));
+        let span = SelectedSpan::of(&self, rows);
+        let bounded = span.selected != 0 && span.selected >= span.len.div_ceil(4);
         let use_codes = bounded && limit.is_none() && predicate.dictionary_filter_eligible();
         let leaf = use_codes
             .then(|| flat_leaf(fields, groups.metadata(), predicate))
             .flatten();
         let code = match (use_codes, leaf) {
             (true, Some((index, field))) => Some(evaluate_chunks(
-                &self, groups, predicate, policy, index, field,
+                &span, groups, predicate, policy, index, field,
             )?),
             _ => None,
         };
-        let selected = || selection_mask(&self, rows);
 
         let Some(code) = code else {
             let chunks = count_selected_chunks(&self, groups);
@@ -111,9 +110,9 @@ impl ReadPlanBuilder {
         } = code;
         let verify = policy.mode == DictionaryFilterMode::Verify && metrics.chunks_verdict != 0;
         let result = if verify {
-            metrics.rows_verified = self.num_rows_selected().unwrap_or(rows);
+            metrics.rows_verified = span.selected;
             let oracle = self.clone().with_predicate(array_reader, predicate)?;
-            if (&selection_mask(&oracle, rows) & &covered) != passed {
+            if (&span.window(oracle.selection(), rows) & &covered) != passed {
                 return Err(general_err!(
                     "Dictionary and value predicate selections differ"
                 ));
@@ -125,17 +124,18 @@ impl ReadPlanBuilder {
             let mask = if metrics.rows_value == 0 {
                 passed
             } else {
-                let remaining = &selected() & &!&covered;
+                let remaining = &span.mask & &!&covered;
                 let fallback = self
                     .clone()
-                    .with_selection(Some(RowSelection::from_boolean_buffer(remaining)))
+                    .with_selection(Some(span.restrict(&self, &remaining)))
                     .with_predicate(array_reader, predicate)?;
-                &selection_mask(&fallback, rows) | &passed
+                &span.window(fallback.selection(), rows) | &passed
             };
-            if mask.count_set_bits() == self.num_rows_selected().unwrap_or(rows) {
+            if mask.count_set_bits() == span.selected {
                 self
             } else {
-                self.with_selection(Some(RowSelection::from_boolean_buffer(mask)))
+                let selection = span.restrict(&self, &mask);
+                self.with_selection(Some(selection))
             }
         };
         predicate.record_dictionary_filter(metrics);
@@ -143,20 +143,124 @@ impl ReadPlanBuilder {
     }
 }
 
-fn selection_mask(plan: &ReadPlanBuilder, rows: usize) -> BooleanBuffer {
-    plan.selection().map_or_else(
-        || BooleanBuffer::new_set(rows),
-        |selection| {
-            let mask = selection.clone().into_boolean_buffer();
-            if mask.len() >= rows {
-                return mask.slice(0, rows);
+/// The rows that a plan selects between its first and last selected row.
+struct SelectedSpan {
+    /// The first selected row in the reader's row range.
+    start: usize,
+    /// The number of rows from the first to the last selected row.
+    len: usize,
+    /// The number of selected rows.
+    selected: usize,
+    /// The selected rows of `start..start + len`.
+    mask: BooleanBuffer,
+}
+
+impl SelectedSpan {
+    fn of(plan: &ReadPlanBuilder, rows: usize) -> Self {
+        let Some(selection) = plan.selection() else {
+            return Self {
+                start: 0,
+                len: rows,
+                selected: rows,
+                mask: BooleanBuffer::new_set(rows),
+            };
+        };
+        let mut bounds = None::<(usize, usize)>;
+        for_each_selected_run(selection, rows, |run| {
+            let first = bounds.map_or(run.start, |(first, _)| first);
+            bounds = Some((first, run.end));
+        });
+        let (start, end) = bounds.unwrap_or((0, 0));
+        let len = end - start;
+        let mask = window_mask(Some(selection), start, len, rows);
+        Self {
+            start,
+            len,
+            selected: mask.count_set_bits(),
+            mask,
+        }
+    }
+
+    /// Returns the rows that `selection` selects in this span.
+    fn window(&self, selection: Option<&RowSelection>, rows: usize) -> BooleanBuffer {
+        window_mask(selection, self.start, self.len, rows)
+    }
+
+    /// Returns the selection of `plan` limited to the rows set in `rows`, a
+    /// mask over this span that sets only selected rows.
+    fn restrict(&self, plan: &ReadPlanBuilder, rows: &BooleanBuffer) -> RowSelection {
+        // Gather the bits of the selected rows only, as a predicate result
+        // does, so the plan's own selection keeps its representation.
+        let mut kept = BooleanBufferBuilder::new(self.selected);
+        for (start, end) in self.mask.set_slices() {
+            kept.append_buffer(&rows.slice(start, end - start));
+        }
+        match plan.selection() {
+            Some(selection) => {
+                // A selection can extend past the reader's rows; it reads
+                // none of them.
+                kept.append_n(selection.row_count() - self.selected, false);
+                selection.and_then(&RowSelection::from_boolean_buffer(kept.finish()))
             }
-            let mut padded = BooleanBufferBuilder::new(rows);
-            padded.append_buffer(&mask);
-            padded.append_n(rows - mask.len(), false);
-            padded.finish()
-        },
-    )
+            None => RowSelection::from_boolean_buffer(kept.finish()),
+        }
+    }
+}
+
+/// Calls `f` with each selected run of rows in `0..rows`, in order.
+fn for_each_selected_run(
+    selection: &RowSelection,
+    rows: usize,
+    mut f: impl FnMut(std::ops::Range<usize>),
+) {
+    if let Some(mask) = selection.as_mask() {
+        let mask = mask.slice(0, mask.len().min(rows));
+        for (start, end) in mask.set_slices() {
+            f(start..end);
+        }
+        return;
+    }
+    let mut offset = 0;
+    for selector in selection.iter() {
+        let end = (offset + selector.row_count).min(rows);
+        if !selector.skip && end > offset {
+            f(offset..end);
+        }
+        offset = end;
+        if offset == rows {
+            break;
+        }
+    }
+}
+
+/// Returns the rows that `selection` selects in `start..start + len`. Rows
+/// past the end of the selection are not selected. This allocates only the
+/// window, not the reader's whole row range.
+fn window_mask(
+    selection: Option<&RowSelection>,
+    start: usize,
+    len: usize,
+    rows: usize,
+) -> BooleanBuffer {
+    let Some(selection) = selection else {
+        return BooleanBuffer::new_set(len);
+    };
+    let end = start + len;
+    if let Some(mask) = selection.as_mask()
+        && mask.len() >= end
+    {
+        return mask.slice(start, len);
+    }
+    let mut window = BooleanBufferBuilder::new(len);
+    for_each_selected_run(selection, rows.min(end), |run| {
+        if run.end > start {
+            let run_start = run.start.max(start);
+            window.append_n(run_start - start - window.len(), false);
+            window.append_n(run.end - run_start, true);
+        }
+    });
+    window.append_n(len - window.len(), false);
+    window.finish()
 }
 
 fn count_selected_chunks(plan: &ReadPlanBuilder, groups: &dyn RowGroups) -> usize {
@@ -205,33 +309,48 @@ struct CodeSelection {
 }
 
 fn evaluate_chunks(
-    plan: &ReadPlanBuilder,
+    span: &SelectedSpan,
     groups: &dyn RowGroups,
     predicate: &mut dyn ArrowPredicate,
     policy: DictionaryFilterOptions,
     leaf: usize,
     field: &ParquetField,
 ) -> Result<CodeSelection> {
-    let selected = selection_mask(plan, groups.num_rows());
     let mut chunks = groups.column_chunks(leaf)?;
-    let mut covered = BooleanBufferBuilder::new(selected.len());
-    let mut passed = BooleanBufferBuilder::new(selected.len());
+    // Both bitmaps cover only the span of selected rows.
+    let mut covered = BooleanBufferBuilder::new(span.len);
+    let mut passed = BooleanBufferBuilder::new(span.len);
     let mut metrics = DictionaryFilterMetrics::default();
     let mut scratch = VerdictScratch {
         validity: Vec::new(),
         verdict: Vec::new(),
     };
+    let span_end = span.start + span.len;
     let mut offset = 0;
     for row_group in groups.row_groups() {
         let length = row_group.num_rows() as usize;
-        let selection = selected.slice(offset, length);
+        let group_start = offset;
         offset += length;
         let pages = chunks
             .next()
             .ok_or_else(|| general_err!("Missing predicate column chunk"))?;
-        let selected_rows = selection.count_set_bits();
+        // The part of this row group inside the span, in group rows.
+        let window_start = span.start.max(group_start);
+        let window_end = span_end.min(offset);
+        if window_start >= window_end {
+            continue;
+        }
+        let window = ChunkWindow {
+            rows: length,
+            start: window_start - group_start,
+            selection: span
+                .mask
+                .slice(window_start - span.start, window_end - window_start),
+        };
+        let selected_rows = window.selection.count_set_bits();
         let mut chunk_result = ChunkResult::default();
         if selected_rows != 0 {
+            let chunk_start = covered.len();
             chunk_result = evaluate_chunk(
                 &mut *pages?,
                 groups,
@@ -240,18 +359,29 @@ fn evaluate_chunks(
                 leaf,
                 field,
                 row_group,
-                &selection,
+                &window,
                 &mut covered,
                 &mut passed,
                 &mut scratch,
                 &mut metrics,
             )?;
+            if chunk_result.inconsistent {
+                // The ordinary reader decides how to read inconsistent page
+                // spans. Evaluate the whole chunk by value.
+                covered.truncate(chunk_start);
+                passed.truncate(chunk_start);
+                chunk_result = ChunkResult {
+                    error: true,
+                    ..Default::default()
+                };
+            }
         }
         // A rejected chunk does not append any bitmap. Mixed chunks append
         // both covered and uncovered page spans in file order.
-        debug_assert!(covered.len() <= offset && passed.len() <= offset);
-        covered.append_n(offset - covered.len(), false);
-        passed.append_n(offset - passed.len(), false);
+        let appended = window_end - span.start;
+        debug_assert!(covered.len() <= appended && passed.len() <= appended);
+        covered.append_n(appended - covered.len(), false);
+        passed.append_n(appended - passed.len(), false);
         let value_rows = selected_rows - chunk_result.rows;
         metrics.chunks_verdict += usize::from(chunk_result.rows > 0);
         metrics.rows_verdict += chunk_result.rows;
@@ -271,6 +401,22 @@ fn evaluate_chunks(
     })
 }
 
+/// The rows of one row group that lie inside the selected span.
+struct ChunkWindow {
+    /// The number of rows in the row group.
+    rows: usize,
+    /// The first window row, relative to the row group.
+    start: usize,
+    /// The selected rows of the window.
+    selection: BooleanBuffer,
+}
+
+impl ChunkWindow {
+    fn end(&self) -> usize {
+        self.start + self.selection.len()
+    }
+}
+
 #[derive(Default)]
 struct ChunkResult {
     rows: usize,
@@ -278,6 +424,8 @@ struct ChunkResult {
     limit: bool,
     error: bool,
     unsupported: bool,
+    /// Page spans disagree with the row group or the page contents.
+    inconsistent: bool,
 }
 
 struct VerdictScratch {
@@ -294,7 +442,7 @@ fn evaluate_chunk(
     leaf: usize,
     field: &ParquetField,
     group: &RowGroupMetaData,
-    selected: &BooleanBuffer,
+    window: &ChunkWindow,
     covered: &mut BooleanBufferBuilder,
     passed: &mut BooleanBufferBuilder,
     scratch: &mut VerdictScratch,
@@ -311,7 +459,7 @@ fn evaluate_chunk(
         return Ok(result);
     };
     let entries = dictionary_page.num_values() as usize;
-    if entries as u128 * 100 > selected.len() as u128 * u128::from(policy.max_percent) {
+    if entries as u128 * 100 > window.rows as u128 * u128::from(policy.max_percent) {
         result.limit = true;
         return Ok(result);
     }
@@ -344,9 +492,9 @@ fn evaluate_chunk(
         && verdict.entries.count_set_bits() == 0
         && all_dictionary_pages(column)
     {
-        covered.append_buffer(selected);
-        passed.append_n(selected.len(), false);
-        result.rows = selected.count_set_bits();
+        covered.append_buffer(&window.selection);
+        passed.append_n(window.selection.len(), false);
+        result.rows = window.selection.count_set_bits();
         metrics.row_groups_pruned_dictionary += 1;
         metrics
             .pruned_row_group_offsets
@@ -361,34 +509,47 @@ fn evaluate_chunk(
         if header.is_dict {
             return Err(general_err!("Unexpected dictionary after first page"));
         }
+        // A flat leaf has one value per row. Like the ordinary column
+        // reader, span a page by its value count, which a page header
+        // gives as its level count. Only an offset index omits it.
         let rows = header
-            .num_rows
-            .or(header.num_levels)
+            .num_levels
+            .or(header.num_rows)
             .ok_or_else(|| general_err!("Missing flat predicate page row count"))?;
-        if rows > selected.len() - offset {
-            return Err(general_err!("Predicate page exceeds row group"));
+        if rows > window.rows - offset {
+            result.inconsistent = true;
+            return Ok(result);
         }
-        let selection = selected.slice(offset, rows);
+        let page_start = offset;
         offset += rows;
+        // The part of this page inside the window.
+        let first = page_start.max(window.start);
+        let last = offset.min(window.end());
+        if first >= last {
+            pages.skip_next_page()?;
+            continue;
+        }
+        let part = last - first;
+        let selection = window.selection.slice(first - window.start, part);
         let selected_rows = selection.count_set_bits();
         if selected_rows == 0 {
             pages.skip_next_page()?;
-            covered.append_n(rows, false);
-            passed.append_n(rows, false);
+            covered.append_n(part, false);
+            passed.append_n(part, false);
             continue;
         }
         let page = pages
             .get_next_page()?
             .ok_or_else(|| general_err!("Missing predicate data page"))?;
         if page.num_values() as usize != rows {
-            return Err(general_err!(
-                "Flat predicate page row count differs from page metadata"
-            ));
+            // An offset index disagrees with the page header.
+            result.inconsistent = true;
+            return Ok(result);
         }
         if !dictionary_encoding(page.encoding()) {
             result.plain = true;
-            covered.append_n(rows, false);
-            passed.append_n(rows, false);
+            covered.append_n(part, false);
+            passed.append_n(part, false);
             continue;
         }
         let decoded = FlatDataPage::new(&page, field.def_level != 0).and_then(|flat| {
@@ -405,8 +566,8 @@ fn evaluate_chunk(
             // final packed header advertises a larger run, for example.
             result.error |= decoded.is_err();
             result.unsupported |= decoded.is_ok();
-            covered.append_n(rows, false);
-            passed.append_n(rows, false);
+            covered.append_n(part, false);
+            passed.append_n(part, false);
             continue;
         }
         if verdict.null && field.def_level != 0 {
@@ -414,13 +575,14 @@ fn evaluate_chunk(
                 *word |= !valid;
             }
         }
-        let page_mask = words_to_mask(&scratch.verdict, rows);
+        let page_mask = words_to_mask(&scratch.verdict, rows).slice(first - page_start, part);
         covered.append_buffer(&selection);
         passed.append_buffer(&(&page_mask & &selection));
         result.rows += selected_rows;
     }
-    if offset != selected.len() {
-        return Err(general_err!("Predicate pages did not cover the row group"));
+    if offset != window.rows {
+        result.inconsistent = true;
+        return Ok(result);
     }
     metrics.runs_evaluated += table.runs_evaluated();
     Ok(result)

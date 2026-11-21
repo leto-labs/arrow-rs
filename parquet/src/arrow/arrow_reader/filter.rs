@@ -997,57 +997,236 @@ mod dictionary_tests {
         }
     }
 
+    /// Reads `file` with a `word = 'yes'` filter in each mode and returns
+    /// the matching words and the verdict report of each mode.
+    fn read_words_in_each_mode(
+        file: &Bytes,
+        options: ArrowReaderOptions,
+    ) -> Vec<(DictionaryFilterMode, Vec<String>, DictionaryFilterMetrics)> {
+        [
+            DictionaryFilterMode::Off,
+            DictionaryFilterMode::On,
+            DictionaryFilterMode::Verify,
+        ]
+        .into_iter()
+        .map(|mode| {
+            let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
+                file.clone(),
+                options.clone(),
+            )
+            .unwrap();
+            let metrics = Arc::new(Mutex::new(DictionaryFilterMetrics::default()));
+            let predicate = StaticFilter {
+                projection: ProjectionMask::leaves(builder.parquet_schema(), [0]),
+                mode,
+                accept_null: false,
+                accept_yes: true,
+                fail_dictionary: false,
+                metrics: Arc::clone(&metrics),
+            };
+            let words = builder
+                .with_row_filter(RowFilter::new(vec![Box::new(predicate)]).with_dictionary_filter())
+                .build()
+                .unwrap()
+                .flat_map(|batch| {
+                    let batch = batch.unwrap();
+                    let words = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    words
+                        .iter()
+                        .map(|w| w.unwrap().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let report = std::mem::take(&mut *metrics.lock().unwrap());
+            (mode, words, report)
+        })
+        .collect()
+    }
+
     #[test]
-    fn dictionary_filter_small_unit_uses_values_without_group_verdict_state() {
-        const UNIT: usize = 256 * 1024;
-        const GROUP: usize = 8 * UNIT;
+    fn dictionary_filter_spans_v2_page_by_value_count_like_ordinary_reader() {
+        // The ordinary column reader spans a DataPage v2 by `num_values` and
+        // ignores `num_rows`. The verdict page walker must use the same span.
+        let schema = Arc::new(Schema::new(vec![Field::new("word", DataType::Utf8, false)]));
+        let values = (0..32)
+            .map(|row| Some(["no", "yes"][row % 2]))
+            .collect::<StringArray>();
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(values)]).unwrap();
+        // Two pages of 16 values each.
+        let props = WriterProperties::builder()
+            .set_writer_version(WriterVersion::PARQUET_2_0)
+            .set_data_page_row_count_limit(16)
+            .set_write_batch_size(16)
+            .build();
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        let mut file = writer.into_inner().unwrap();
+        let metadata =
+            ArrowReaderMetadata::load(&Bytes::copy_from_slice(&file), ArrowReaderOptions::new())
+                .unwrap();
+        let column = metadata.metadata().row_group(0).column(0);
+        let (start, length) = column.byte_range();
+        let data_page = usize::try_from(column.data_page_offset()).unwrap();
+        let end = usize::try_from(start + length).unwrap();
+        // The first DataPageHeaderV2 in the compact protocol: num_values =
+        // 16, num_nulls = 0 and num_rows = 16, each a zigzag i32 field.
+        let header = [0x15, 0x20, 0x15, 0x00, 0x15, 0x20];
+        let at = file[data_page..end]
+            .windows(header.len())
+            .position(|window| window == header)
+            .expect("DataPageHeaderV2 counts")
+            + data_page;
+        // Declare 15 rows on the first page. It still holds 16 values.
+        file[at + 5] = 0x1e;
+        let file = Bytes::from(file);
+        // Without an offset index, page spans come from the page headers.
+        for policy in [PageIndexPolicy::Skip, PageIndexPolicy::Required] {
+            let options = ArrowReaderOptions::new().with_page_index_policy(policy);
+            let results = read_words_in_each_mode(&file, options);
+            let (_, ordinary, _) = &results[0];
+            assert_eq!(ordinary, &vec!["yes".to_string(); 16], "{policy:?}");
+            for (mode, words, report) in &results[1..] {
+                assert_eq!(words, ordinary, "{policy:?} {mode:?}");
+                // The flat page decoder refuses the inconsistent first page,
+                // so its rows use values. The second page keeps its span and
+                // uses the verdict.
+                assert_eq!(report.fallback_error, 1, "{policy:?} {mode:?} {report:?}");
+                assert_eq!(report.rows_value, 16, "{policy:?} {mode:?} {report:?}");
+                assert_eq!(report.rows_verdict, 16, "{policy:?} {mode:?} {report:?}");
+                assert_eq!(
+                    report.rows_verdict_matched, 8,
+                    "{policy:?} {mode:?} {report:?}"
+                );
+            }
+        }
+
+        // An offset index that starts the second page at row 15 spans the
+        // first page by 15 rows, which disagrees with its 16 values. The
+        // ordinary reader reads by value count. The verdict path evaluates
+        // the whole chunk by value instead of failing.
+        let mut indexed = file.to_vec();
+        let metadata = ArrowReaderMetadata::load(
+            &file,
+            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required),
+        )
+        .unwrap();
+        let column = metadata.metadata().row_group(0).column(0);
+        let index_start = usize::try_from(column.offset_index_offset().unwrap()).unwrap();
+        let index_end =
+            index_start + usize::try_from(column.offset_index_length().unwrap()).unwrap();
+        // PageLocation.first_row_index = 16: a zigzag i64 field.
+        let at = indexed[index_start..index_end]
+            .windows(2)
+            .position(|window| window == [0x16, 0x20])
+            .expect("second page location")
+            + index_start;
+        indexed[at + 1] = 0x1e;
+        let indexed = Bytes::from(indexed);
+        let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
+        let results = read_words_in_each_mode(&indexed, options);
+        let (_, ordinary, _) = &results[0];
+        assert_eq!(ordinary, &vec!["yes".to_string(); 16]);
+        for (mode, words, report) in &results[1..] {
+            assert_eq!(words, ordinary, "{mode:?}");
+            assert_eq!(report.fallback_error, 1, "{mode:?} {report:?}");
+            assert_eq!(report.rows_value, 32, "{mode:?} {report:?}");
+            assert_eq!(report.rows_verdict, 0, "{mode:?} {report:?}");
+        }
+    }
+
+    fn alternating_words_file(unit: usize, group: usize) -> Bytes {
         let schema = Arc::new(Schema::new(vec![Field::new("word", DataType::Utf8, false)]));
         let props = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(GROUP))
-            .set_data_page_row_count_limit(UNIT / 4)
+            .set_max_row_group_row_count(Some(group))
+            .set_data_page_row_count_limit(unit / 4)
             .build();
         let mut writer =
             ArrowWriter::try_new(Vec::new(), Arc::clone(&schema), Some(props)).unwrap();
         let batch = RecordBatch::try_new(
             schema,
             vec![Arc::new(
-                (0..UNIT)
+                (0..unit)
                     .map(|row| Some(["no", "yes"][row % 2]))
                     .collect::<StringArray>(),
             )],
         )
         .unwrap();
-        for _ in 0..8 {
+        for _ in 0..group / unit {
             writer.write(&batch).unwrap();
         }
-        let file = Bytes::from(writer.into_inner().unwrap());
+        Bytes::from(writer.into_inner().unwrap())
+    }
+
+    fn read_unit(file: Bytes, selection: Vec<RowSelector>) -> (usize, DictionaryFilterMetrics) {
         let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
-        assert_eq!(builder.metadata().row_group(0).num_rows(), GROUP as i64);
         let metrics = Arc::new(Mutex::new(DictionaryFilterMetrics::default()));
         let predicate = StaticFilter {
             projection: ProjectionMask::leaves(builder.parquet_schema(), [0]),
-            mode: DictionaryFilterMode::On,
+            mode: DictionaryFilterMode::Verify,
             accept_null: false,
             accept_yes: true,
             fail_dictionary: false,
             metrics: Arc::clone(&metrics),
         };
         let rows = builder
-            .with_row_selection(RowSelection::from(vec![
-                RowSelector::skip(GROUP - UNIT),
-                RowSelector::select(UNIT),
-            ]))
+            .with_row_selection(RowSelection::from(selection))
             .with_row_filter(RowFilter::new(vec![Box::new(predicate)]).with_dictionary_filter())
             .build()
             .unwrap()
             .map(|batch| batch.unwrap().num_rows())
             .sum::<usize>();
+        let report = std::mem::take(&mut *metrics.lock().unwrap());
+        (rows, report)
+    }
+
+    #[test]
+    fn dictionary_filter_sparse_unit_uses_values_without_group_verdict_state() {
+        const UNIT: usize = 256 * 1024;
+        const GROUP: usize = 8 * UNIT;
+        let file = alternating_words_file(UNIT, GROUP);
+        // Two runs at both ends of the group: the selected span is the whole
+        // group, and the selection is one eighth of it.
+        let (rows, report) = read_unit(
+            file,
+            vec![
+                RowSelector::select(UNIT / 2),
+                RowSelector::skip(GROUP - UNIT),
+                RowSelector::select(UNIT / 2),
+            ],
+        );
         assert_eq!(rows, UNIT / 2);
-        let report = metrics.lock().unwrap();
         assert_eq!(report.chunks_verdict, 0);
         assert_eq!(report.entries_tested, 0);
         assert_eq!(report.runs_evaluated, 0);
         assert_eq!(report.rows_value, UNIT);
+    }
+
+    #[test]
+    fn dictionary_filter_contiguous_unit_uses_verdicts_over_its_span() {
+        const UNIT: usize = 256 * 1024;
+        const GROUP: usize = 8 * UNIT;
+        let file = alternating_words_file(UNIT, GROUP);
+        // The verdict bitmaps cover the selected span, not the group, so a
+        // contiguous unit in a much larger group can use them. The unit
+        // starts and ends inside data pages.
+        let (rows, report) = read_unit(
+            file,
+            vec![
+                RowSelector::skip(GROUP - UNIT - UNIT / 8),
+                RowSelector::select(UNIT),
+                RowSelector::skip(UNIT / 8),
+            ],
+        );
+        assert_eq!(rows, UNIT / 2);
+        assert_eq!(report.chunks_verdict, 1);
+        assert_eq!(report.rows_verdict, UNIT);
+        assert_eq!(report.rows_verdict_matched, UNIT / 2);
+        assert_eq!(report.rows_value, 0);
+        assert_eq!(report.rows_verified, UNIT);
     }
 
     #[test]
