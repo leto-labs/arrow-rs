@@ -1320,6 +1320,115 @@ mod tests {
     }
 
     #[test]
+    fn staged_second_filter_column_is_gathered_and_compacted_again() {
+        use crate::arrow::ArrowWriter;
+        use crate::arrow::arrow_reader::ArrowReaderMetadata;
+        use crate::arrow::push_decoder::ParquetPushDecoderBuilder;
+        use crate::file::properties::WriterProperties;
+        use arrow_array::{Int32Array, Int64Array};
+        use arrow_schema::Field;
+        use arrow_select::filter::filter_record_batch;
+        use bytes::Bytes;
+
+        let rows = 128;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("first", DataType::Boolean, false),
+            Field::new("second", DataType::Int32, false),
+            Field::new("third", DataType::Int32, false),
+            Field::new("payload", DataType::Int64, false),
+        ]));
+        let input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(BooleanArray::from_iter(
+                    (0..rows).map(|row| Some(matches!(row, 2 | 63 | 70 | 127))),
+                )),
+                Arc::new(Int32Array::from_iter_values(0..rows)),
+                Arc::new(Int32Array::from_iter_values((0..rows).map(|row| row * 2))),
+                Arc::new(Int64Array::from_iter_values(1000..1000 + i64::from(rows))),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .build();
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema, Some(props)).unwrap();
+        writer.write(&input).unwrap();
+        let bytes = Bytes::from(writer.into_inner().unwrap());
+        let staged = Arc::new(StagedScan::new(
+            vec![
+                StagedPredicate::new(vec![0], |batch| {
+                    Ok(batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .unwrap()
+                        .clone())
+                }),
+                StagedPredicate::new(vec![1], |batch| {
+                    let values = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap();
+                    assert_eq!(values.values().as_ref(), &[2, 63, 70, 127]);
+                    Ok(values
+                        .iter()
+                        .map(|value| value.map(|row| row >= 63))
+                        .collect())
+                }),
+                StagedPredicate::new(vec![1, 2], |batch| {
+                    let reused = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap();
+                    let other = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap();
+                    assert_eq!(reused.values().as_ref(), &[63, 70, 127]);
+                    Ok(reused
+                        .iter()
+                        .zip(other.iter())
+                        .map(|(left, right)| {
+                            left.zip(right)
+                                .map(|(left, right)| left % 2 == 1 && right == left * 2)
+                        })
+                        .collect())
+                }),
+            ],
+            |_| {},
+        ));
+        let metadata = ArrowReaderMetadata::load(&bytes, Default::default()).unwrap();
+        let mut decoder = ParquetPushDecoderBuilder::new_with_metadata(metadata)
+            .with_batch_size(rows as usize)
+            .with_staged_scan(Some(staged))
+            .build()
+            .unwrap();
+        decoder.push_range(0..bytes.len() as u64, bytes).unwrap();
+        let crate::DecodeResult::Data(mut reader) = decoder.try_next_reader().unwrap() else {
+            panic!("expected a row-group reader");
+        };
+        let (actual, selection) = reader.next_with_selection().unwrap().unwrap();
+        let mask = (0..rows).map(|row| Some(matches!(row, 63 | 127))).collect();
+        assert_eq!(actual, filter_record_batch(&input, &mask).unwrap());
+        assert_eq!(selection.unwrap().count_set_bits(), actual.num_rows());
+        let staged = reader
+            .array_reader
+            .as_any()
+            .downcast_ref::<StagedArrayReader>()
+            .unwrap();
+        assert!(staged.columns[0].ordinary);
+        assert!(
+            !staged.columns[1].ordinary,
+            "the second predicate used a full read"
+        );
+        assert!(reader.next().is_none());
+    }
+
+    #[test]
     fn staged_order_requires_a_stable_difference_and_cannot_swap_back() {
         let mut order = StagedOrder::new(&[1.0, 2.0]);
         for _ in 0..2 {

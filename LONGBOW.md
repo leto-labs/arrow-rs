@@ -493,3 +493,7 @@ can still load a primitive page at a vector boundary, and a cache-admitted
 skip can still fill or transcode the page. A column that has entered ordinary
 mode stays there through its current chunk. The stage reports that full-read
 work separately from selected gathers.
+
+The staged reader regression exercises three conjuncts. The second gathers
+only rows selected by the first. The third reuses and compacts the gathered
+column against the narrower selection before a dense output comparison.
