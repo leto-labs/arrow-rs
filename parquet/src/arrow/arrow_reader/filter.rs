@@ -997,120 +997,248 @@ mod dictionary_tests {
         }
     }
 
-    /// Reads `file` with a `word = 'yes'` filter in each mode and returns
-    /// the matching words and the verdict report of each mode.
-    fn read_words_in_each_mode(
-        file: &Bytes,
-        options: ArrowReaderOptions,
-    ) -> Vec<(DictionaryFilterMode, Vec<String>, DictionaryFilterMetrics)> {
-        [
-            DictionaryFilterMode::Off,
-            DictionaryFilterMode::On,
-            DictionaryFilterMode::Verify,
-        ]
-        .into_iter()
-        .map(|mode| {
-            let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
-                file.clone(),
-                options.clone(),
+    const MODES: [DictionaryFilterMode; 3] = [
+        DictionaryFilterMode::Off,
+        DictionaryFilterMode::On,
+        DictionaryFilterMode::Verify,
+    ];
+
+    /// Writes rows with consecutive ids as `word` ("no" for even ids, "yes"
+    /// for odd ids) and `id`, one row group of each size in `groups`, with
+    /// pages of `page_rows` rows.
+    fn words_and_ids_file(groups: &[i32], page_rows: usize, v2: bool) -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("word", DataType::Utf8, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let props = WriterProperties::builder()
+            .set_writer_version(if v2 {
+                WriterVersion::PARQUET_2_0
+            } else {
+                WriterVersion::PARQUET_1_0
+            })
+            .set_data_page_row_count_limit(page_rows)
+            .set_write_batch_size(page_rows)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(Vec::new(), Arc::clone(&schema), Some(props)).unwrap();
+        let mut first = 0;
+        for &rows in groups {
+            let ids = first..first + rows;
+            first += rows;
+            let words = ids
+                .clone()
+                .map(|id| Some(["no", "yes"][(id % 2) as usize]))
+                .collect::<StringArray>();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(words), Arc::new(Int32Array::from_iter_values(ids))],
             )
             .unwrap();
-            let metrics = Arc::new(Mutex::new(DictionaryFilterMetrics::default()));
-            let predicate = StaticFilter {
-                projection: ProjectionMask::leaves(builder.parquet_schema(), [0]),
-                mode,
-                accept_null: false,
-                accept_yes: true,
-                fail_dictionary: false,
-                metrics: Arc::clone(&metrics),
-            };
-            let words = builder
-                .with_row_filter(RowFilter::new(vec![Box::new(predicate)]).with_dictionary_filter())
-                .build()
-                .unwrap()
-                .flat_map(|batch| {
-                    let batch = batch.unwrap();
-                    let words = batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .unwrap();
-                    words
-                        .iter()
-                        .map(|w| w.unwrap().to_string())
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            let report = std::mem::take(&mut *metrics.lock().unwrap());
-            (mode, words, report)
-        })
-        .collect()
+            writer.write(&batch).unwrap();
+            writer.flush().unwrap();
+        }
+        writer.into_inner().unwrap()
+    }
+
+    /// Replaces the only occurrence of `from` in `file[range]` with `to`.
+    fn patch_once(file: &mut [u8], range: std::ops::Range<usize>, from: &[u8], to: &[u8]) {
+        let found = file[range.clone()]
+            .windows(from.len())
+            .enumerate()
+            .filter(|(_, window)| *window == from)
+            .map(|(at, _)| at + range.start)
+            .collect::<Vec<_>>();
+        assert_eq!(found.len(), 1, "{from:?} in {range:?}");
+        file[found[0]..found[0] + to.len()].copy_from_slice(to);
+    }
+
+    type ModeResult = (
+        DictionaryFilterMode,
+        Result<Vec<i32>, String>,
+        DictionaryFilterMetrics,
+    );
+
+    /// Reads `file` with a `word = 'yes'` filter (or a filter that rejects
+    /// every word) in each mode. Returns the ids read, or the error, and the
+    /// verdict report of each mode.
+    fn read_ids_in_each_mode(
+        file: &Bytes,
+        options: ArrowReaderOptions,
+        selection: Option<Vec<RowSelector>>,
+        accept_yes: bool,
+    ) -> Vec<ModeResult> {
+        MODES
+            .into_iter()
+            .map(|mode| {
+                let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
+                    file.clone(),
+                    options.clone(),
+                )
+                .unwrap();
+                let metrics = Arc::new(Mutex::new(DictionaryFilterMetrics::default()));
+                let predicate = StaticFilter {
+                    projection: ProjectionMask::leaves(builder.parquet_schema(), [0]),
+                    mode,
+                    accept_null: false,
+                    accept_yes,
+                    fail_dictionary: false,
+                    metrics: Arc::clone(&metrics),
+                };
+                let mut builder = builder.with_row_filter(
+                    RowFilter::new(vec![Box::new(predicate)]).with_dictionary_filter(),
+                );
+                if let Some(selection) = &selection {
+                    builder = builder.with_row_selection(RowSelection::from(selection.clone()));
+                }
+                let ids = builder
+                    .build()
+                    .map_err(|e| e.to_string())
+                    .and_then(|reader| {
+                        let mut ids = Vec::new();
+                        for batch in reader {
+                            let batch = batch.map_err(|e| e.to_string())?;
+                            let column = batch
+                                .column(1)
+                                .as_any()
+                                .downcast_ref::<Int32Array>()
+                                .unwrap();
+                            ids.extend_from_slice(column.values());
+                        }
+                        Ok(ids)
+                    });
+                let report = std::mem::take(&mut *metrics.lock().unwrap());
+                (mode, ids, report)
+            })
+            .collect()
+    }
+
+    /// Asserts that every mode returns what the ordinary reader returns and,
+    /// if `no_verdict`, that the verdict modes use no verdict.
+    fn assert_matches_ordinary(results: &[ModeResult], context: &str, no_verdict: bool) {
+        let (_, ordinary, _) = &results[0];
+        for (mode, ids, report) in &results[1..] {
+            assert_eq!(ids, ordinary, "{context} {mode:?}");
+            if no_verdict {
+                assert_eq!(report.rows_verdict, 0, "{context} {mode:?} {report:?}");
+                assert_eq!(report.row_groups_pruned_dictionary, 0, "{context} {mode:?}");
+            }
+        }
+    }
+
+    fn assert_ordinary_semantics(results: &[ModeResult], context: &str) {
+        assert_matches_ordinary(results, context, true);
     }
 
     #[test]
-    fn dictionary_filter_spans_v2_page_by_value_count_like_ordinary_reader() {
-        // The ordinary column reader spans a DataPage v2 by `num_values` and
-        // ignores `num_rows`. The verdict page walker must use the same span.
-        let schema = Arc::new(Schema::new(vec![Field::new("word", DataType::Utf8, false)]));
-        let values = (0..32)
-            .map(|row| Some(["no", "yes"][row % 2]))
-            .collect::<StringArray>();
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(values)]).unwrap();
-        // Two pages of 16 values each.
-        let props = WriterProperties::builder()
-            .set_writer_version(WriterVersion::PARQUET_2_0)
-            .set_data_page_row_count_limit(16)
-            .set_write_batch_size(16)
-            .build();
-        let mut writer = ArrowWriter::try_new(Vec::new(), schema, Some(props)).unwrap();
-        writer.write(&batch).unwrap();
-        let mut file = writer.into_inner().unwrap();
+    fn dictionary_filter_v2_row_count_mismatch_uses_ordinary_semantics() {
+        // Regression (a): two 16-value DataPage v2 pages; the first page
+        // header declares 15 rows. The ordinary reader skips a page by its
+        // declared rows and decodes it by its value count.
+        let mut file = words_and_ids_file(&[32], 16, true);
         let metadata =
             ArrowReaderMetadata::load(&Bytes::copy_from_slice(&file), ArrowReaderOptions::new())
                 .unwrap();
         let column = metadata.metadata().row_group(0).column(0);
-        let (start, length) = column.byte_range();
         let data_page = usize::try_from(column.data_page_offset()).unwrap();
+        let (start, length) = column.byte_range();
         let end = usize::try_from(start + length).unwrap();
         // The first DataPageHeaderV2 in the compact protocol: num_values =
-        // 16, num_nulls = 0 and num_rows = 16, each a zigzag i32 field.
+        // 16, num_nulls = 0 and num_rows = 16, each a zigzag i32 field. The
+        // second page header follows the first page.
         let header = [0x15, 0x20, 0x15, 0x00, 0x15, 0x20];
         let at = file[data_page..end]
             .windows(header.len())
             .position(|window| window == header)
-            .expect("DataPageHeaderV2 counts")
+            .unwrap()
             + data_page;
         // Declare 15 rows on the first page. It still holds 16 values.
         file[at + 5] = 0x1e;
         let file = Bytes::from(file);
-        // Without an offset index, page spans come from the page headers.
         for policy in [PageIndexPolicy::Skip, PageIndexPolicy::Required] {
-            let options = ArrowReaderOptions::new().with_page_index_policy(policy);
-            let results = read_words_in_each_mode(&file, options);
-            let (_, ordinary, _) = &results[0];
-            assert_eq!(ordinary, &vec!["yes".to_string(); 16], "{policy:?}");
-            for (mode, words, report) in &results[1..] {
-                assert_eq!(words, ordinary, "{policy:?} {mode:?}");
-                // The flat page decoder refuses the inconsistent first page,
-                // so its rows use values. The second page keeps its span and
-                // uses the verdict.
-                assert_eq!(report.fallback_error, 1, "{policy:?} {mode:?} {report:?}");
-                assert_eq!(report.rows_value, 16, "{policy:?} {mode:?} {report:?}");
-                assert_eq!(report.rows_verdict, 16, "{policy:?} {mode:?} {report:?}");
-                assert_eq!(
-                    report.rows_verdict_matched, 8,
-                    "{policy:?} {mode:?} {report:?}"
-                );
+            for selection in [
+                None,
+                Some(vec![RowSelector::skip(16), RowSelector::select(15)]),
+                Some(vec![RowSelector::select(8), RowSelector::skip(24)]),
+            ] {
+                let context = format!("{policy:?} {selection:?}");
+                let options = ArrowReaderOptions::new().with_page_index_policy(policy);
+                // With an offset index, both readers skip the first page by
+                // its index span when it holds no selected row, and never
+                // read its header. Otherwise the mismatch reaches a reader.
+                let first_page_skipped = policy == PageIndexPolicy::Required
+                    && selection
+                        .as_ref()
+                        .is_some_and(|selection| selection[0].skip && selection[0].row_count >= 16);
+                let results = read_ids_in_each_mode(&file, options, selection.clone(), true);
+                assert_matches_ordinary(&results, &context, !first_page_skipped);
+                if policy == PageIndexPolicy::Skip && selection.is_none() {
+                    let (_, ordinary, _) = &results[0];
+                    assert_eq!(ordinary.as_ref().unwrap().len(), 16, "{context}");
+                }
             }
         }
+    }
 
-        // An offset index that starts the second page at row 15 spans the
-        // first page by 15 rows, which disagrees with its 16 values. The
-        // ordinary reader reads by value count. The verdict path evaluates
-        // the whole chunk by value instead of failing.
-        let mut indexed = file.to_vec();
+    #[test]
+    fn dictionary_filter_short_row_group_uses_ordinary_semantics() {
+        // Regression (b): group A declares 16 rows but its pages hold 15
+        // values. The ordinary reader places group B's first value at row
+        // 15, so a mismatch in one chunk moves the rows of later chunks.
+        let mut file = words_and_ids_file(&[15, 16], 16, false);
+        let footer_len =
+            u32::from_le_bytes(file[file.len() - 8..file.len() - 4].try_into().unwrap()) as usize;
+        let footer = file.len() - 8 - footer_len..file.len() - 8;
+        // RowGroup.num_rows = 15, a zigzag i64 field after total_byte_size,
+        // and FileMetaData.num_rows = 31.
+        let candidates = file[footer.clone()]
+            .windows(2)
+            .enumerate()
+            .filter(|(_, window)| *window == [0x16, 0x1e])
+            .map(|(at, _)| at + footer.start)
+            .collect::<Vec<_>>();
+        let patched = candidates
+            .into_iter()
+            .find_map(|at| {
+                let mut candidate = file.clone();
+                candidate[at + 1] = 0x20;
+                let metadata = ArrowReaderMetadata::load(
+                    &Bytes::from(candidate.clone()),
+                    ArrowReaderOptions::new(),
+                )
+                .ok()?;
+                let groups = metadata.metadata().row_groups();
+                (groups[0].num_rows() == 16
+                    && groups[1].num_rows() == 16
+                    && groups[0].column(0).num_values() == 15)
+                    .then_some(candidate)
+            })
+            .expect("row group A num_rows");
+        file = patched;
+        let file = Bytes::from(file);
+        for selection in [
+            None,
+            Some(vec![RowSelector::skip(16), RowSelector::select(16)]),
+            Some(vec![
+                RowSelector::skip(8),
+                RowSelector::select(16),
+                RowSelector::skip(8),
+            ]),
+        ] {
+            let context = format!("{selection:?}");
+            let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
+            let results = read_ids_in_each_mode(&file, options, selection, true);
+            assert_ordinary_semantics(&results, &context);
+        }
+    }
+
+    #[test]
+    fn dictionary_filter_offset_index_mismatch_uses_ordinary_semantics() {
+        // Regression (c): three 16-value pages whose offset index starts
+        // them at rows 0, 15 and 32.
+        let mut file = words_and_ids_file(&[48], 16, false);
         let metadata = ArrowReaderMetadata::load(
-            &file,
+            &Bytes::copy_from_slice(&file),
             ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required),
         )
         .unwrap();
@@ -1119,22 +1247,48 @@ mod dictionary_tests {
         let index_end =
             index_start + usize::try_from(column.offset_index_length().unwrap()).unwrap();
         // PageLocation.first_row_index = 16: a zigzag i64 field.
-        let at = indexed[index_start..index_end]
-            .windows(2)
-            .position(|window| window == [0x16, 0x20])
-            .expect("second page location")
-            + index_start;
-        indexed[at + 1] = 0x1e;
-        let indexed = Bytes::from(indexed);
-        let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
-        let results = read_words_in_each_mode(&indexed, options);
+        patch_once(
+            &mut file,
+            index_start..index_end,
+            &[0x16, 0x20],
+            &[0x16, 0x1e],
+        );
+        let file = Bytes::from(file);
+        let options =
+            || ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
+
+        // A mismatched page holds selected rows. The empty-verdict shortcut
+        // (every word rejected) must not run before the page check.
+        for (selection, accept_yes) in [
+            (None, true),
+            (None, false),
+            (
+                Some(vec![RowSelector::skip(16), RowSelector::select(32)]),
+                true,
+            ),
+            (
+                Some(vec![RowSelector::skip(16), RowSelector::select(32)]),
+                false,
+            ),
+        ] {
+            let context = format!("{selection:?} accept_yes={accept_yes}");
+            let results = read_ids_in_each_mode(&file, options(), selection, accept_yes);
+            assert_ordinary_semantics(&results, &context);
+        }
+
+        // Only the consistent third page holds selected rows. Both readers
+        // skip the first two pages by their index spans without reading
+        // their headers, so the verdict applies to the third page.
+        let selection = Some(vec![RowSelector::skip(32), RowSelector::select(16)]);
+        let results = read_ids_in_each_mode(&file, options(), selection, true);
         let (_, ordinary, _) = &results[0];
-        assert_eq!(ordinary, &vec!["yes".to_string(); 16]);
-        for (mode, words, report) in &results[1..] {
-            assert_eq!(words, ordinary, "{mode:?}");
-            assert_eq!(report.fallback_error, 1, "{mode:?} {report:?}");
-            assert_eq!(report.rows_value, 32, "{mode:?} {report:?}");
-            assert_eq!(report.rows_verdict, 0, "{mode:?} {report:?}");
+        assert_eq!(
+            ordinary.as_ref().unwrap(),
+            &(32..48).filter(|id| id % 2 == 1).collect::<Vec<_>>()
+        );
+        for (mode, ids, report) in &results[1..] {
+            assert_eq!(ids, ordinary, "{mode:?}");
+            assert_eq!(report.rows_verdict, 16, "{mode:?} {report:?}");
         }
     }
 

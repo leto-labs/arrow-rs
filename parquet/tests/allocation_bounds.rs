@@ -173,6 +173,25 @@ fn read_unit_of_group(
     group_rows: usize,
     tail_rows: usize,
 ) -> (usize, usize, usize) {
+    read_selection_of_group(
+        unit_rows,
+        group_rows,
+        vec![
+            RowSelector::skip(group_rows - unit_rows - tail_rows),
+            RowSelector::select(unit_rows),
+            RowSelector::skip(tail_rows),
+        ],
+    )
+}
+
+/// Reads `selection` of one row group of `group_rows` rows with a
+/// dictionary filter. The file repeats a batch of `batch_rows` rows.
+fn read_selection_of_group(
+    batch_rows: usize,
+    group_rows: usize,
+    selection: Vec<RowSelector>,
+) -> (usize, usize, usize) {
+    let unit_rows = batch_rows;
     let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
@@ -195,11 +214,7 @@ fn read_unit_of_group(
     let projection = ProjectionMask::leaves(builder.parquet_schema(), [0]);
     let builder = builder
         .with_batch_size(1024)
-        .with_row_selection(RowSelection::from(vec![
-            RowSelector::skip(group_rows - unit_rows - tail_rows),
-            RowSelector::select(unit_rows),
-            RowSelector::skip(tail_rows),
-        ]))
+        .with_row_selection(RowSelection::from(selection))
         .with_row_filter(
             RowFilter::new(vec![Box::new(PassDictionary(projection))]).with_dictionary_filter(),
         );
@@ -240,6 +255,30 @@ fn dictionary_filter_bitmaps_cover_only_the_selected_span() {
     assert!(
         largest <= SPAN_BITMAP + 64,
         "largest allocation was {largest} bytes; a span bitmap needs {SPAN_BITMAP}"
+    );
+}
+
+#[test]
+fn dictionary_filter_sparse_selection_checks_density_before_allocating() {
+    // Two runs at opposite ends of a 2 Mi-row group select one eighth of
+    // the span between them. The density check rejects the verdict path
+    // before it builds a span bitmap (256 KiB).
+    const RUN_ROWS: usize = 128 * 1024;
+    const GROUP_ROWS: usize = 16 * RUN_ROWS;
+    let (rows, verdict_rows, largest) = read_selection_of_group(
+        2 * RUN_ROWS,
+        GROUP_ROWS,
+        vec![
+            RowSelector::select(RUN_ROWS),
+            RowSelector::skip(GROUP_ROWS - 2 * RUN_ROWS),
+            RowSelector::select(RUN_ROWS),
+        ],
+    );
+    assert_eq!(rows, 2 * RUN_ROWS);
+    assert_eq!(verdict_rows, 0, "the selection must use values");
+    assert!(
+        largest < GROUP_ROWS / 8,
+        "largest allocation was {largest} bytes, enough for a span bitmap"
     );
 }
 

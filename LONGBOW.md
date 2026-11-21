@@ -63,12 +63,16 @@ index's row accounting and has no Longbow-specific dependencies.
 DV evaluates a flat column's dictionary once for each participating predicate and
 chunk selection. It uses the normal Arrow column reader to interpret PLAIN entries
 with the column's logical type and uses the DCX index walker for data pages. The
-NULL verdict is applied through the page's definition levels. Pages span their
-value count, as in the ordinary column reader. Mixed pages and entry or cursor
-errors use the existing value reader, and page spans that disagree with an
-offset index or the row group send the whole chunk to it. Verdict bitmaps cover
-only the span from the first to the last selected row, and a selection covering
-less than one quarter of that span bypasses them. Ordinary row filters
+NULL verdict is applied through the page's definition levels. Before any verdict
+work, DV checks the page counts of every chunk up to the end of the selected
+span: each unindexed page header, and each indexed page that holds selected
+rows. A DataPage v2 row count that differs from its value count, an index span
+that differs from a decoded page, or spans that do not add up to the row group
+send the whole read unit to the value reader, which defines how such a file
+reads. Mixed pages and entry or cursor errors use the existing value reader.
+Verdict bitmaps cover only the span from the first to the last selected row. A
+selection covering less than one quarter of that span bypasses them before
+anything is allocated. Ordinary row filters
 use the value plan directly. In verify mode, the value predicate must select
 exactly the same rows wherever a verdict was used.
 

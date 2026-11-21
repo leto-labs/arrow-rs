@@ -58,22 +58,29 @@ impl ReadPlanBuilder {
         // The verdict uses dense bitmaps over the span from the first to the
         // last selected row. A native unit can cover a small part of a much
         // larger row group, so the bitmaps never cover the whole group for
-        // it. Refuse the verdict before allocating if the span exceeds four
-        // times the selected row count.
-        let span = SelectedSpan::of(&self, rows);
-        let bounded = span.selected != 0 && span.selected >= span.len.div_ceil(4);
-        let use_codes = bounded && limit.is_none() && predicate.dictionary_filter_eligible();
-        let leaf = use_codes
-            .then(|| flat_leaf(fields, groups.metadata(), predicate))
+        // it. `SelectedSpan::of` refuses the verdict before it allocates if
+        // the span exceeds four times the selected row count.
+        let span = (limit.is_none() && predicate.dictionary_filter_eligible())
+            .then(|| SelectedSpan::of(&self, rows))
             .flatten();
-        let code = match (use_codes, leaf) {
-            (true, Some((index, field))) => Some(evaluate_chunks(
-                &span, groups, predicate, policy, index, field,
-            )?),
+        let leaf = span
+            .as_ref()
+            .and_then(|_| flat_leaf(fields, groups.metadata(), predicate));
+        let mut inconsistent = false;
+        let code = match (span, leaf) {
+            (Some(span), Some((index, field))) => {
+                match evaluate_chunks(&span, groups, predicate, policy, index, field)? {
+                    Some(code) => Some((span, code)),
+                    None => {
+                        inconsistent = true;
+                        None
+                    }
+                }
+            }
             _ => None,
         };
 
-        let Some(code) = code else {
+        let Some((span, code)) = code else {
             let chunks = count_selected_chunks(&self, groups);
             let several_leaves = (0..groups
                 .metadata()
@@ -93,12 +100,23 @@ impl ReadPlanBuilder {
                 },
                 |rows| rows_value = rows,
             )?;
-            let metrics = DictionaryFilterMetrics {
-                chunks_value: chunks,
-                rows_value,
-                fallback_columns: if several_leaves { chunks } else { 0 },
-                fallback_unsupported: if several_leaves { 0 } else { chunks },
-                ..Default::default()
+            let metrics = if inconsistent {
+                // Page counts disagree somewhere in the unit. The ordinary
+                // reader defines how such a unit reads.
+                DictionaryFilterMetrics {
+                    chunks_value: chunks,
+                    rows_value,
+                    fallback_error: chunks,
+                    ..Default::default()
+                }
+            } else {
+                DictionaryFilterMetrics {
+                    chunks_value: chunks,
+                    rows_value,
+                    fallback_columns: if several_leaves { chunks } else { 0 },
+                    fallback_unsupported: if several_leaves { 0 } else { chunks },
+                    ..Default::default()
+                }
             };
             predicate.record_dictionary_filter(metrics);
             return Ok(result);
@@ -156,29 +174,38 @@ struct SelectedSpan {
 }
 
 impl SelectedSpan {
-    fn of(plan: &ReadPlanBuilder, rows: usize) -> Self {
+    /// Returns the selected span of `plan`, or `None` if it selects no rows
+    /// or fewer than one row in four of its span. The check counts the
+    /// selected runs and allocates nothing.
+    fn of(plan: &ReadPlanBuilder, rows: usize) -> Option<Self> {
         let Some(selection) = plan.selection() else {
-            return Self {
+            return (rows != 0).then(|| Self {
                 start: 0,
                 len: rows,
                 selected: rows,
                 mask: BooleanBuffer::new_set(rows),
-            };
+            });
         };
         let mut bounds = None::<(usize, usize)>;
+        let mut selected = 0;
         for_each_selected_run(selection, rows, |run| {
+            selected += run.len();
             let first = bounds.map_or(run.start, |(first, _)| first);
             bounds = Some((first, run.end));
         });
-        let (start, end) = bounds.unwrap_or((0, 0));
+        let (start, end) = bounds?;
         let len = end - start;
+        if selected < len.div_ceil(4) {
+            return None;
+        }
         let mask = window_mask(Some(selection), start, len, rows);
-        Self {
+        debug_assert_eq!(mask.count_set_bits(), selected);
+        Some(Self {
             start,
             len,
-            selected: mask.count_set_bits(),
+            selected,
             mask,
-        }
+        })
     }
 
     /// Returns the rows that `selection` selects in this span.
@@ -308,6 +335,10 @@ struct CodeSelection {
     metrics: DictionaryFilterMetrics,
 }
 
+/// Evaluates the verdict for each chunk in the selected span. Returns `None`
+/// if page counts disagree in any chunk that the ordinary reader positions
+/// rows through. The ordinary reader then evaluates the whole unit, because
+/// such a disagreement can shift the rows of later pages and row groups.
 fn evaluate_chunks(
     span: &SelectedSpan,
     groups: &dyn RowGroups,
@@ -315,7 +346,7 @@ fn evaluate_chunks(
     policy: DictionaryFilterOptions,
     leaf: usize,
     field: &ParquetField,
-) -> Result<CodeSelection> {
+) -> Result<Option<CodeSelection>> {
     let mut chunks = groups.column_chunks(leaf)?;
     // Both bitmaps cover only the span of selected rows.
     let mut covered = BooleanBufferBuilder::new(span.len);
@@ -328,6 +359,10 @@ fn evaluate_chunks(
     let span_end = span.start + span.len;
     let mut offset = 0;
     for row_group in groups.row_groups() {
+        if offset >= span_end {
+            // Later row groups cannot move selected rows.
+            break;
+        }
         let length = row_group.num_rows() as usize;
         let group_start = offset;
         offset += length;
@@ -337,45 +372,39 @@ fn evaluate_chunks(
         // The part of this row group inside the span, in group rows.
         let window_start = span.start.max(group_start);
         let window_end = span_end.min(offset);
-        if window_start >= window_end {
+        let window = (window_start < window_end)
+            .then(|| ChunkWindow {
+                rows: length,
+                start: window_start - group_start,
+                selection: span
+                    .mask
+                    .slice(window_start - span.start, window_end - window_start),
+            })
+            .filter(|window| window.selection.count_set_bits() != 0);
+        // Check the page counts of every chunk up to the end of the span
+        // before using any verdict. A chunk before the span still positions
+        // the rows after it.
+        let Some(scanned) = scan_chunk(&mut *pages?, length, window.as_ref())? else {
+            return Ok(None);
+        };
+        let Some(window) = window else {
             continue;
-        }
-        let window = ChunkWindow {
-            rows: length,
-            start: window_start - group_start,
-            selection: span
-                .mask
-                .slice(window_start - span.start, window_end - window_start),
         };
         let selected_rows = window.selection.count_set_bits();
-        let mut chunk_result = ChunkResult::default();
-        if selected_rows != 0 {
-            let chunk_start = covered.len();
-            chunk_result = evaluate_chunk(
-                &mut *pages?,
-                groups,
-                predicate,
-                policy,
-                leaf,
-                field,
-                row_group,
-                &window,
-                &mut covered,
-                &mut passed,
-                &mut scratch,
-                &mut metrics,
-            )?;
-            if chunk_result.inconsistent {
-                // The ordinary reader decides how to read inconsistent page
-                // spans. Evaluate the whole chunk by value.
-                covered.truncate(chunk_start);
-                passed.truncate(chunk_start);
-                chunk_result = ChunkResult {
-                    error: true,
-                    ..Default::default()
-                };
-            }
-        }
+        let chunk_result = evaluate_chunk(
+            scanned,
+            groups,
+            predicate,
+            policy,
+            leaf,
+            field,
+            row_group,
+            &window,
+            &mut covered,
+            &mut passed,
+            &mut scratch,
+            &mut metrics,
+        )?;
         // A rejected chunk does not append any bitmap. Mixed chunks append
         // both covered and uncovered page spans in file order.
         let appended = window_end - span.start;
@@ -392,13 +421,16 @@ fn evaluate_chunks(
         metrics.fallback_error += usize::from(chunk_result.error);
         metrics.fallback_unsupported += usize::from(chunk_result.unsupported);
     }
+    // Row groups that hold no selected rows append nothing.
+    covered.append_n(span.len - covered.len(), false);
+    passed.append_n(span.len - passed.len(), false);
     let passed = passed.finish();
     metrics.rows_verdict_matched = passed.count_set_bits();
-    Ok(CodeSelection {
+    Ok(Some(CodeSelection {
         covered: covered.finish(),
         passed,
         metrics,
-    })
+    }))
 }
 
 /// The rows of one row group that lie inside the selected span.
@@ -415,6 +447,122 @@ impl ChunkWindow {
     fn end(&self) -> usize {
         self.start + self.selection.len()
     }
+
+    /// Returns the selected rows of the window inside group rows
+    /// `start..end`, and the first of those rows.
+    fn part(&self, start: usize, end: usize) -> Option<(usize, BooleanBuffer)> {
+        let first = start.max(self.start);
+        let last = end.min(self.end());
+        (first < last).then(|| {
+            (
+                first,
+                self.selection.slice(first - self.start, last - first),
+            )
+        })
+    }
+}
+
+/// The pages of one column chunk, read and checked before any verdict work.
+struct ScannedChunk {
+    /// The dictionary page, if the chunk starts with one.
+    dictionary: Option<Page>,
+    /// The data pages inside the window, in file order. Only pages with
+    /// selected rows hold their contents.
+    pages: Vec<ScannedPage>,
+}
+
+struct ScannedPage {
+    /// The first row of the page, relative to the row group.
+    start: usize,
+    rows: usize,
+    page: Option<Page>,
+}
+
+/// Reads the page spans of one chunk and the pages that hold selected rows
+/// in `window`. Returns `None` if a page's counts or the chunk's total
+/// disagree, so that only the ordinary reader positions its rows:
+///
+/// * A page header's DataPage v2 row count differs from its value count.
+/// * An offset index span differs from the value or row count of a page
+///   that both readers decode.
+/// * The page spans do not add up to the row group.
+///
+/// Without an offset index, every page header is checked. With one, both
+/// readers skip pages without selected rows by their index span, so their
+/// headers cannot move a row. Sparse and cached chunks do not hold their
+/// bytes.
+fn scan_chunk(
+    pages: &mut dyn PageReader,
+    rows: usize,
+    window: Option<&ChunkWindow>,
+) -> Result<Option<ScannedChunk>> {
+    let mut dictionary = None;
+    if pages.peek_next_page()?.is_some_and(|page| page.is_dict) {
+        if window.is_none() {
+            pages.skip_next_page()?;
+        } else {
+            let Ok(Some(page)) = pages.get_next_page() else {
+                // An ordinary read might only touch selected PLAIN pages in
+                // this chunk, and it decides whether they read.
+                return Ok(None);
+            };
+            dictionary = Some(page);
+        }
+    }
+    let mut scanned = Vec::new();
+    let mut offset = 0;
+    while let Some(header) = pages.peek_next_page()? {
+        // A flat leaf has one value per row. A page header gives its value
+        // count as the level count. Only an offset index omits it.
+        let span = match (header.is_dict, header.num_levels, header.num_rows) {
+            (true, _, _) => return Ok(None),
+            (_, Some(levels), Some(rows)) if levels != rows => return Ok(None),
+            (_, Some(levels), _) => levels,
+            (_, None, Some(rows)) => rows,
+            (_, None, None) => return Ok(None),
+        };
+        if span > rows - offset {
+            return Ok(None);
+        }
+        let start = offset;
+        offset += span;
+        let part = window.and_then(|window| window.part(start, offset));
+        let wanted = part
+            .as_ref()
+            .is_some_and(|(_, selection)| selection.count_set_bits() != 0);
+        let page = if wanted {
+            let page = pages
+                .get_next_page()?
+                .ok_or_else(|| general_err!("Missing predicate data page"))?;
+            let page_rows = match &page {
+                Page::DataPageV2 { num_rows, .. } => *num_rows as usize,
+                _ => span,
+            };
+            if page.num_values() as usize != span || page_rows != span {
+                return Ok(None);
+            }
+            Some(page)
+        } else {
+            pages.skip_next_page()?;
+            None
+        };
+        // Keep only pages inside the window, so this list is bounded by the
+        // selected span rather than by the row group.
+        if part.is_some() {
+            scanned.push(ScannedPage {
+                start,
+                rows: span,
+                page,
+            });
+        }
+    }
+    if offset != rows {
+        return Ok(None);
+    }
+    Ok(Some(ScannedChunk {
+        dictionary,
+        pages: scanned,
+    }))
 }
 
 #[derive(Default)]
@@ -424,8 +572,6 @@ struct ChunkResult {
     limit: bool,
     error: bool,
     unsupported: bool,
-    /// Page spans disagree with the row group or the page contents.
-    inconsistent: bool,
 }
 
 struct VerdictScratch {
@@ -435,7 +581,7 @@ struct VerdictScratch {
 
 #[expect(clippy::too_many_arguments)]
 fn evaluate_chunk(
-    pages: &mut dyn PageReader,
+    scanned: ScannedChunk,
     groups: &dyn RowGroups,
     predicate: &mut dyn ArrowPredicate,
     policy: DictionaryFilterOptions,
@@ -449,13 +595,8 @@ fn evaluate_chunk(
     metrics: &mut DictionaryFilterMetrics,
 ) -> Result<ChunkResult> {
     let mut result = ChunkResult::default();
-    if !pages.peek_next_page()?.is_some_and(|page| page.is_dict) {
+    let Some(dictionary_page) = scanned.dictionary else {
         result.plain = true;
-        return Ok(result);
-    }
-    let Ok(Some(dictionary_page)) = pages.get_next_page() else {
-        // An ordinary read might only touch selected PLAIN pages in this chunk.
-        result.error = true;
         return Ok(result);
     };
     let entries = dictionary_page.num_values() as usize;
@@ -504,48 +645,18 @@ fn evaluate_chunk(
 
     let dictionary = ChunkDictionary::for_verdict(values, column.column_type());
     let mut table = dictionary.verdict_table(verdict.entries.iter());
-    let mut offset = 0;
-    while let Some(header) = pages.peek_next_page()? {
-        if header.is_dict {
-            return Err(general_err!("Unexpected dictionary after first page"));
-        }
-        // A flat leaf has one value per row. Like the ordinary column
-        // reader, span a page by its value count, which a page header
-        // gives as its level count. Only an offset index omits it.
-        let rows = header
-            .num_levels
-            .or(header.num_rows)
-            .ok_or_else(|| general_err!("Missing flat predicate page row count"))?;
-        if rows > window.rows - offset {
-            result.inconsistent = true;
-            return Ok(result);
-        }
-        let page_start = offset;
-        offset += rows;
-        // The part of this page inside the window.
-        let first = page_start.max(window.start);
-        let last = offset.min(window.end());
-        if first >= last {
-            pages.skip_next_page()?;
+    for ScannedPage { start, rows, page } in scanned.pages {
+        let Some((first, selection)) = window.part(start, start + rows) else {
             continue;
-        }
-        let part = last - first;
-        let selection = window.selection.slice(first - window.start, part);
-        let selected_rows = selection.count_set_bits();
-        if selected_rows == 0 {
-            pages.skip_next_page()?;
+        };
+        let part = selection.len();
+        let Some(page) = page else {
+            // The page has no selected rows.
             covered.append_n(part, false);
             passed.append_n(part, false);
             continue;
-        }
-        let page = pages
-            .get_next_page()?
-            .ok_or_else(|| general_err!("Missing predicate data page"))?;
-        if page.num_values() as usize != rows {
-            // An offset index disagrees with the page header.
-            result.inconsistent = true;
-            return Ok(result);
-        }
+        };
+        let selected_rows = selection.count_set_bits();
         if !dictionary_encoding(page.encoding()) {
             result.plain = true;
             covered.append_n(part, false);
@@ -575,14 +686,10 @@ fn evaluate_chunk(
                 *word |= !valid;
             }
         }
-        let page_mask = words_to_mask(&scratch.verdict, rows).slice(first - page_start, part);
+        let page_mask = words_to_mask(&scratch.verdict, rows).slice(first - start, part);
         covered.append_buffer(&selection);
         passed.append_buffer(&(&page_mask & &selection));
         result.rows += selected_rows;
-    }
-    if offset != window.rows {
-        result.inconsistent = true;
-        return Ok(result);
     }
     metrics.runs_evaluated += table.runs_evaluated();
     Ok(result)
