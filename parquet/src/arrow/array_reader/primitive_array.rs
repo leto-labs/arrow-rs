@@ -939,6 +939,70 @@ mod tests {
         }
     }
 
+    fn legacy_fixture_double_pages() -> (ColumnDescPtr, Box<dyn PageIterator>) {
+        use crate::file::reader::{FilePageIterator, FileReader, SerializedFileReader};
+        use bytes::Bytes;
+
+        let file = Bytes::from_static(include_bytes!(
+            "../../../tests/data/bitpacking_levels.parquet"
+        ));
+        let reader = Arc::new(SerializedFileReader::new(file).unwrap());
+        let column = 3;
+        let desc = reader
+            .metadata()
+            .file_metadata()
+            .schema_descr()
+            .column(column);
+        assert_eq!(desc.name(), "optional_double");
+        let pages = FilePageIterator::new(column, reader).unwrap();
+        (desc, Box::new(pages))
+    }
+
+    fn legacy_fixture_double_reader() -> PrimitiveArrayReader<crate::data_type::DoubleType> {
+        let (desc, pages) = legacy_fixture_double_pages();
+        PrimitiveArrayReader::new(pages, desc, None, 1, None).unwrap()
+    }
+
+    #[test]
+    fn legacy_fixture_arrow_ordinary() {
+        let actual = legacy_fixture_double_reader().next_batch(1).unwrap();
+        assert_eq!(
+            actual.as_primitive::<Float64Type>(),
+            &Float64Array::from(vec![1.0])
+        );
+    }
+
+    #[test]
+    fn legacy_fixture_dcx_full() {
+        use crate::column::reader::{CodeColumnPage, CodeColumnReader};
+        use crate::data_type::DoubleType;
+
+        let (desc, mut pages) = legacy_fixture_double_pages();
+        let mut reader =
+            CodeColumnReader::<DoubleType, Float64Type>::new(desc, pages.next().unwrap().unwrap())
+                .unwrap();
+        let Some(CodeColumnPage::Values { values, .. }) = reader.next_page().unwrap() else {
+            panic!("expected a value page");
+        };
+        let ordinary = legacy_fixture_double_reader().next_batch(1).unwrap();
+        assert_eq!(values, Float64Array::from(vec![1.0]));
+        assert_eq!(&values, ordinary.as_primitive::<Float64Type>());
+        assert!(reader.next_page().unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_fixture_dcx_selected() {
+        let actual = legacy_fixture_double_reader()
+            .read_selected(&[1], 1)
+            .unwrap();
+        let ordinary = legacy_fixture_double_reader().next_batch(1).unwrap();
+        assert_eq!(
+            actual.as_primitive::<Float64Type>(),
+            &Float64Array::from(vec![1.0])
+        );
+        assert_eq!(actual.as_ref(), ordinary.as_ref());
+    }
+
     #[test]
     #[expect(deprecated, reason = "Exercise the Parquet V1 BIT_PACKED encoding")]
     fn code_page_legacy_levels_match_ordinary_reader() {
@@ -985,10 +1049,11 @@ mod tests {
                 };
                 let full = ordinary().next_batch(8).unwrap();
                 let full = full.as_any().downcast_ref::<Int32Array>().unwrap();
-                assert_eq!(
-                    full.iter().collect::<Vec<_>>(),
-                    [None, None, None, None, None, None, None, Some(17)]
-                );
+                let expected =
+                    Int32Array::from(vec![Some(17), None, None, None, None, None, None, None]);
+                if full != &expected {
+                    mismatches.push(format!("{encoding:?} ordinary: {full:?}"));
+                }
                 let mut code_reader = CodeColumnReader::<Int32Type, ArrowInt32>::new(
                     desc.clone(),
                     Box::new(InMemoryPageReader::new(pages.clone())),
@@ -998,14 +1063,17 @@ mod tests {
                 else {
                     panic!("expected a value page")
                 };
-                if &values != full {
+                if values != expected || &values != full {
                     mismatches.push(format!("{encoding:?} full: {values:?}"));
                 }
                 for row in [0, 7] {
                     let mask = BooleanArray::from_iter((0..8).map(|i| Some(i == row)));
-                    let expected = arrow_select::filter::filter(full, &mask).unwrap();
+                    let expected = arrow_select::filter::filter(&expected, &mask).unwrap();
+                    let ordinary_selected = arrow_select::filter::filter(full, &mask).unwrap();
                     let actual = ordinary().read_selected(&[1 << row], 8).unwrap();
-                    if actual.as_ref() != expected.as_ref() {
+                    if actual.as_ref() != expected.as_ref()
+                        || actual.as_ref() != ordinary_selected.as_ref()
+                    {
                         mismatches.push(format!("{encoding:?} selected row {row}: {actual:?}"));
                     }
                 }

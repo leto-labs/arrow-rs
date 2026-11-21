@@ -948,10 +948,9 @@ mod tests {
                 definition
                     .chunks(8)
                     .map(|chunk| {
-                        chunk
-                            .iter()
-                            .enumerate()
-                            .fold(0, |byte, (bit, &valid)| byte | (u8::from(valid) << bit))
+                        chunk.iter().enumerate().fold(0, |byte, (bit, &valid)| {
+                            byte | (u8::from(valid) << (7 - bit))
+                        })
                     })
                     .collect()
             }
