@@ -160,8 +160,8 @@ DPC is a hook for an engine-owned decompressed page cache; Parquet owns neither
 the cache budget nor eviction. The hook is attached to metadata for a file
 generation and reworked onto Arrow 60's `PageIndexProvider` and shared fetch
 planning. Complete column residency can omit fetches for unencrypted chunks,
-including uncompressed chunks. A fill copies each uncompressed page body out
-of its fetched range, so the charge covers the memory the page retains.
+including uncompressed chunks. After admitting a borrowed page, its fill
+copies the body out of the fetched range and charges those owned bytes.
 Partial residency and encrypted chunks use source reads. Atomic page leases
 keep planned hits resident through decode and reclamation, with memory ownership
 in Longbow. Failed hit checks fall back to cold reads. Cached pages have already
@@ -359,12 +359,11 @@ index load, keeps it.
 
 Limits that the tests state:
 
-- Unencrypted column chunks can use the cache. An uncompressed chunk keeps
-  its on-disk value encoding, with an independent copy of each page body
-  offered on a fill ticket. A Data Page V2 stored uncompressed inside a
-  compressed chunk can enter the cache when dictionary-to-PLAIN conversion
-  gives it an owned body. Readers that decode page statistics
-  (`ReaderProperties::read_page_stats`) bypass the cache.
+- Unencrypted column chunks can use the cache. Pages with uncompressed bodies
+  offer a deferred ownership copy to the fill ticket. This includes a V2 page
+  stored uncompressed inside a compressed chunk. A successful
+  dictionary-to-PLAIN conversion already owns its output. Readers that decode
+  page statistics (`ReaderProperties::read_page_stats`) bypass the cache.
 - A cached page passed the reader's header parse and CRC when it was filled.
   A hit repeats neither, but it repeats the placement checks (codec of the
   column chunk, fit in the chunk, offset-index length and page kind); see the

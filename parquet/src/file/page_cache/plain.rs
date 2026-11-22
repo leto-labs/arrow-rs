@@ -84,16 +84,14 @@ impl PlainChunk {
         self.dictionary.is_some()
     }
 
-    /// Returns the representation to store. A dictionary data page for which
-    /// we have not seen the dictionary, or cannot transcode, stays a miss.
-    pub(crate) fn data_page(&self, page: &Page, owns_buffer: bool) -> Option<Page> {
-        if !is_dictionary_encoded(page.encoding()) {
-            return owns_buffer.then(|| page.clone());
-        }
+    /// Returns a dictionary data page to store and whether it was converted
+    /// to an owned PLAIN page. An unclassified chunk or a failed conversion
+    /// remains a miss.
+    pub(crate) fn dictionary_data_page(&self, page: &Page) -> Option<(Page, bool)> {
         if let Some(dict) = &self.dictionary {
-            self.transcode(page.clone(), dict)
+            self.transcode(page.clone(), dict).map(|page| (page, true))
         } else {
-            (self.classified && owns_buffer).then(|| page.clone())
+            self.classified.then(|| (page.clone(), false))
         }
     }
 

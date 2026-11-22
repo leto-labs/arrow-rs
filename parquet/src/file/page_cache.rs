@@ -60,9 +60,9 @@
 //! read or a [`ParquetError`](crate::errors::ParquetError), not a wrong
 //! result.
 //!
-//! Only pages of unencrypted column chunks are cached. A page of an
-//! uncompressed chunk is copied on fill so the cache keeps and charges
-//! just its body, independently of the fetched chunk.
+//! Only pages of unencrypted column chunks are cached. A page with a
+//! borrowed body offers a copy to its fill ticket. An admitted page then
+//! owns its body independently of the fetched range.
 //!
 //! # Planning reads with the cache
 //!
@@ -157,6 +157,21 @@ impl CachedPage {
         };
         *buf = bytes::Bytes::copy_from_slice(buf);
         self
+    }
+
+    /// Offers a body that needs a copy to keep the fetched range out of the cache.
+    pub(crate) fn publish_with_copy(self, fill: Box<dyn PageFill>, flat_nullable: bool) {
+        #[cfg(feature = "arrow")]
+        if flat_nullable && let Some(bytes) = self.validity_build_charge() {
+            return fill.complete_with_copy(
+                self,
+                Self::with_owned_body,
+                bytes,
+                Self::build_validity,
+            );
+        }
+        let _ = flat_nullable;
+        fill.complete_with_copy(self, Self::with_owned_body, 0, std::convert::identity);
     }
 
     /// Offers the page to a fill ticket, with optional flat nullable validity.
@@ -301,6 +316,25 @@ pub trait PageFill: Send {
         _build: fn(CachedPage) -> CachedPage,
     ) {
         self.complete(page);
+    }
+
+    /// Offers a page that would retain a larger fetched allocation unless
+    /// copied. The cache may refuse it before calling `copy`. If it keeps
+    /// the page, it must copy before publication or building its validity.
+    /// The copy retains exactly the page's body length.
+    fn complete_with_copy(
+        self: Box<Self>,
+        page: CachedPage,
+        copy: fn(CachedPage) -> CachedPage,
+        extra_bytes: usize,
+        build_validity: fn(CachedPage) -> CachedPage,
+    ) {
+        let page = copy(page);
+        if extra_bytes == 0 {
+            self.complete(page);
+        } else {
+            self.complete_with_validity(page, extra_bytes, build_validity);
+        }
     }
 }
 

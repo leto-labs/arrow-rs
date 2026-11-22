@@ -802,14 +802,8 @@ fn publish_page(
     plain_chunk: Option<&mut PlainChunk>,
     flat_nullable: bool,
 ) -> Page {
-    if codec == Compression::UNCOMPRESSED {
-        if let Some(fill) = fill {
-            CachedPage::new(page.clone(), stored_len, codec)
-                .with_owned_body()
-                .publish(fill, flat_nullable);
-        }
-        return page;
-    }
+    let mut owns_buffer = owns_buffer && codec != Compression::UNCOMPRESSED;
+    let mut page = page;
     if let Some(chunk) = plain_chunk {
         if page.is_dictionary_page() {
             let plain = chunk.observe_dictionary(&page);
@@ -819,18 +813,21 @@ fn publish_page(
                 }
                 return page;
             }
-        } else if let Some(fill) = fill {
-            if let Some(stored) = chunk.data_page(&page, owns_buffer) {
-                CachedPage::new(stored.clone(), stored_len, codec).publish(fill, flat_nullable);
-                return stored;
-            }
-            return page;
+        } else if fill.is_some() && is_dictionary_encoded(page.encoding()) {
+            let Some((stored, converted)) = chunk.dictionary_data_page(&page) else {
+                return page;
+            };
+            page = stored;
+            owns_buffer |= converted;
         }
     }
-    if let Some(fill) = fill
-        && owns_buffer
-    {
-        CachedPage::new(page.clone(), stored_len, codec).publish(fill, flat_nullable);
+    if let Some(fill) = fill {
+        let cached = CachedPage::new(page.clone(), stored_len, codec);
+        if owns_buffer {
+            cached.publish(fill, flat_nullable);
+        } else {
+            cached.publish_with_copy(fill, flat_nullable);
+        }
     }
     page
 }
@@ -3947,6 +3944,70 @@ mod tests {
         assert!(!pages.peek_next_page().unwrap().unwrap().is_dict);
         pages.skip_unselected_data_page().unwrap();
         assert!(pages.peek_next_page().unwrap().is_none());
+    }
+
+    #[cfg(all(feature = "arrow", feature = "snap"))]
+    #[test]
+    fn uncompressed_v2_page_cache_owns_a_body_in_a_compressed_chunk() {
+        use crate::file::page_cache::testing::MapPageCache;
+        use crate::file::properties::WriterVersion;
+
+        let schema = Arc::new(parse_message_type("message test { REQUIRED INT32 a; }").unwrap());
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_writer_version(WriterVersion::PARQUET_2_0)
+                .set_compression(Compression::SNAPPY)
+                .set_dictionary_enabled(false)
+                .set_data_page_v2_compression_ratio_threshold(0.001)
+                .build(),
+        );
+        let mut writer = SerializedFileWriter::new(Vec::new(), schema, props).unwrap();
+        let mut group = writer.next_row_group().unwrap();
+        let mut column = group.next_column().unwrap().unwrap();
+        column
+            .typed::<Int32Type>()
+            .write_batch(&[42; 128], None, None)
+            .unwrap();
+        column.close().unwrap();
+        group.close().unwrap();
+        let bytes = Arc::new(Bytes::from(writer.into_inner().unwrap()));
+        let options = ReadOptionsBuilder::new().with_page_index().build();
+        let reader =
+            SerializedFileReader::new_with_options(bytes.as_ref().clone(), options).unwrap();
+        let metadata = reader.metadata();
+        let column = metadata.row_group(0).column(0);
+        let indexed = metadata
+            .page_index_for_row_group(0)
+            .page_locations(0)
+            .unwrap()
+            .clone();
+        assert_eq!(column.compression(), Compression::SNAPPY);
+
+        for locations in [None, Some(indexed)] {
+            let cache = Arc::new(MapPageCache::with_leases());
+            let make = || {
+                SerializedPageReader::new(bytes.clone(), column, 128, locations.clone())
+                    .unwrap()
+                    .with_page_cache(Some(cache.clone()), None)
+            };
+            let page = make().get_next_page().unwrap().unwrap();
+            assert!(matches!(
+                &page,
+                Page::DataPageV2 {
+                    is_compressed: false,
+                    ..
+                }
+            ));
+            let offset = column.data_page_offset() as u64;
+            let cached = cache.probe(offset).expect("V2 page was admitted");
+            assert_eq!(cached.codec(), Compression::SNAPPY);
+            assert_eq!(cached.page().buffer(), page.buffer());
+            assert_ne!(cached.page().buffer().as_ptr(), page.buffer().as_ptr());
+            assert_eq!(
+                make().get_next_page().unwrap().unwrap().buffer().as_ptr(),
+                cached.page().buffer().as_ptr()
+            );
+        }
     }
 
     #[cfg(feature = "arrow")]
