@@ -39,6 +39,7 @@ in `third_party/README.md` and `docs/UPSTREAM_MATRIX.toml`.
 | DV | Apply static Arrow predicate verdicts to selected Parquet rows using DCX index runs | DICTIONARY-CODE-EXECUTION | UPSTREAMABLE |
 | LMS | Materialize selected flat Parquet values with DCX ranks and adapt filter and payload reads per vector | LATE-MATERIALIZED-SCAN | UPSTREAMABLE |
 | DPC | Hook decompressed page caching and atomic page leases into PageIndexProvider and shared fetch planning | SCAN-PAGE-CACHE | UPSTREAMABLE |
+| DOL | Use contiguous loads for ordered Parquet dictionary indices in the full primitive reader | NATIVE-PARQUET-DECODE | UPSTREAMABLE |
 | DRL | Decode dictionary runs and definition levels with register cursors, SIMD lookup and in-place NULL expansion | NATIVE-PARQUET-DECODE | UPSTREAMABLE |
 | NPI | Classify repeated-leaf null pages by value count to preserve valid column indexes | DATA-SKIPPING | UPSTREAMABLE |
 
@@ -375,6 +376,17 @@ Limits that the tests state:
 
 With no handle attached nothing changes. Results never change.
 
+### DOL: ordered dictionary lookup
+
+DOL extends the native primitive reader for Longbow scale-up task 5.10.
+The AVX-512 VBMI decoder samples four blocks of a packed run when the values
+are 64-bit, the dictionary has at least 4,096 entries, and at least 256 output
+slots are available at widths 13 through 17. For each matching block, it
+copies 16 consecutive entries or expands indices within an eight-entry window
+with register permutations. Every block validates its indices and checks the
+chosen layout before loading from the dictionary. Other blocks use the
+existing gather. The window check also bounds the full eight-entry load.
+
 ### DRL: dictionary runs and definition levels
 
 DRL is an UPSTREAMABLE patch family for NATIVE-PARQUET-DECODE (Longbow scale-up
@@ -394,8 +406,9 @@ do not change; NULL slots stay zero, as NEX defined them.
 - **Every bit width is fused.** The AVX-512 VBMI kernel unpacks widths 25 to 32
   into 64-bit lanes; widths 1 to 24 as before. It also takes a last block of
   eight values, so a run of 504 values no longer leaves eight for the scalar
-  path. On AVX-512 hosts AVX2 stays for widths 1 to 16; AVX2-only hosts use
-  it for widths 1 to 24; the scalar path covers CPUs without either.
+  path. AVX2 handles widths 1 through 16 outside the small-dictionary and
+  DOL paths. AVX2-only hosts use it for widths 1 to 24, and the scalar path
+  covers CPUs without either.
 - **Small dictionaries are looked up by permutation**, not gathered: up to 128
   four-byte or 64 eight-byte entries, in eight 64-byte tables, two
   `vpermi2d`/`vpermi2q` per pair and a blend per index bit. IDs are checked

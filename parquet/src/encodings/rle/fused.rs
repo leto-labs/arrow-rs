@@ -57,8 +57,14 @@ pub(super) fn decode<T: 'static>(
         // A dictionary that fits a few registers is looked up with a
         // two-table permutation: it is three times the rate of a gather.
         let small = dict.len() <= SMALL_ENTRIES * 4 / size_of::<T>();
+        // Probe only large 64-bit dictionaries and runs long enough to pay for
+        // the probe. The width band covers the measured ordered ID streams.
+        let ordered = size_of::<T>() == 8
+            && dict.len() >= 4096
+            && out.len() >= 256
+            && (13..=17).contains(&width);
         if allow_avx512
-            && (width >= 17 || small)
+            && (width >= 17 || small || ordered)
             && !cfg!(miri)
             && std::is_x86_feature_detected!("avx512f")
             && std::is_x86_feature_detected!("avx512vbmi")
@@ -66,7 +72,14 @@ pub(super) fn decode<T: 'static>(
             && std::is_x86_feature_detected!("avx512vl")
         {
             let count = (out.len().min(data.len().saturating_mul(8) / width as usize) / 8) * 8;
-            if count >= 8 {
+            if ordered && count >= 256 {
+                // SAFETY: same input, type, and CPU preconditions as the gather below.
+                let ordered = unsafe { avx512_ordered(data, width, dict, &mut out[..count]) };
+                if ordered.is_some() {
+                    return ordered;
+                }
+            }
+            if count >= 8 && (width >= 17 || small) {
                 // SAFETY: feature detection and exact primitive type checks above.
                 // The count fits both the packed input and MaybeUninit output.
                 return Some(unsafe {
@@ -255,6 +268,32 @@ struct Unpack {
 
 #[cfg(target_arch = "x86_64")]
 impl Unpack {
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+    fn new<const WIDE: bool>(width: u8) -> Self {
+        let w = width as usize;
+        let table = &AVX512_UNPACK[w];
+        // SAFETY: each shuffle and shifts array contains 64 readable bytes.
+        unsafe {
+            Self {
+                shuffle: [
+                    _mm512_loadu_si512(table.shuffle[0].as_ptr().cast()),
+                    _mm512_loadu_si512(table.shuffle[1].as_ptr().cast()),
+                ],
+                shifts: [
+                    _mm512_loadu_si512(table.shifts[0].as_ptr().cast()),
+                    _mm512_loadu_si512(table.shifts[1].as_ptr().cast()),
+                ],
+                mask: if WIDE {
+                    _mm512_set1_epi64(((1u64 << width) - 1) as i64)
+                } else {
+                    _mm512_set1_epi32(((1u32 << width) - 1) as i32)
+                },
+                w,
+            }
+        }
+    }
+
     /// The IDs of `lanes` (8 or 16) values packed at `data[start..]`.
     ///
     /// # Safety
@@ -337,26 +376,7 @@ unsafe fn blocks_of<T, const WIDE: bool>(
 ) -> Result<usize> {
     debug_assert!(matches!(size_of::<T>(), 4 | 8) && out.len().is_multiple_of(8));
     let w = width as usize;
-    let table = &AVX512_UNPACK[w];
-    // SAFETY: each shuffle and shifts array contains 64 readable bytes.
-    let unpack = unsafe {
-        Unpack {
-            shuffle: [
-                _mm512_loadu_si512(table.shuffle[0].as_ptr().cast()),
-                _mm512_loadu_si512(table.shuffle[1].as_ptr().cast()),
-            ],
-            shifts: [
-                _mm512_loadu_si512(table.shifts[0].as_ptr().cast()),
-                _mm512_loadu_si512(table.shifts[1].as_ptr().cast()),
-            ],
-            mask: if WIDE {
-                _mm512_set1_epi64(((1u64 << width) - 1) as i64)
-            } else {
-                _mm512_set1_epi32(((1u32 << width) - 1) as i32)
-            },
-            w,
-        }
-    };
+    let unpack = Unpack::new::<WIDE>(width);
     let bound = _mm512_set1_epi32(dict.len() as i32);
     let base = out.as_mut_ptr();
     let mut block = |written: usize, lanes: usize, active: u16| -> Result<()> {
@@ -424,6 +444,103 @@ unsafe fn avx512<T>(
                     base.cast(),
                 );
                 _mm512_mask_storeu_epi32(dst.cast(), active, values);
+            }
+        })
+    }
+}
+
+/// Samples four blocks before trying contiguous loads. A rejected probe
+/// leaves the input and output untouched for the ordinary decoder.
+///
+/// # Safety
+/// As [`blocks`], with width 13..=17, 64-bit values and at least 256 output slots.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+unsafe fn avx512_ordered<T>(
+    data: &[u8],
+    width: u8,
+    dict: &[T],
+    out: &mut [MaybeUninit<T>],
+) -> Option<Result<usize>> {
+    let unpack = Unpack::new::<false>(width);
+    let ramp = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let start = |ids| _mm512_set1_epi32(_mm_cvtsi128_si32(_mm512_castsi512_si128(ids)));
+    let offsets = |ids| _mm512_sub_epi32(ids, start(ids));
+    let fits_window = |delta| _mm512_cmplt_epu32_mask(delta, _mm512_set1_epi32(8)) == u16::MAX;
+    let is_consecutive = |delta| _mm512_cmpeq_epi32_mask(delta, ramp) == u16::MAX;
+    let mut consecutive = true;
+    let mut window = true;
+    // A block near the middle helps distinguish a dense run from a short
+    // ordered prefix. The probe only chooses a lookup strategy.
+    for block in [0, 1, out.len() / 64, out.len() / 32] {
+        // SAFETY: each probe is a full sixteen-value block in the input.
+        let delta =
+            offsets(unsafe { unpack.ids::<false>(data, block * 2 * usize::from(width), 16) });
+        consecutive &= is_consecutive(delta);
+        window &= fits_window(delta);
+        if !consecutive && !window {
+            return None;
+        }
+    }
+    // SAFETY: the same input, types, and output as this function.
+    Some(unsafe {
+        if consecutive {
+            ordered_blocks::<T, false>(data, width, dict, out)
+        } else {
+            ordered_blocks::<T, true>(data, width, dict, out)
+        }
+    })
+}
+
+/// # Safety
+/// As `avx512_ordered`.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+unsafe fn ordered_blocks<T, const WINDOW: bool>(
+    data: &[u8],
+    width: u8,
+    dict: &[T],
+    out: &mut [MaybeUninit<T>],
+) -> Result<usize> {
+    let ramp = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let base = dict.as_ptr();
+    // SAFETY: validated indices from `blocks` and full output slots. Window
+    // loads use an explicit length check as they can include unused entries.
+    unsafe {
+        blocks(data, width, dict, out, |ids, dst, active| {
+            let low_ids = _mm512_castsi512_si256(ids);
+            let first = _mm256_extract_epi32::<0>(low_ids) as usize;
+            if active == u16::MAX {
+                let delta = _mm512_sub_epi32(ids, _mm512_set1_epi32(first as i32));
+                if !WINDOW && _mm512_cmpeq_epi32_mask(delta, ramp) == u16::MAX {
+                    let src = base.add(first).cast();
+                    _mm512_storeu_si512(dst.cast(), _mm512_loadu_si512(src));
+                    _mm512_storeu_si512(dst.add(8).cast(), _mm512_loadu_si512(src.add(1)));
+                    return;
+                }
+                if WINDOW
+                    && _mm512_cmplt_epu32_mask(delta, _mm512_set1_epi32(8)) == u16::MAX
+                    && first + 8 <= dict.len()
+                {
+                    let table = _mm512_loadu_si512(base.add(first).cast());
+                    let low = _mm512_cvtepu32_epi64(_mm512_castsi512_si256(delta));
+                    let high = _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(delta));
+                    _mm512_storeu_si512(dst.cast(), _mm512_permutexvar_epi64(low, table));
+                    _mm512_storeu_si512(dst.add(8).cast(), _mm512_permutexvar_epi64(high, table));
+                    return;
+                }
+            }
+            _mm512_storeu_si512(
+                dst.cast(),
+                _mm512_i32gather_epi64::<8>(low_ids, base.cast()),
+            );
+            if active == u16::MAX {
+                let high_ids = _mm512_extracti64x4_epi64::<1>(ids);
+                _mm512_storeu_si512(
+                    dst.add(8).cast(),
+                    _mm512_i32gather_epi64::<8>(high_ids, base.cast()),
+                );
             }
         })
     }
@@ -512,6 +629,61 @@ unsafe fn avx512_small<T>(
 mod tests {
     use super::*;
     use crate::util::bit_util::BitReader;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_ordered_lookup_revalidates_after_sampling() {
+        if cfg!(miri)
+            || !std::is_x86_feature_detected!("avx512f")
+            || !std::is_x86_feature_detected!("avx512bw")
+            || !std::is_x86_feature_detected!("avx512vl")
+            || !std::is_x86_feature_detected!("avx512vbmi")
+        {
+            return;
+        }
+        for width in 13..=17 {
+            let dict: Vec<_> = (0..4999)
+                .map(|i| f64::from_bits(0x7ff8_0000_0000_0000 + i))
+                .collect();
+            for window in [false, true] {
+                let mut ids: Vec<u32> = (0..504)
+                    .map(|i| if window { 123 + i / 4 } else { 123 + i })
+                    .collect();
+                // The probe misses the last complete block. These valid IDs
+                // require a gather, including a window near the dictionary end.
+                for (i, id) in ids[480..496].iter_mut().enumerate() {
+                    *id = if window { 4994 + i as u32 / 4 } else { 77 };
+                }
+                let mut out = [MaybeUninit::uninit(); 505];
+                out[504].write(-0.0);
+                let data = packed(&ids, width);
+                // SAFETY: features checked above, exact 64-bit primitive,
+                // and packed input and output each fit 504 values.
+                let result = unsafe { avx512_ordered(&data, width as u8, &dict, &mut out[..504]) };
+                assert_eq!(result.unwrap().unwrap(), 504);
+                for (value, id) in out[..504].iter().zip(&ids) {
+                    // SAFETY: successful decode initialized every value.
+                    assert_eq!(
+                        unsafe { value.assume_init() }.to_bits(),
+                        dict[*id as usize].to_bits()
+                    );
+                }
+                // SAFETY: initialized before decoding.
+                assert_eq!(
+                    unsafe { out[504].assume_init() }.to_bits(),
+                    (-0.0f64).to_bits()
+                );
+
+                // Out-of-range IDs in the last half-block must fail before
+                // reading either a full table or a gathered lane.
+                ids[503] = dict.len() as u32;
+                let data = packed(&ids, width);
+                // SAFETY: as above. The kernel validates all active IDs.
+                let result = unsafe { avx512_ordered(&data, width as u8, &dict, &mut out[..504]) };
+                assert!(result.unwrap().is_err());
+            }
+        }
+    }
 
     // Independent little-endian bit writer, including the full unsigned range.
     fn packed(ids: &[u32], width: usize) -> Vec<u8> {

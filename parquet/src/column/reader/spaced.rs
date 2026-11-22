@@ -468,6 +468,74 @@ mod tests {
     }
 
     #[test]
+    fn test_spaced_dictionary_ordered_and_mixed_widths() {
+        use crate::encodings::rle::{RleDecoder, RleEncoder};
+        use bytes::Bytes;
+
+        crate::util::native::dispatch::for_each_tier(|| {
+            for width in 1..=32 {
+                let length = (1usize << width.min(13)).min(5111);
+                let dictionary: Vec<_> = (0..length)
+                    .map(|i| (i as i64 + 1).wrapping_mul(-0x3182_af69_e8b2))
+                    .collect();
+                for pattern in 0..3 {
+                    for batches in [[1301, 1033], [57, 2277]] {
+                        let rows = batches.iter().sum::<usize>();
+                        let offset = 5;
+                        let mut bitmap = vec![0; (offset + rows).div_ceil(8)];
+                        let mut encoder = RleEncoder::new(width, rows * 4 + 64);
+                        let mut expected = Vec::with_capacity(rows);
+                        let mut physical = 0;
+                        for row in 0..rows {
+                            if (row * 37 + 11) % 101 < 27 {
+                                expected.push(0);
+                                continue;
+                            }
+                            let id = match pattern {
+                                0 => physical % length,
+                                1 => (physical / 4) % length,
+                                _ => (physical * 37) % length,
+                            };
+                            expected.push(dictionary[id]);
+                            encoder.put(id as u64);
+                            physical += 1;
+                            let bit = offset + row;
+                            bitmap[bit / 8] |= 1 << (bit % 8);
+                        }
+                        let mut decoder = RleDecoder::new(width);
+                        decoder.set_data(Bytes::from(encoder.consume())).unwrap();
+                        let mut out = vec![i64::MIN];
+                        let mut at = 0;
+                        for count in batches {
+                            let nonnull = expected[at..at + count]
+                                .iter()
+                                .filter(|&&value| value != 0)
+                                .count();
+                            assert_eq!(
+                                read(
+                                    &mut out,
+                                    nonnull,
+                                    count,
+                                    &bitmap,
+                                    offset + at,
+                                    |dst, want| {
+                                        decoder.append_dictionary(&dictionary, dst, want)
+                                    }
+                                )
+                                .unwrap(),
+                                nonnull
+                            );
+                            at += count;
+                        }
+                        assert_eq!(out[0], i64::MIN);
+                        assert_eq!(&out[1..], expected, "width {width}, pattern {pattern}");
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
     fn test_spaced_rejects_bad_extents_and_short_reads() {
         crate::util::native::dispatch::for_each_tier(|| {
             let mut out = vec![-17i64, 42];
