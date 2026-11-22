@@ -34,13 +34,13 @@ pub enum LightKind {
 
 /// Integer values of a light page. A page uses full blocks followed by at most
 /// one short block. The page owns the validity bitmap separately.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct LightBlock {
     pub(super) len: usize,
     pub(super) values: Values,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum Values {
     Constant(i64),
     Packed(Frame),
@@ -51,7 +51,7 @@ pub(super) enum Values {
 /// index `r * lanes + l`, the offset starts at bit `r * width` of lane `l`.
 /// Word `k` of that lane is at index `k * lanes + l`. The last word group
 /// is zero-padded. Short frames keep the same lane stride.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(super) struct Frame {
     pub(super) len: usize,
     pub(super) base: i64,
@@ -59,7 +59,7 @@ pub(super) struct Frame {
     pub(super) words: Words,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum Words {
     Narrow(Box<[u32]>),
     Wide(Box<[u64]>),
@@ -68,10 +68,10 @@ pub(super) enum Words {
 /// Light codes preserve the original Parquet dictionary indices. Their
 /// interleaved frame-of-reference layout is distinct from the eight-code
 /// groups of Parquet's hybrid RLE encoding.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct LightCodeBlock {
     pub(super) block: LightBlock,
-    pub(super) all_null: bool,
+    pub(super) max_code: Option<u32>,
 }
 
 /// An invalid kernel input.
@@ -83,6 +83,8 @@ pub enum LightError {
     ValidityLength,
     /// An output slice is too short for the block.
     OutputLength,
+    /// An integer value does not fit the requested output type.
+    ValueOutOfRange,
     /// A valid code is outside the supplied dictionary.
     DictionaryIndex,
 }
@@ -93,6 +95,7 @@ impl std::fmt::Display for LightError {
             Self::BlockLength => "light block must contain 1 through 1,024 values",
             Self::ValidityLength => "light validity bitmap has the wrong length",
             Self::OutputLength => "light output has fewer slots than the block",
+            Self::ValueOutOfRange => "light integer does not fit INT32",
             Self::DictionaryIndex => "light code is outside the dictionary",
         })
     }

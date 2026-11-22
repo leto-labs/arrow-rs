@@ -42,8 +42,13 @@ mod tests {
     #[test]
     fn frames_match_input_at_every_width() {
         let mut state = 0xa826_7d81_aeff_26cd;
+        let lengths: &[usize] = if cfg!(miri) {
+            &[2, 33]
+        } else {
+            &[2, 17, 33, 127, 1023, BLOCK_LEN]
+        };
         for width in 1..=64 {
-            for len in [2, 17, 33, 127, 1023, BLOCK_LEN] {
+            for &len in lengths {
                 for pattern in 0..5 {
                     let base = i64::MIN + (random(&mut state) % 4096) as i64;
                     let base = if width == 64 { i64::MIN } else { base };
@@ -59,7 +64,7 @@ mod tests {
                             1 => false,
                             2 => i % 2 == 0,
                             3 => i % 51 < 31,
-                            _ => random(&mut state) % 3 == 0,
+                            _ => random(&mut state).is_multiple_of(3),
                         })
                         .collect();
                     let mut valid = valid;
@@ -79,6 +84,11 @@ mod tests {
                     }
                     let validity = (pattern != 0).then_some(bitmap.as_slice());
                     let block = LightBlock::pack(&input, validity).unwrap();
+                    #[cfg(not(miri))]
+                    assert_eq!(block, LightBlock::pack_scalar(&input, validity).unwrap());
+                    if len == BLOCK_LEN && pattern == 0 {
+                        assert_eq!(block.kind(), LightKind::Packed(width));
+                    }
                     let mut scalar = vec![9; len + 2];
                     let mut dispatched = scalar.clone();
                     block.decode_scalar_into(&mut scalar).unwrap();
@@ -146,6 +156,15 @@ mod tests {
         let mut output = [0; 7];
         block.decode_into(&mut output).unwrap();
         assert_eq!(output, input.map(i64::from));
+        let mut narrow = [0; 7];
+        block.decode_i32_into(&mut narrow).unwrap();
+        assert_eq!(narrow, input);
+        assert_eq!(
+            LightBlock::pack(&[i64::MAX], None)
+                .unwrap()
+                .decode_i32_into(&mut narrow),
+            Err(LightError::ValueOutOfRange)
+        );
 
         let codes = [u32::MAX, 4, 2, 4, 3, 5, 5];
         let validity = [0xfe];
@@ -164,6 +183,27 @@ mod tests {
         let all_null = LightCodeBlock::pack(&codes, Some(&[0]), 0).unwrap();
         all_null.decode_views(&[], &mut views).unwrap();
         assert_eq!(views, [0; 7]);
+    }
+
+    #[test]
+    fn light_code_words_interleave_rows_and_use_the_frame_base() {
+        let codes: [u32; 64] = std::array::from_fn(|i| {
+            let lane = (i % 4) as u32;
+            97 + if i < 32 { lane } else { 3 - lane }
+        });
+        let light = LightCodeBlock::pack(&codes, None, 101).unwrap();
+        let format::Values::Packed(frame) = &light.block.values else {
+            panic!("expected a frame")
+        };
+        let format::Words::Narrow(words) = &frame.words else {
+            panic!("expected 32-bit words")
+        };
+        assert_eq!(frame.base, 97);
+        assert_eq!(frame.width, 2);
+        assert_eq!(&words[..4], &[0b1100, 0b1001, 0b0110, 0b0011]);
+        let mut decoded = [0; 64];
+        light.decode_into(&mut decoded).unwrap();
+        assert_eq!(decoded, codes);
     }
 
     #[test]
