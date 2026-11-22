@@ -159,8 +159,10 @@ zero-width runs can still take substantial decode work.
 DPC is a hook for an engine-owned decompressed page cache; Parquet owns neither
 the cache budget nor eviction. The hook is attached to metadata for a file
 generation and reworked onto Arrow 60's `PageIndexProvider` and shared fetch
-planning. Complete column residency can omit compressed, unencrypted fetches;
-partial, uncompressed and encrypted cases keep the cold path. Atomic page leases
+planning. Complete column residency can omit fetches for unencrypted chunks,
+including uncompressed chunks. A fill copies each uncompressed page body out
+of its fetched range, so the charge covers the memory the page retains.
+Partial residency and encrypted chunks use source reads. Atomic page leases
 keep planned hits resident through decode and reclamation, with memory ownership
 in Longbow. Failed hit checks fall back to cold reads. Cached pages have already
 passed header and checksum checks; cache identity, integrity and lease lifetime
@@ -357,10 +359,12 @@ index load, keeps it.
 
 Limits that the tests state:
 
-- Only compressed, unencrypted column chunks use the cache. The buffer of an
-  uncompressed page is a slice of the fetched chunk, so caching it would keep
-  the chunk alive and save no decompression. A reader that decodes page
-  statistics (`ReaderProperties::read_page_stats`) does not use it either.
+- Unencrypted column chunks can use the cache. An uncompressed chunk keeps
+  its on-disk value encoding, with an independent copy of each page body
+  offered on a fill ticket. A Data Page V2 stored uncompressed inside a
+  compressed chunk can enter the cache when dictionary-to-PLAIN conversion
+  gives it an owned body. Readers that decode page statistics
+  (`ReaderProperties::read_page_stats`) bypass the cache.
 - A cached page passed the reader's header parse and CRC when it was filled.
   A hit repeats neither, but it repeats the placement checks (codec of the
   column chunk, fit in the chunk, offset-index length and page kind); see the
