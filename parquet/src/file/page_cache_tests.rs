@@ -201,19 +201,29 @@ fn a_resident_page_needs_no_file_bytes() {
 
 #[test]
 fn offset_index_and_sequential_readers_share_pages() {
+    for compression in [Compression::SNAPPY, Compression::UNCOMPRESSED] {
+        check_shared_pages(compression);
+    }
+}
+
+fn check_shared_pages(compression: Compression) {
     // A page has one key, the offset of its header, and one stored length,
     // whichever reader filled it: the reader that walks the offset index or
     // the reader that steps from header to header.
     for version in [WriterVersion::PARQUET_1_0, WriterVersion::PARQUET_2_0] {
-        let file = file(version, Compression::SNAPPY);
+        let file = file(version, compression);
         for filled_with_index in [true, false] {
             let filler = metadata(&file, filled_with_index);
             let reader_metadata = metadata(&file, !filled_with_index);
             let cache = Arc::new(MapPageCache::default());
             let handle: Arc<dyn PageCache> = cache.clone();
             let source = Arc::new(file.clone());
+            let source_start = file.as_ptr().addr();
+            let source_addresses = source_start..source_start + file.len();
+            let mut total_pages = 0;
             for (group, column) in chunks(&filler) {
                 let expected = pages(reader(Arc::clone(&source), &filler, group, column, None));
+                total_pages += expected.len();
                 let filled = pages(reader(
                     Arc::clone(&source),
                     &filler,
@@ -224,15 +234,19 @@ fn offset_index_and_sequential_readers_share_pages() {
                 assert_eq!(filled, expected);
                 // The other kind of reader finds every page, with no bytes.
                 let empty = Arc::new(NoBytes(file.len() as u64));
-                let other = pages(reader(
-                    empty,
-                    &reader_metadata,
-                    group,
-                    column,
-                    Some(handle.clone()),
-                ));
+                let mut warm = reader(empty, &reader_metadata, group, column, Some(handle.clone()));
+                let mut other = vec![];
+                while let Some(page) = warm.get_next_page().unwrap() {
+                    assert!(
+                        !source_addresses.contains(&page.buffer().as_ptr().addr()),
+                        "the cache retains an entire fetch buffer for one page"
+                    );
+                    other.push(fingerprint(&page));
+                }
                 assert_eq!(other, expected, "filled with index: {filled_with_index}");
             }
+            assert_eq!(cache.fills.load(Ordering::Relaxed), total_pages);
+            assert_eq!(cache.hits.load(Ordering::Relaxed), total_pages);
             // The push decoder of the other kind fetches nothing either.
             let plain = Arc::new(reader_metadata.clone());
             let cached = Arc::new(reader_metadata.with_page_cache(Some(handle)));
@@ -241,30 +255,6 @@ fn offset_index_and_sequential_readers_share_pages() {
             assert_eq!(actual, expected);
             assert_eq!(fetched, vec![], "filled with index: {filled_with_index}");
         }
-    }
-}
-
-#[test]
-fn an_uncompressed_chunk_is_not_cached() {
-    let file = file(WriterVersion::PARQUET_1_0, Compression::UNCOMPRESSED);
-    for page_index in [false, true] {
-        let metadata = metadata(&file, page_index);
-        let cache = Arc::new(MapPageCache::default());
-        let source = Arc::new(file.clone());
-        for (group, column) in chunks(&metadata) {
-            let expected = pages(reader(Arc::clone(&source), &metadata, group, column, None));
-            let handle: Arc<dyn PageCache> = cache.clone();
-            let read = pages(reader(
-                Arc::clone(&source),
-                &metadata,
-                group,
-                column,
-                Some(handle),
-            ));
-            assert_eq!(read, expected);
-        }
-        assert_eq!(cache.len(), 0);
-        assert_eq!(cache.misses.load(Ordering::Relaxed), 0);
     }
 }
 

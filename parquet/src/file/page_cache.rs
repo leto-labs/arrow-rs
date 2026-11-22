@@ -60,9 +60,9 @@
 //! read or a [`ParquetError`](crate::errors::ParquetError), not a wrong
 //! result.
 //!
-//! Only pages of compressed, unencrypted column chunks are cached. The buffer
-//! of an uncompressed page is a slice of the fetched column chunk, so caching
-//! it would keep the whole chunk alive and save no decompression.
+//! Only pages of unencrypted column chunks are cached. A page of an
+//! uncompressed chunk is copied on fill so the cache keeps and charges
+//! just its body, independently of the fetched chunk.
 //!
 //! # Planning reads with the cache
 //!
@@ -146,6 +146,17 @@ impl CachedPage {
             dictionary_marker: false,
             validity: None,
         }
+    }
+
+    /// Copies a body that may be a slice of a larger fetch buffer.
+    pub(crate) fn with_owned_body(mut self) -> Self {
+        let buf = match &mut self.page {
+            Page::DataPage { buf, .. }
+            | Page::DataPageV2 { buf, .. }
+            | Page::DictionaryPage { buf, .. } => buf,
+        };
+        *buf = bytes::Bytes::copy_from_slice(buf);
+        self
     }
 
     /// Offers the page to a fill ticket, with optional flat nullable validity.
@@ -571,20 +582,18 @@ pub trait PageCache: Debug + Send + Sync {
 }
 
 /// Whether the pages of a column chunk can be in the page cache: the chunk
-/// is compressed and not encrypted, and its reader does not decode page
+/// is not encrypted, and its reader does not decode page
 /// statistics (`ReaderProperties::read_page_stats`). The page reader and the
 /// push decoder's fetch planning both decide with this function.
 ///
-/// The buffer of an uncompressed page is a slice of the fetched chunk, so
-/// caching it would keep the chunk alive and save no decompression. The
-/// decrypted pages of an encrypted chunk must not reach memory that other
+/// The decrypted pages of an encrypted chunk must not reach memory that other
 /// readers share. A cached page has no statistics.
-pub(crate) fn page_cache_applies(column: &ColumnChunkMetaData, read_page_stats: bool) -> bool {
+pub(crate) fn page_cache_applies(_column: &ColumnChunkMetaData, read_page_stats: bool) -> bool {
     #[cfg(feature = "encryption")]
-    if column.crypto_metadata().is_some() {
+    if _column.crypto_metadata().is_some() {
         return false;
     }
-    column.compression() != Compression::UNCOMPRESSED && !read_page_stats
+    !read_page_stats
 }
 
 /// The pages of one column chunk that fetch planning took from a

@@ -663,7 +663,7 @@ pub struct SerializedPageReader<R: ChunkReader> {
     context: SerializedPageReaderContext,
 
     /// The decompressed page cache of this file, when the column chunk is
-    /// compressed and not encrypted. See [`crate::file::page_cache`].
+    /// eligible. See [`crate::file::page_cache`].
     page_cache: Option<PageCacheReader>,
 
     /// The codec of the column chunk if its pages can be cached
@@ -783,8 +783,7 @@ impl PageCacheReader {
     }
 }
 
-/// Whether `decode_page` decompresses the body of this page into a buffer of
-/// its own. Only such a page is offered to the page cache.
+/// Whether a V2 page in a compressed chunk uses the chunk's codec.
 fn page_body_is_compressed(header: &PageHeader) -> bool {
     header
         .data_page_header_v2
@@ -803,6 +802,14 @@ fn publish_page(
     plain_chunk: Option<&mut PlainChunk>,
     flat_nullable: bool,
 ) -> Page {
+    if codec == Compression::UNCOMPRESSED {
+        if let Some(fill) = fill {
+            CachedPage::new(page.clone(), stored_len, codec)
+                .with_owned_body()
+                .publish(fill, flat_nullable);
+        }
+        return page;
+    }
     if let Some(chunk) = plain_chunk {
         if page.is_dictionary_page() {
             let plain = chunk.observe_dictionary(&page);
@@ -1022,7 +1029,9 @@ impl<R: ChunkReader> SerializedPageReader<R> {
             physical_type: meta.column_type(),
             context,
             page_cache: None,
-            plain_chunk: PlainChunk::new(meta),
+            plain_chunk: (meta.compression() != Compression::UNCOMPRESSED)
+                .then(|| PlainChunk::new(meta))
+                .flatten(),
             flat_nullable: meta.column_descr().max_rep_level() == 0
                 && meta.column_descr().max_def_level() == 1
                 && meta.column_descr().path().parts().len() == 1,
@@ -1035,9 +1044,8 @@ impl<R: ChunkReader> SerializedPageReader<R> {
     /// file. `pinned` holds the pages that fetch planning already took from
     /// the cache.
     ///
-    /// The cache is used only where [`page_cache_applies`]: not for an
-    /// uncompressed chunk, an encrypted chunk or a reader that decodes page
-    /// statistics. Fetch planning decides with the same function.
+    /// The cache is used only where [`page_cache_applies`]. Fetch planning
+    /// decides with the same function.
     #[cfg(feature = "arrow")]
     pub(crate) fn with_page_cache(
         mut self,
@@ -1956,9 +1964,8 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                     read_page_header_len_from_bytes(&self.context, buffer.as_ref(), 0, true)?;
                 let bytes = buffer.slice(offset..);
                 let bytes = self.context.decrypt_page_data(bytes, 0, true)?;
-                let cacheable = fill.is_some()
-                    && page_body_is_compressed(&header)
-                    && location_matches_header(offset, &header, page_len);
+                let fill = fill.filter(|_| location_matches_header(offset, &header, page_len));
+                let owns_buffer = fill.is_some() && page_body_is_compressed(&header);
                 let page = decode_page(
                     header,
                     bytes,
@@ -1967,7 +1974,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                 )?;
                 publish_page(
                     fill,
-                    cacheable,
+                    owns_buffer,
                     page,
                     page_len as u64,
                     codec,
