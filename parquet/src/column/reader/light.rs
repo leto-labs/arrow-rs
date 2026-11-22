@@ -75,25 +75,33 @@ impl LightDecoder {
             return Err(general_err!("light string reader received numeric values"));
         };
         let start = output.len();
-        if self.page.validity.as_ref().is_some_and(|v| v.nulls != 0) {
-            // Apply validity before looking up the code. NULL placeholders
-            // are not dictionary indices to consume.
+        if let Some(validity) = &self.page.validity
+            && validity.nulls != 0
+        {
+            // Unpack the block once, then apply validity before touching
+            // the dictionary. Code consumers that need one row at a time
+            // borrow the native Interleaved run instead.
+            let mut codes = [0; BLOCK_LEN];
             let mut row = self.rows.start;
             while row < self.rows.end {
                 let block = row / BLOCK_LEN;
                 let first = block * BLOCK_LEN;
-                let run = blocks[block].code_run();
-                let end = (first + run.len()).min(self.rows.end);
-                while row < end {
-                    if self.page.is_valid(row) {
-                        let view = run
-                            .code_at(row - first)
-                            .and_then(|key| dictionary.get(key as usize))
-                            .ok_or_else(|| general_err!("invalid light string dictionary key"))?;
-                        output.push(*view);
-                    }
-                    row += 1;
+                let block = &blocks[block];
+                let end = (first + block.len()).min(self.rows.end);
+                if block
+                    .max_code()
+                    .is_some_and(|key| key as usize >= dictionary.len())
+                {
+                    return Err(general_err!("invalid light string dictionary key"));
                 }
+                block.decode_into(&mut codes).map_err(light_error)?;
+                let valid = &validity.bits;
+                output.extend(
+                    (row..end)
+                        .filter(|&row| valid[row / 8] & (1 << (row % 8)) != 0)
+                        .map(|row| dictionary[codes[row - first] as usize]),
+                );
+                row = end;
             }
         } else {
             self.read_blocks(
