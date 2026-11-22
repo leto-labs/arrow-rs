@@ -20,9 +20,7 @@
 //! Offline light-page block kernels. A page keeps its validity and chunk
 //! dictionary separately from these blocks.
 //!
-//! A packed NULL slot has the block base. A run absorbs NULLs up to the next
-//! distinct valid value, with leading NULLs in the first run. The validity
-//! bitmap is authoritative in both cases.
+//! A packed NULL slot holds the block base. The validity bitmap is authoritative.
 
 mod format;
 mod pack;
@@ -100,52 +98,44 @@ mod tests {
                         "width {width}, length {len}, pattern {pattern}"
                     );
                     assert_eq!(&scalar[len..], &[9, 9]);
-                    if block.kind() != LightKind::Runs {
-                        assert_eq!(
-                            &scalar[..len],
-                            &expected,
-                            "width {width}, length {len}, pattern {pattern}"
-                        );
-                        assert_eq!(
-                            block.kind(),
-                            if pattern == 1 {
-                                LightKind::Constant
-                            } else {
-                                LightKind::Packed(width)
-                            }
-                        );
-                    } else {
-                        for (i, value) in scalar[..len].iter().enumerate() {
-                            if valid[i] {
-                                assert_eq!(*value, expected[i]);
-                            }
+                    assert_eq!(
+                        &scalar[..len],
+                        &expected,
+                        "width {width}, length {len}, pattern {pattern}"
+                    );
+                    assert_eq!(
+                        block.kind(),
+                        if pattern == 1 {
+                            LightKind::Constant
+                        } else {
+                            LightKind::Packed(width)
                         }
-                    }
+                    );
                 }
             }
         }
     }
 
     #[test]
-    fn nulls_keep_the_enclosing_run_and_do_not_change_its_end() {
-        let mut input = [i64::MAX; BLOCK_LEN];
-        let mut bitmap = [0xEE; BLOCK_LEN / 8];
-        for (index, value) in input.iter_mut().enumerate() {
-            if bitmap[index / 8] & (1 << (index % 8)) != 0 {
-                *value = if index < 511 { -13 } else { 17 };
-            }
-        }
-        // The first valid value of the second run occurs at 511. The NULL
-        // slot at 508 remains in the first run, and leading NULLs join it.
-        let mut output = [0; BLOCK_LEN];
+    fn nulls_hold_the_frame_base_even_after_the_value_changes() {
+        let input = std::array::from_fn::<_, BLOCK_LEN, _>(|row| if row < 511 { -13 } else { 17 });
+        let bitmap = [0xEE; BLOCK_LEN / 8];
         let block = LightBlock::pack(&input, Some(&bitmap)).unwrap();
-        assert_eq!(block.kind(), LightKind::Runs);
+        assert_eq!(block.kind(), LightKind::Packed(5));
+        let mut output = [0; BLOCK_LEN];
         block.decode_into(&mut output).unwrap();
-        assert_eq!(output[..511], [-13; 511]);
-        assert_eq!(output[511..], [17; BLOCK_LEN - 511]);
+        for (row, &value) in output.iter().enumerate() {
+            assert_eq!(
+                value,
+                if row.is_multiple_of(4) {
+                    -13
+                } else {
+                    input[row]
+                }
+            );
+        }
 
-        bitmap.fill(0);
-        let all_null = LightBlock::pack(&input, Some(&bitmap)).unwrap();
+        let all_null = LightBlock::pack(&input, Some(&[0; BLOCK_LEN / 8])).unwrap();
         assert_eq!(all_null.kind(), LightKind::Constant);
         all_null.decode_into(&mut output).unwrap();
         assert_eq!(output, [0; BLOCK_LEN]);

@@ -36,9 +36,9 @@ fn valid(validity: Option<&[u8]>, index: usize) -> bool {
 }
 
 impl LightBlock {
-    /// Pack signed logical slots using the smallest encoding. Set bits in
+    /// Pack signed logical slots as a constant or a frame. Set bits in
     /// `validity` name values, least-significant bit first, starting at row 0.
-    /// A NULL slot's input value is ignored. Ties favor frame of reference.
+    /// A NULL slot's input value is ignored and stores the frame base.
     pub fn pack(input: &[i64], validity: Option<&[u8]>) -> Result<Self, LightError> {
         check_input(input.len(), validity)?;
         Ok(Self::pack_impl(input, validity, Frame::pack, dense_stats))
@@ -69,45 +69,19 @@ impl LightBlock {
         input: &[i64],
         validity: Option<&[u8]>,
         pack: PackFrame,
-        stats: fn(&[i64]) -> (i64, i64, usize, usize),
+        stats: fn(&[i64]) -> (i64, i64),
     ) -> Self {
         let len = input.len();
-        let (min, max, run_count, first_end) = if let Some(bitmap) = validity {
+        let (min, max) = if let Some(bitmap) = validity {
             nullable_stats(input, bitmap)
         } else {
             stats(input)
         };
 
-        let values = if run_count == 0 {
-            Values::Constant(0)
-        } else if run_count == 1 {
-            Values::Constant(min)
+        let values = if min >= max {
+            Values::Constant(if min == max { min } else { 0 })
         } else {
-            let width = Frame::width(min, max);
-            let end_width = Frame::width(first_end as i64, len as i64);
-            if Frame::bytes(run_count, width) + Frame::bytes(run_count, end_width)
-                < Frame::bytes(len, width)
-            {
-                let mut run_values = [0; BLOCK_LEN];
-                let mut ends = [0; BLOCK_LEN];
-                let mut runs = 0;
-                for (index, &value) in input.iter().enumerate() {
-                    if valid(validity, index) && (runs == 0 || run_values[runs - 1] != value) {
-                        if runs > 0 {
-                            ends[runs - 1] = index as i64;
-                        }
-                        run_values[runs] = value;
-                        runs += 1;
-                    }
-                }
-                ends[runs - 1] = len as i64;
-                Values::Runs {
-                    values: pack(&run_values[..runs], None, min, width),
-                    ends: pack(&ends[..runs], None, first_end as i64, end_width),
-                }
-            } else {
-                Values::Packed(pack(input, validity, min, width))
-            }
+            Values::Packed(pack(input, validity, min, Frame::width(min, max)))
         };
         Self { len, values }
     }
@@ -147,57 +121,34 @@ impl LightCodeBlock {
 
 type PackFrame = fn(&[i64], Option<&[u8]>, i64, u8) -> Frame;
 
-fn dense_stats(input: &[i64]) -> (i64, i64, usize, usize) {
+fn dense_stats(input: &[i64]) -> (i64, i64) {
     #[cfg(all(target_arch = "x86_64", not(miri)))]
     if input.len() >= 32 && input.len().is_multiple_of(8) && is_x86_feature_detected!("avx512f") {
         // SAFETY: AVX-512F is available and every chunk contains eight values.
-        let (min, max, count) = unsafe { avx512::dense_stats(input) };
-        let first_end = input.iter().take_while(|&&value| value == input[0]).count();
-        return (min, max, count, first_end);
+        return unsafe { avx512::dense_stats(input) };
     }
 
     dense_scalar_stats(input)
 }
 
-fn dense_scalar_stats(input: &[i64]) -> (i64, i64, usize, usize) {
-    let (min, max) = input
+fn dense_scalar_stats(input: &[i64]) -> (i64, i64) {
+    input
         .iter()
         .fold((i64::MAX, i64::MIN), |(min, max), &value| {
             (min.min(value), max.max(value))
-        });
-    if min == max {
-        return (min, max, 1, input.len());
-    }
-    let count = 1 + input[..input.len() - 1]
-        .iter()
-        .zip(&input[1..])
-        .map(|(left, right)| usize::from(left != right))
-        .sum::<usize>();
-    let first_end = input.iter().take_while(|&&value| value == input[0]).count();
-    (min, max, count, first_end)
+        })
 }
 
-fn nullable_stats(input: &[i64], validity: &[u8]) -> (i64, i64, usize, usize) {
+fn nullable_stats(input: &[i64], validity: &[u8]) -> (i64, i64) {
     let mut min = i64::MAX;
     let mut max = i64::MIN;
-    let mut previous = None;
-    let mut count = 0;
-    let mut first_end = 0;
     for (index, &value) in input.iter().enumerate() {
-        if !valid(Some(validity), index) {
-            continue;
-        }
-        min = min.min(value);
-        max = max.max(value);
-        if previous != Some(value) {
-            if count == 1 {
-                first_end = index;
-            }
-            previous = Some(value);
-            count += 1;
+        if valid(Some(validity), index) {
+            min = min.min(value);
+            max = max.max(value);
         }
     }
-    (min, max, count, first_end)
+    (min, max)
 }
 
 impl Frame {
@@ -255,25 +206,16 @@ mod avx512 {
     use super::{Frame, Words};
 
     #[target_feature(enable = "avx512f")]
-    pub(super) unsafe fn dense_stats(input: &[i64]) -> (i64, i64, usize) {
+    pub(super) unsafe fn dense_stats(input: &[i64]) -> (i64, i64) {
         let mut min = _mm512_set1_epi64(i64::MAX);
         let mut max = _mm512_set1_epi64(i64::MIN);
-        let mut prior = _mm512_set1_epi64(input[0]);
-        let mut count = 1;
         for chunk in input.as_chunks::<8>().0 {
             // SAFETY: The chunk contains exactly eight initialized i64s.
             let next = unsafe { _mm512_loadu_si512(chunk.as_ptr().cast()) };
             min = _mm512_min_epi64(min, next);
             max = _mm512_max_epi64(max, next);
-            let predecessor = _mm512_alignr_epi64::<7>(next, prior);
-            count += _mm512_cmpneq_epi64_mask(next, predecessor).count_ones() as usize;
-            prior = next;
         }
-        (
-            _mm512_reduce_min_epi64(min),
-            _mm512_reduce_max_epi64(max),
-            count,
-        )
+        (_mm512_reduce_min_epi64(min), _mm512_reduce_max_epi64(max))
     }
 
     /// AVX-512F and complete rows are required. A supplied bitmap must cover

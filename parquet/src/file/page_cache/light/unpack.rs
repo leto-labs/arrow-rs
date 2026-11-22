@@ -48,18 +48,6 @@ impl LightBlock {
         match &self.values {
             Values::Constant(base) => out.fill(*base),
             Values::Packed(frame) => unpack(frame, out),
-            Values::Runs { values, ends } => {
-                let mut run_values = [0; BLOCK_LEN];
-                let mut run_ends = [0; BLOCK_LEN];
-                unpack(values, &mut run_values[..values.len]);
-                unpack(ends, &mut run_ends[..ends.len]);
-                let mut start = 0;
-                for (&value, &end) in run_values[..values.len].iter().zip(&run_ends) {
-                    let end = end as usize;
-                    out[start..end].fill(value);
-                    start = end;
-                }
-            }
         }
         Ok(())
     }

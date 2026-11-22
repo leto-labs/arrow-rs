@@ -30,8 +30,6 @@ pub enum LightKind {
     Constant,
     /// Frame of reference over signed values, with unsigned offsets.
     Packed(u8),
-    /// Frame of reference over the values and exclusive ends of the runs.
-    Runs,
 }
 
 /// Integer values of a light page. A page uses full blocks followed by at most
@@ -46,7 +44,6 @@ pub struct LightBlock {
 pub(super) enum Values {
     Constant(i64),
     Packed(Frame),
-    Runs { values: Frame, ends: Frame },
 }
 
 /// A frame stores little-endian *bit order* in native words. For a logical
@@ -121,7 +118,6 @@ impl LightBlock {
         match &self.values {
             Values::Constant(_) => LightKind::Constant,
             Values::Packed(frame) => LightKind::Packed(frame.width),
-            Values::Runs { .. } => LightKind::Runs,
         }
     }
 
@@ -132,7 +128,6 @@ impl LightBlock {
             + match &self.values {
                 Values::Constant(_) => 0,
                 Values::Packed(frame) => frame.words.bytes(),
-                Values::Runs { values, ends } => values.words.bytes() + ends.words.bytes(),
             }
     }
 }
@@ -144,15 +139,6 @@ impl Frame {
 
     pub(super) fn word_count(len: usize, width: usize, lanes: usize, bits: usize) -> usize {
         (len.div_ceil(lanes) * width).div_ceil(bits) * lanes
-    }
-
-    pub(super) fn bytes(len: usize, width: u8) -> usize {
-        let width = usize::from(width);
-        if width <= 32 {
-            Self::word_count(len, width, 32, 32) * size_of::<u32>()
-        } else {
-            Self::word_count(len, width, 16, 64) * size_of::<u64>()
-        }
     }
 }
 
