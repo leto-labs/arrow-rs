@@ -32,6 +32,9 @@ use crate::util::bit_util::num_required_bits;
 #[cfg(feature = "arrow")]
 pub(crate) mod code_page;
 
+use crate::file::page_cache::LightDataPage;
+use std::sync::Arc;
+
 /// Decodes level data
 pub trait ColumnLevelDecoder {
     type Buffer;
@@ -78,6 +81,11 @@ pub trait DefinitionLevelDecoder: ColumnLevelDecoder {
         _validity: Option<std::sync::Arc<crate::file::page_cache::CachedValidity>>,
     ) -> Result<()> {
         self.set_data(encoding, data)
+    }
+
+    /// Installs the levels of a nullable light page.
+    fn set_light_validity(&mut self, page: &LightDataPage) -> Result<()> {
+        self.set_data(Encoding::RLE, page.encoded_levels())
     }
 
     /// Read up to `num_levels` definition levels into `out`.
@@ -129,6 +137,35 @@ pub trait ColumnValueDecoder {
         num_levels: usize,
         num_values: Option<usize>,
     ) -> Result<()>;
+
+    /// Whether this decoder consumes a light page directly.
+    fn supports_light_page() -> bool {
+        false
+    }
+
+    /// Installs a validated light page.
+    fn set_light_page(&mut self, _page: Arc<LightDataPage>) -> Result<()> {
+        Err(general_err!("decoder does not support light pages"))
+    }
+
+    /// Positions the value decoder at the logical rows for the next read.
+    fn set_light_span(&mut self, _start: usize, _end: usize) {}
+
+    /// Installs a cached string-view dictionary. Other outputs reuse their
+    /// normal dictionary decoder on the equivalent Parquet dictionary page.
+    #[cfg(feature = "arrow")]
+    fn set_light_dictionary(
+        &mut self,
+        dictionary: Arc<arrow_array::StringViewArray>,
+    ) -> Result<()> {
+        let (page, _) = crate::file::page_cache::PageRead::Dictionary(dictionary).into_parquet()?;
+        self.set_dict(
+            page.buffer().clone(),
+            page.num_values(),
+            page.encoding(),
+            false,
+        )
+    }
 
     /// Read up to `num_values` values into `out`.
     fn read(&mut self, out: &mut Self::Buffer, num_values: usize) -> Result<usize>;
@@ -332,6 +369,7 @@ pub struct ColumnValueDecoderImpl<T: DataType> {
     descr: ColumnDescPtr,
 
     current_encoding: Option<Encoding>,
+    light: Option<super::light::LightDecoder>,
 
     /// Cache of decoders for existing encodings.
     /// Uses `EncodingMask` and dense storage keyed by encoding discriminant.
@@ -346,6 +384,7 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
         Self {
             descr: descr.clone(),
             current_encoding: None,
+            light: None,
             decoder_mask: EncodingMask::default(),
             decoders: std::array::from_fn(|_| None),
         }
@@ -421,13 +460,30 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
 
         decoder.set_data(data, num_values.unwrap_or(num_levels))?;
         self.current_encoding = Some(encoding);
+        self.light = None;
         Ok(())
     }
 
+    fn supports_light_page() -> bool {
+        matches!(T::get_physical_type(), Type::INT32 | Type::INT64)
+    }
+
+    fn set_light_page(&mut self, page: Arc<LightDataPage>) -> Result<()> {
+        self.light = Some(super::light::LightDecoder::new(page));
+        self.current_encoding = None;
+        Ok(())
+    }
+
+    fn set_light_span(&mut self, start: usize, end: usize) {
+        self.light.as_mut().expect("light page installed").rows = start..end;
+    }
+
     fn read(&mut self, out: &mut Self::Buffer, num_values: usize) -> Result<usize> {
-        let encoding = self
-            .current_encoding
-            .expect("current_encoding should be set");
+        let Some(encoding) = self.current_encoding else {
+            let light = self.light.as_ref().expect("light page installed");
+            light.read_native(out, false)?;
+            return Ok(num_values);
+        };
 
         let current_decoder = self.decoders[encoding as usize]
             .as_mut()
@@ -448,9 +504,11 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
         validity: &[u8],
         offset: usize,
     ) -> Result<usize> {
-        let encoding = self
-            .current_encoding
-            .expect("current_encoding should be set");
+        let Some(encoding) = self.current_encoding else {
+            let light = self.light.as_ref().expect("light page installed");
+            light.read_native(out, true)?;
+            return Ok(num_values);
+        };
         let decoder = self.decoders[encoding as usize]
             .as_mut()
             .expect("current decoder should be set");

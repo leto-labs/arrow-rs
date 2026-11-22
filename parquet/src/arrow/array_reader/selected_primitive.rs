@@ -398,6 +398,21 @@ impl PageReader for ReplayPages {
         }
     }
 
+    fn get_next_cached_page(&mut self) -> Result<Option<crate::file::page_cache::PageRead>> {
+        match self.dictionary.take().or_else(|| self.data.take()) {
+            Some(page) => Ok(Some(crate::file::page_cache::PageRead::Parquet((
+                page, None,
+            )))),
+            None => self.tail.get_next_cached_page(),
+        }
+    }
+
+    fn take_deferred_cached_dictionary(
+        &mut self,
+    ) -> Result<Option<crate::file::page_cache::PageRead>> {
+        self.tail.take_deferred_cached_dictionary()
+    }
+
     fn peek_next_page(&mut self) -> Result<Option<PageMetadata>> {
         match self.dictionary.as_ref().or(self.data.as_ref()) {
             Some(page) => Ok(Some(PageMetadata {

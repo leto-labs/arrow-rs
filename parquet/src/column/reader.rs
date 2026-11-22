@@ -30,8 +30,10 @@ use crate::column::reader::decoder::{
 };
 use crate::data_type::*;
 use crate::errors::{ParquetError, Result};
+use crate::file::page_cache::{LightDataPage, PageRead};
 use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::{ceil, num_required_bits, read_num_bytes};
+use std::sync::Arc;
 
 pub(crate) mod decoder;
 #[cfg(feature = "arrow")]
@@ -41,6 +43,7 @@ pub use decoder::code_page::{
     ChunkDictionary, CodeColumnPage, CodeColumnReader, DictionaryCodePage,
 };
 mod legacy_fixed_len_byte_array;
+pub(crate) mod light;
 mod spaced;
 #[cfg(feature = "arrow")]
 pub(crate) use spaced::{FlatPageReplay, FlatValidityRanks};
@@ -149,6 +152,7 @@ pub struct GenericColumnReader<R, D, V> {
 
     /// The decoder for the values
     values_decoder: V,
+    light_page: bool,
 
     /// Width and remaining payload bytes for a nullable V1 FLBA page whose
     /// physical count is checked during normal level decoding, not a pre-scan.
@@ -200,6 +204,7 @@ where
             num_buffered_values: 0,
             num_decoded_values: 0,
             values_decoder,
+            light_page: false,
             has_record_delimiter: false,
             remaining_fixed_len_bytes: None,
         }
@@ -309,6 +314,12 @@ where
 
             self.check_fixed_len_bytes(values_to_read, levels_to_read == remaining_levels)?;
 
+            if self.light_page {
+                self.values_decoder.set_light_span(
+                    self.num_decoded_values,
+                    self.num_decoded_values + levels_to_read,
+                );
+            }
             let def_levels = def_levels.as_deref();
             let values_read = read_values(
                 &mut self.values_decoder,
@@ -436,7 +447,7 @@ where
             }
 
             self.check_fixed_len_bytes(values_read, page_finished)?;
-            if page_finished {
+            if page_finished || self.light_page {
                 continue;
             }
 
@@ -486,48 +497,88 @@ where
     /// while it is still available. Returns an error if the next page is not
     /// a dictionary page.
     fn read_dictionary_page(&mut self) -> Result<()> {
-        match self.page_reader.get_next_page()? {
-            Some(Page::DictionaryPage {
-                buf,
-                num_values,
-                encoding,
-                is_sorted,
-            }) => self
-                .values_decoder
-                .set_dict(buf, num_values, encoding, is_sorted),
-            _ => Err(ParquetError::General(
-                "Invalid page. Expecting dictionary page".to_string(),
-            )),
-        }
+        let page = self
+            .page_reader
+            .get_next_cached_page()?
+            .ok_or_else(|| general_err!("Invalid page. Expecting dictionary page"))?;
+        self.install_dictionary(page)
     }
 
     /// Installs a dictionary previously deferred by the page reader.
-    /// A no-op when nothing was deferred.
     fn install_deferred_dictionary(&mut self) -> Result<()> {
-        match self.page_reader.take_deferred_dictionary()? {
-            Some(Page::DictionaryPage {
-                buf,
-                num_values,
-                encoding,
-                is_sorted,
-            }) => self
+        if let Some(page) = self.page_reader.take_deferred_cached_dictionary()? {
+            self.install_dictionary(page)?;
+        }
+        Ok(())
+    }
+
+    fn install_dictionary(&mut self, page: PageRead) -> Result<()> {
+        match page {
+            PageRead::Parquet((
+                Page::DictionaryPage {
+                    buf,
+                    num_values,
+                    encoding,
+                    is_sorted,
+                },
+                _,
+            )) => self
                 .values_decoder
                 .set_dict(buf, num_values, encoding, is_sorted),
-            Some(_) => Err(ParquetError::General(
-                "Invalid page. Expecting dictionary page".to_string(),
-            )),
-            None => Ok(()),
+            #[cfg(feature = "arrow")]
+            PageRead::Dictionary(dictionary) => {
+                self.values_decoder.set_light_dictionary(dictionary)
+            }
+            _ => Err(general_err!("Invalid page. Expecting dictionary page")),
         }
+    }
+
+    fn install_light_page(&mut self, page: Arc<LightDataPage>) -> Result<()> {
+        let nullable = self.def_level_decoder.is_some();
+        if self.descr.physical_type() != page.physical_type()
+            || nullable != page.validity.is_some()
+            || self.descr.max_def_level() > 1
+            || self.rep_level_decoder.is_some()
+        {
+            return Err(general_err!("cached light page does not match flat column"));
+        }
+        if page.has_codes() {
+            self.install_deferred_dictionary()?;
+        }
+        if let Some(levels) = &mut self.def_level_decoder {
+            levels.set_light_validity(&page)?;
+        }
+        self.num_buffered_values = page.rows();
+        self.num_decoded_values = 0;
+        self.remaining_fixed_len_bytes = None;
+        self.values_decoder.set_light_page(page)?;
+        self.light_page = true;
+        Ok(())
     }
 
     /// Reads a new page and set up the decoders for levels, values or dictionary.
     /// Returns false if there's no page left.
     fn read_new_page(&mut self) -> Result<bool> {
         loop {
-            match self.page_reader.get_next_page_with_validity()? {
+            let page = match self.page_reader.get_next_cached_page()? {
+                Some(page @ PageRead::Light(_)) if !V::supports_light_page() => {
+                    Some(PageRead::Parquet(page.into_parquet()?))
+                }
+                page => page,
+            };
+            match page {
                 // No more page to read
                 None => return Ok(false),
-                Some((current_page, validity)) => {
+                Some(PageRead::Light(page)) => {
+                    self.install_light_page(page)?;
+                    return Ok(true);
+                }
+                #[cfg(feature = "arrow")]
+                Some(PageRead::Dictionary(dictionary)) => {
+                    self.values_decoder.set_light_dictionary(dictionary)?;
+                }
+                Some(PageRead::Parquet((current_page, validity))) => {
+                    self.light_page = false;
                     match current_page {
                         // 1. Dictionary page: configure dictionary for this page.
                         Page::DictionaryPage {
@@ -2154,8 +2205,6 @@ mod tests {
 #[cfg(test)]
 mod invalid_input_tests {
     use super::*;
-
-    use std::sync::Arc;
 
     use crate::basic::Type as PhysicalType;
     use crate::schema::types::{ColumnDescriptor, ColumnPath, Type as SchemaType};

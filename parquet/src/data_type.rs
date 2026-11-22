@@ -710,7 +710,8 @@ pub(crate) mod private {
     /// crate, and thus hint to the type system (and end user) traits are public for the contract
     /// and not for extension.
     pub trait ParquetValueType:
-        PartialEq
+        'static
+        + PartialEq
         + std::fmt::Debug
         + std::fmt::Display
         + Default

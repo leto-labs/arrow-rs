@@ -37,6 +37,7 @@ in `third_party/README.md` and `docs/UPSTREAM_MATRIX.toml`.
 |---|---|---|---|
 | DCX | Read flat primitive chunk dictionaries, borrowed hybrid runs and selected nullable keys | DICTIONARY-CODE-EXECUTION | UPSTREAMABLE |
 | DV | Apply static Arrow predicate verdicts to selected Parquet rows using DCX index runs | DICTIONARY-CODE-EXECUTION | UPSTREAMABLE |
+| LTP | Decode cached constant and frame-of-reference pages, with original string codes and validated chunk views | LIGHT-PAGES | KEEP |
 | LMS | Materialize selected flat dictionary byte-array views with DCX ranks and reuse selected fixed-width reads | LATE-MATERIALIZED-SCAN | UPSTREAMABLE |
 | DPC | Hook decompressed page caching and atomic page leases into PageIndexProvider and shared fetch planning | SCAN-PAGE-CACHE | UPSTREAMABLE |
 | DRL | Decode dictionary runs and definition levels with register cursors, SIMD lookup and in-place NULL expansion | NATIVE-PARQUET-DECODE | UPSTREAMABLE |

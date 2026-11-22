@@ -63,6 +63,7 @@ fuzz_target!(|input: &[u8]| {
         match cursor.next_run() {
             Ok(Some(CodeRun::Repeated { code, len })) => pulled.repeated(code, len),
             Ok(Some(CodeRun::Packed { width, bytes, len })) => pulled.packed(width, bytes, len),
+            Ok(Some(CodeRun::Interleaved { .. })) => unreachable!(),
             Ok(None) => break true,
             Err(_) => break false,
         }

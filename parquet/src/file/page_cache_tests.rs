@@ -1647,3 +1647,6 @@ fn nearly_unique_numeric_chunks_use_plain_cached_pages() {
 }
 
 mod marker_accounting;
+
+#[path = "page_cache/light_reader_tests.rs"]
+mod light_reader_tests;

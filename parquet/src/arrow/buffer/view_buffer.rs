@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -40,10 +42,6 @@ impl ViewBuffer {
             views: Vec::with_capacity(capacity),
             buffers: Vec::new(),
         }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.views.is_empty()
     }
 
     pub fn append_block(&mut self, block: Buffer) -> u32 {

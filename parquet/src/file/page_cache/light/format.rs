@@ -162,6 +162,32 @@ impl LightCodeBlock {
         self.block.is_empty()
     }
 
+    /// Largest original code among valid slots.
+    pub fn max_code(&self) -> Option<u32> {
+        self.max_code
+    }
+
+    /// Borrow the base, width, and interleaved words of a nonconstant block.
+    pub fn words(&self) -> Option<(u32, u8, &[u32])> {
+        match &self.block.values {
+            Values::Packed(Frame {
+                base,
+                width,
+                words: Words::Narrow(words),
+                ..
+            }) => Some((*base as u32, *width, words)),
+            _ => None,
+        }
+    }
+
+    /// The repeated code of a constant block, including empty placeholders.
+    pub fn constant_code(&self) -> Option<u32> {
+        match self.block.values {
+            Values::Constant(code) => Some(code as u32),
+            Values::Packed(_) => None,
+        }
+    }
+
     /// Retained bytes, including the inline block and out-of-line words.
     /// The caller accounts for the chunk dictionary and validity separately.
     pub fn retained_bytes(&self) -> usize {

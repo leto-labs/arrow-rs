@@ -31,7 +31,8 @@ use crate::file::metadata::page_index::RowGroupPageIndex;
 use crate::file::metadata::thrift::PageHeader;
 use crate::file::page_cache::plain::{PlainChunk, is_dictionary_encoded};
 use crate::file::page_cache::{
-    CachedPage, PageCache, PageFill, PageLookup, PageWithValidity, PinnedPages, page_cache_applies,
+    CachedPage, PageCache, PageFill, PageLookup, PageRead, PageWithValidity, PinnedPages,
+    page_cache_applies,
 };
 use crate::file::page_index::offset_index::PageLocation;
 use crate::file::statistics;
@@ -599,7 +600,7 @@ enum DeferredDictionaryPage {
     Cached {
         /// File offset of the page header.
         offset: u64,
-        page: Page,
+        page: CachedPage,
     },
 }
 
@@ -1441,6 +1442,12 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
     }
 
     fn get_next_page_with_validity(&mut self) -> Result<Option<PageWithValidity>> {
+        self.get_next_cached_page()?
+            .map(PageRead::into_parquet)
+            .transpose()
+    }
+
+    fn get_next_cached_page(&mut self) -> Result<Option<PageRead>> {
         let codec = self.cache_codec();
         loop {
             let (page, fill, owns_buffer, stored_len) = match &mut self.state {
@@ -1479,7 +1486,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                                 *offset += rest;
                                 *remaining -= rest;
                                 let dictionary_marker = cached.is_dictionary_marker();
-                                let (page, validity) = cached.into_page_with_validity();
+                                let page = cached.page();
                                 if page.is_data_page() {
                                     *page_index += 1;
                                 } else if page.is_dictionary_page() {
@@ -1491,9 +1498,9 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                                 if page.is_dictionary_page()
                                     && let Some(chunk) = &mut self.plain_chunk
                                 {
-                                    chunk.observe_dictionary(&page);
+                                    chunk.observe_dictionary(page);
                                 }
-                                return Ok(Some((page, validity)));
+                                return Ok(Some(cached.into_read_page()));
                             }
                             Err(ticket) => fill = ticket,
                         }
@@ -1578,7 +1585,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                                 if is_dictionary_page && let Some(chunk) = &mut self.plain_chunk {
                                     chunk.observe_dictionary(cached.page());
                                 }
-                                return Ok(Some(cached.into_page_with_validity()));
+                                return Ok(Some(cached.into_read_page()));
                             }
                             Err(ticket) => fill = ticket,
                         }
@@ -1635,7 +1642,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                 self.plain_chunk.as_mut(),
                 self.flat_nullable,
             );
-            return Ok(Some((page, None)));
+            return Ok(Some(PageRead::Parquet((page, None))));
         }
     }
 
@@ -1789,7 +1796,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                     } else if cached.page().is_dictionary_page() {
                         deferred = Some(DeferredDictionaryPage::Cached {
                             offset: *offset,
-                            page: cached.page().clone(),
+                            page: cached,
                         });
                     }
                     *offset += stored_len;
@@ -1865,6 +1872,12 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
     }
 
     fn take_deferred_dictionary(&mut self) -> Result<Option<Page>> {
+        self.take_deferred_cached_dictionary()?
+            .map(|page| page.into_parquet().map(|(page, _)| page))
+            .transpose()
+    }
+
+    fn take_deferred_cached_dictionary(&mut self) -> Result<Option<PageRead>> {
         let Some(deferred) = self.deferred_dictionary.take() else {
             return Ok(None);
         };
@@ -1906,7 +1919,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                         if let Some(chunk) = &mut self.plain_chunk {
                             chunk.observe_dictionary(cached.page());
                         }
-                        return Ok(Some(cached.page().clone()));
+                        return Ok(Some(cached.into_read_page()));
                     }
                     Err(ticket) => ticket,
                 };
@@ -1946,7 +1959,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                         if let Some(chunk) = &mut self.plain_chunk {
                             chunk.observe_dictionary(cached.page());
                         }
-                        return Ok(Some(cached.page().clone()));
+                        return Ok(Some(cached.into_read_page()));
                     }
                     Err(ticket) => ticket,
                 };
@@ -1983,12 +1996,12 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                     cache.mark_read(offset);
                 }
                 if let Some(chunk) = &mut self.plain_chunk {
-                    chunk.observe_dictionary(&page);
+                    chunk.observe_dictionary(page.page());
                 }
-                page
+                return Ok(Some(page.into_read_page()));
             }
         };
-        Ok(Some(page))
+        Ok(Some(PageRead::Parquet((page, None))))
     }
 
     fn at_record_boundary(&mut self) -> Result<bool> {

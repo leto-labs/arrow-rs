@@ -163,11 +163,11 @@ mod tests {
         let block = LightCodeBlock::pack(&codes, Some(&validity), 6).unwrap();
         let mut output = [0; 7];
         block.decode_into(&mut output).unwrap();
-        assert_eq!(output, [2, 4, 2, 4, 3, 5, 5]);
+        assert_eq!(output, [0, 4, 2, 4, 3, 5, 5]);
         let dictionary = [10, 20, 30, 40, 50, 60];
         let mut views = [0; 7];
         block.decode_views(&dictionary, &mut views).unwrap();
-        assert_eq!(views, [30, 50, 30, 50, 40, 60, 60]);
+        assert_eq!(views, [10, 50, 30, 50, 40, 60, 60]);
         assert_eq!(
             block.decode_views(&dictionary[..5], &mut views),
             Err(LightError::DictionaryIndex)
@@ -178,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn light_code_words_interleave_rows_and_use_the_frame_base() {
+    fn light_code_words_interleave_rows_and_keep_original_indices() {
         let codes: [u32; 64] = std::array::from_fn(|i| {
             let lane = (i % 4) as u32;
             97 + if i < 32 { lane } else { 3 - lane }
@@ -190,12 +190,47 @@ mod tests {
         let format::Words::Narrow(words) = &frame.words else {
             panic!("expected 32-bit words")
         };
-        assert_eq!(frame.base, 97);
-        assert_eq!(frame.width, 2);
-        assert_eq!(&words[..4], &[0b1100, 0b1001, 0b0110, 0b0011]);
+        assert_eq!(frame.base, 0);
+        assert_eq!(frame.width, 7);
+        assert_eq!(
+            &words[..4],
+            &[97 | 100 << 7, 98 | 99 << 7, 99 | 98 << 7, 100 | 97 << 7]
+        );
         let mut decoded = [0; 64];
         light.decode_into(&mut decoded).unwrap();
         assert_eq!(decoded, codes);
+    }
+
+    #[test]
+    fn append_initializes_only_the_new_slots_and_keeps_length_on_error() {
+        let mut small = vec![123];
+        let mut wide = vec![321];
+        for width in 1..=32 {
+            let offset = u32::MAX >> (32 - width);
+            let start = i32::MIN as i64;
+            let input: [i32; BLOCK_LEN - 1] = std::array::from_fn(|i| {
+                (start
+                    + i64::from(if i == 1 {
+                        offset
+                    } else {
+                        (i as u32 * 301) & offset
+                    })) as i32
+            });
+            let block = LightBlock::pack_i32(&input, None).unwrap();
+            block.append_i32(&mut small).unwrap();
+            assert_eq!(&small[small.len() - input.len()..], &input);
+            block.append_i64(&mut wide).unwrap();
+            assert_eq!(&wide[wide.len() - input.len()..], &input.map(i64::from));
+        }
+        assert_eq!(small[0], 123);
+        assert_eq!(wide[0], 321);
+        let before = small.len();
+        let out_of_range = LightBlock::pack(&[0, i64::MAX], None).unwrap();
+        assert_eq!(
+            out_of_range.append_i32(&mut small),
+            Err(LightError::ValueOutOfRange)
+        );
+        assert_eq!(small.len(), before);
     }
 
     #[test]

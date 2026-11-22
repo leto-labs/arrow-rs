@@ -357,6 +357,15 @@ impl DefinitionLevelDecoder for DefinitionLevelBufferDecoder {
         self.set_data(encoding, data)
     }
 
+    fn set_light_validity(&mut self, page: &crate::file::page_cache::LightDataPage) -> Result<()> {
+        let bytes = if matches!(self.decoder, MaybePacked::Fallback(_)) {
+            page.encoded_levels()
+        } else {
+            Bytes::new()
+        };
+        self.set_data_with_validity(Encoding::RLE, bytes, page.validity.clone())
+    }
+
     fn read_def_levels(
         &mut self,
         writer: &mut Self::Buffer,

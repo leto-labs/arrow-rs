@@ -26,7 +26,7 @@ use crate::errors::{ParquetError, Result};
 use crate::file::metadata::thrift::{
     DataPageHeader, DataPageHeaderV2, DictionaryPageHeader, PageHeader,
 };
-use crate::file::page_cache::PageWithValidity;
+use crate::file::page_cache::{PageRead, PageWithValidity};
 use crate::file::statistics::{Statistics, page_stats_to_thrift};
 
 /// Parquet Page definition.
@@ -425,6 +425,13 @@ pub trait PageReader: Iterator<Item = Result<Page>> + Send {
             .map(|page| page.map(|page| (page, None)))
     }
 
+    /// Gets the next page with its cache representation intact.
+    #[doc(hidden)]
+    fn get_next_cached_page(&mut self) -> Result<Option<PageRead>> {
+        self.get_next_page_with_validity()
+            .map(|page| page.map(PageRead::Parquet))
+    }
+
     /// Gets metadata about the next page, returns an error if no
     /// column index information
     fn peek_next_page(&mut self) -> Result<Option<PageMetadata>>;
@@ -463,6 +470,13 @@ pub trait PageReader: Iterator<Item = Result<Page>> + Send {
     /// never defers.
     fn take_deferred_dictionary(&mut self) -> Result<Option<Page>> {
         Ok(None)
+    }
+
+    /// Takes the deferred dictionary with its cache representation intact.
+    #[doc(hidden)]
+    fn take_deferred_cached_dictionary(&mut self) -> Result<Option<PageRead>> {
+        self.take_deferred_dictionary()
+            .map(|page| page.map(|page| PageRead::Parquet((page, None))))
     }
 
     /// Returns `true` if the next page can be assumed to contain the start of a new record

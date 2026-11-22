@@ -86,10 +86,15 @@
 //! skips a range whose lease [`is_charged`](PageLease::is_charged), and holds
 //! the lease until the decoder has read the row group.
 
+pub mod light;
+mod light_page;
 pub(crate) mod plain;
+pub(crate) use light_page::light_error;
+pub use light_page::{LightDataPage, LightValues, MAX_LIGHT_ROWS, PageRead, light_chunk_eligible};
 
 use crate::basic::Compression;
 use crate::column::page::{Page, PageMetadata};
+use crate::errors::ParquetError;
 use crate::file::metadata::ColumnChunkMetaData;
 use bytes::Bytes;
 use std::fmt::Debug;
@@ -102,9 +107,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 #[derive(Debug)]
 pub struct CachedValidity {
     pub(crate) bits: Bytes,
-    #[cfg(feature = "arrow")]
     pub(crate) len: usize,
-    #[cfg(feature = "arrow")]
     pub(crate) nulls: usize,
 }
 
@@ -113,6 +116,25 @@ pub struct CachedValidity {
 pub type PageWithValidity = (Page, Option<Arc<CachedValidity>>);
 
 impl CachedValidity {
+    fn try_from_bits(bits: Bytes, len: usize) -> crate::errors::Result<Self> {
+        if bits.len() != len.div_ceil(8) {
+            return Err(general_err!("invalid light page bitmap length"));
+        }
+        let padding = (8 - len % 8) % 8;
+        let count = bits
+            .iter()
+            .map(|byte| byte.count_ones() as usize)
+            .sum::<usize>();
+        if padding != 0 && bits[bits.len() - 1] >> (8 - padding) != 0 {
+            return Err(general_err!("nonzero padding in light page bitmap"));
+        }
+        Ok(Self {
+            bits,
+            len,
+            nulls: len - count,
+        })
+    }
+
     fn charge(bitmap_bytes: usize) -> usize {
         bitmap_bytes + std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>()
     }
@@ -129,8 +151,16 @@ pub struct CachedPage {
     page: Page,
     stored_len: u64,
     codec: Compression,
-    dictionary_marker: bool,
-    validity: Option<Arc<CachedValidity>>,
+    payload: CachedPayload,
+}
+
+#[derive(Clone, Debug)]
+enum CachedPayload {
+    Parquet(Option<Arc<CachedValidity>>),
+    DictionaryMarker,
+    Light(Arc<LightDataPage>),
+    #[cfg(feature = "arrow")]
+    Dictionary(Arc<arrow_array::StringViewArray>),
 }
 
 impl CachedPage {
@@ -143,9 +173,65 @@ impl CachedPage {
             page,
             stored_len,
             codec,
-            dictionary_marker: false,
-            validity: None,
+            payload: CachedPayload::Parquet(None),
         }
+    }
+
+    /// Store a light representation with its original file header and extent.
+    pub fn new_light(
+        mut header: Page,
+        stored_len: u64,
+        codec: Compression,
+        light: LightDataPage,
+    ) -> crate::errors::Result<Self> {
+        if header.num_values() as usize != light.rows() {
+            return Err(general_err!(
+                "light rows disagree with the original page header"
+            ));
+        }
+        match &mut header {
+            Page::DataPage { buf, .. } => *buf = Bytes::new(),
+            Page::DataPageV2 {
+                buf,
+                num_rows,
+                num_nulls,
+                rep_levels_byte_len,
+                ..
+            } if *num_rows as usize == light.rows()
+                && *rep_levels_byte_len == 0
+                && *num_nulls as usize == light.validity.as_ref().map_or(0, |v| v.nulls) =>
+            {
+                *buf = Bytes::new();
+            }
+            _ => return Err(general_err!("invalid original header for light data")),
+        }
+        let mut cached = Self::new(header, stored_len, codec);
+        cached.payload = CachedPayload::Light(Arc::new(light));
+        Ok(cached)
+    }
+
+    /// Store validated UTF-8 dictionary views under the original dictionary key.
+    #[cfg(feature = "arrow")]
+    pub fn new_light_dictionary(
+        mut header: Page,
+        stored_len: u64,
+        codec: Compression,
+        dictionary: Arc<arrow_array::StringViewArray>,
+    ) -> crate::errors::Result<Self> {
+        use arrow_array::Array;
+        let Page::DictionaryPage {
+            buf, num_values, ..
+        } = &mut header
+        else {
+            return Err(general_err!("invalid original header for light dictionary"));
+        };
+        if *num_values as usize != dictionary.len() || dictionary.null_count() != 0 {
+            return Err(general_err!("invalid light chunk dictionary"));
+        }
+        *buf = Bytes::new();
+        let mut cached = Self::new(header, stored_len, codec);
+        cached.payload = CachedPayload::Dictionary(dictionary);
+        Ok(cached)
     }
 
     /// Offers the page to a fill ticket, with optional flat nullable validity.
@@ -184,13 +270,21 @@ impl CachedPage {
 
     #[cfg(feature = "arrow")]
     fn build_validity(mut self) -> Self {
-        self.validity = crate::arrow::record_reader::definition_levels::cache_validity(&self.page)
-            .map(Arc::new);
+        self.payload = CachedPayload::Parquet(
+            crate::arrow::record_reader::definition_levels::cache_validity(&self.page)
+                .map(Arc::new),
+        );
         self
     }
 
-    pub(crate) fn into_page_with_validity(self) -> PageWithValidity {
-        (self.page, self.validity)
+    pub(crate) fn into_read_page(self) -> PageRead {
+        match self.payload {
+            CachedPayload::Parquet(validity) => PageRead::Parquet((self.page, validity)),
+            CachedPayload::DictionaryMarker => PageRead::Parquet((self.page, None)),
+            CachedPayload::Light(page) => PageRead::Light(page),
+            #[cfg(feature = "arrow")]
+            CachedPayload::Dictionary(dictionary) => PageRead::Dictionary(dictionary),
+        }
     }
 
     /// Retains the dictionary's file range for lease tiling without keeping its values.
@@ -200,15 +294,15 @@ impl CachedPage {
             *buf = Default::default();
         }
         let mut cached = Self::new(page, stored_len, codec);
-        cached.dictionary_marker = true;
+        cached.payload = CachedPayload::DictionaryMarker;
         cached
     }
 
     pub(crate) fn is_dictionary_marker(&self) -> bool {
-        self.dictionary_marker
+        matches!(self.payload, CachedPayload::DictionaryMarker)
     }
 
-    /// The decompressed page.
+    /// The decompressed page, or just its original header for a light entry.
     pub fn page(&self) -> &Page {
         &self.page
     }
@@ -225,11 +319,18 @@ impl CachedPage {
 
     /// Bytes retained by the decompressed buffer and optional validity sidecar.
     pub fn buffer_len(&self) -> usize {
-        self.page.buffer().len()
-            + self
-                .validity
-                .as_deref()
-                .map_or(0, CachedValidity::buffer_len)
+        match &self.payload {
+            CachedPayload::Parquet(validity) => {
+                self.page.buffer().len() + validity.as_deref().map_or(0, CachedValidity::buffer_len)
+            }
+            CachedPayload::DictionaryMarker => 0,
+            CachedPayload::Light(page) => page.retained_bytes(),
+            #[cfg(feature = "arrow")]
+            CachedPayload::Dictionary(dictionary) => {
+                use arrow_array::Array;
+                dictionary.get_array_memory_size() + 2 * size_of::<usize>()
+            }
+        }
     }
 
     /// What `peek_next_page` reports for this page when the column chunk has

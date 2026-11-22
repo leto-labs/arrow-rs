@@ -28,10 +28,12 @@ use crate::basic::{ConvertedType, Encoding};
 use crate::column::page::{Page, PageIterator, PageReader};
 use crate::column::reader::decoder::ColumnValueDecoder;
 use crate::column::reader::decoder::code_page::FlatDataPage;
+use crate::column::reader::light::LightDecoder;
 use crate::column::reader::{FlatPageReplay, FlatValidityRanks};
 use crate::encodings::decoding::DeltaLengths;
 use crate::encodings::rle::codes::{CodeCursor, CodePosition};
 use crate::errors::{ParquetError, Result};
+use crate::file::page_cache::LightDataPage;
 use crate::schema::types::ColumnDescPtr;
 use crate::util::utf8::check_valid_utf8;
 use arrow_array::{ArrayRef, BinaryViewArray, StringViewArray, UInt32Array, builder::make_view};
@@ -389,12 +391,17 @@ impl SelectedViews {
                     return Ok(gap);
                 }
             }
-            match chunk.get_next_page()? {
+            let next = chunk.get_next_cached_page()?;
+            let force_full = matches!(&next, Some(crate::file::page_cache::PageRead::Light(_)));
+            match next
+                .map(|page| page.into_parquet().map(|(page, _)| page))
+                .transpose()?
+            {
                 None if self.offset != 0 => return Err(eof_err!("Missing buffered view page")),
                 None => self.chunk = None,
                 Some(page) if page.is_dictionary_page() => self.install_dictionary(page)?,
                 Some(page) => {
-                    self.load(page, span, nullable, view_type)?;
+                    self.load(page, span, nullable, view_type, force_full)?;
                     return Ok(0);
                 }
             }
@@ -408,6 +415,8 @@ impl SelectedViews {
         // Build binary views now and validate UTF-8 only for retained values.
         let mut decoder = ByteViewArrayColumnValueDecoder {
             dict: None,
+            cached_dict: None,
+            light: None,
             decoder: None,
             validate_utf8: false,
         };
@@ -427,6 +436,7 @@ impl SelectedViews {
         span: Option<usize>,
         nullable: bool,
         view_type: SelectedViewType,
+        force_full: bool,
     ) -> Result<()> {
         let page = FlatDataPage::new(&original, nullable)?;
         let rows = page.rows;
@@ -451,7 +461,7 @@ impl SelectedViews {
                 .ok_or_else(|| general_err!("Missing column chunk dictionary"))?;
             self.install_dictionary(dict)?;
         }
-        let values = if dictionary && page.has_hybrid_levels() {
+        let values = if dictionary && !force_full && page.has_hybrid_levels() {
             ViewPageValues::Dictionary {
                 data: page.data,
                 position: None,
@@ -551,6 +561,8 @@ fn finish_views(
 /// A [`ColumnValueDecoder`] for variable length byte arrays
 struct ByteViewArrayColumnValueDecoder {
     dict: Option<ViewBuffer>,
+    cached_dict: Option<Arc<StringViewArray>>,
+    light: Option<LightDecoder>,
     decoder: Option<ByteViewArrayDecoder>,
     validate_utf8: bool,
 }
@@ -562,6 +574,8 @@ impl ColumnValueDecoder for ByteViewArrayColumnValueDecoder {
         let validate_utf8 = desc.converted_type() == ConvertedType::UTF8;
         Self {
             dict: None,
+            cached_dict: None,
+            light: None,
             decoder: None,
             validate_utf8,
         }
@@ -604,6 +618,28 @@ impl ColumnValueDecoder for ByteViewArrayColumnValueDecoder {
         Ok(())
     }
 
+    fn supports_light_page() -> bool {
+        true
+    }
+
+    fn set_light_page(&mut self, page: Arc<LightDataPage>) -> Result<()> {
+        if self.dict.is_none() && self.cached_dict.is_none() {
+            return Err(general_err!("light string page needs a chunk dictionary"));
+        }
+        self.light = Some(LightDecoder::new(page));
+        self.decoder = None;
+        Ok(())
+    }
+
+    fn set_light_span(&mut self, start: usize, end: usize) {
+        self.light.as_mut().expect("light page installed").rows = start..end;
+    }
+
+    fn set_light_dictionary(&mut self, dictionary: Arc<StringViewArray>) -> Result<()> {
+        self.cached_dict = Some(dictionary);
+        Ok(())
+    }
+
     fn set_data(
         &mut self,
         encoding: Encoding,
@@ -611,6 +647,7 @@ impl ColumnValueDecoder for ByteViewArrayColumnValueDecoder {
         num_levels: usize,
         num_values: Option<usize>,
     ) -> Result<()> {
+        self.light = None;
         self.decoder = Some(ByteViewArrayDecoder::new(
             encoding,
             data,
@@ -622,12 +659,24 @@ impl ColumnValueDecoder for ByteViewArrayColumnValueDecoder {
     }
 
     fn read(&mut self, out: &mut Self::Buffer, num_values: usize) -> Result<usize> {
-        let decoder = self
-            .decoder
-            .as_mut()
+        let dict = self
+            .cached_dict
+            .as_deref()
+            .map(DictionaryViews::from)
+            .or_else(|| self.dict.as_ref().map(DictionaryViews::from));
+        if let Some(decoder) = &mut self.decoder {
+            return decoder.read_with_dictionary(out, num_values, dict);
+        }
+        let light = self
+            .light
+            .as_ref()
             .ok_or_else(|| general_err!("no decoder set"))?;
-
-        decoder.read(out, num_values, self.dict.as_ref())
+        let dict = dict.ok_or_else(|| general_err!("light page requires dictionary"))?;
+        if num_values != 0 {
+            let buffer_base = dict.append_buffers(out);
+            light.read_views(&mut out.views, dict.views, buffer_base)?;
+        }
+        Ok(num_values)
     }
 
     fn skip_values(&mut self, num_values: usize) -> Result<usize> {
@@ -635,7 +684,9 @@ impl ColumnValueDecoder for ByteViewArrayColumnValueDecoder {
             .decoder
             .as_mut()
             .ok_or_else(|| general_err!("no decoder set"))?;
-
+        if let Some(dict) = self.cached_dict.as_deref() {
+            return decoder.skip_with_dictionary(num_values, Some(DictionaryViews::from(dict)));
+        }
         decoder.skip(num_values, self.dict.as_ref())
     }
 }
@@ -700,6 +751,15 @@ impl ByteViewArrayDecoder {
         len: usize,
         dict: Option<&ViewBuffer>,
     ) -> Result<usize> {
+        self.read_with_dictionary(out, len, dict.map(DictionaryViews::from))
+    }
+
+    fn read_with_dictionary(
+        &mut self,
+        out: &mut ViewBuffer,
+        len: usize,
+        dict: Option<DictionaryViews<'_>>,
+    ) -> Result<usize> {
         match self {
             ByteViewArrayDecoder::Plain(d) => d.read(out, len),
             ByteViewArrayDecoder::Dictionary(d) => {
@@ -714,6 +774,14 @@ impl ByteViewArrayDecoder {
 
     /// Skip `len` values
     pub fn skip(&mut self, len: usize, dict: Option<&ViewBuffer>) -> Result<usize> {
+        self.skip_with_dictionary(len, dict.map(DictionaryViews::from))
+    }
+
+    fn skip_with_dictionary(
+        &mut self,
+        len: usize,
+        dict: Option<DictionaryViews<'_>>,
+    ) -> Result<usize> {
         match self {
             ByteViewArrayDecoder::Plain(d) => d.skip(len),
             ByteViewArrayDecoder::Dictionary(d) => {
@@ -903,6 +971,49 @@ pub struct ByteViewArrayDecoderDictionary {
     decoder: DictIndexDecoder,
 }
 
+#[derive(Clone, Copy)]
+struct DictionaryViews<'a> {
+    views: &'a [u128],
+    buffers: &'a [Buffer],
+}
+
+impl<'a> From<&'a ViewBuffer> for DictionaryViews<'a> {
+    fn from(dict: &'a ViewBuffer) -> Self {
+        Self {
+            views: &dict.views,
+            buffers: &dict.buffers,
+        }
+    }
+}
+
+impl<'a> From<&'a StringViewArray> for DictionaryViews<'a> {
+    fn from(dict: &'a StringViewArray) -> Self {
+        Self {
+            views: dict.views(),
+            buffers: dict.data_buffers(),
+        }
+    }
+}
+
+impl DictionaryViews<'_> {
+    fn append_buffers(self, output: &mut ViewBuffer) -> u32 {
+        if !output
+            .buffers
+            .len()
+            .checked_sub(self.buffers.len())
+            .is_some_and(|offset| {
+                output.buffers[offset..]
+                    .iter()
+                    .zip(self.buffers)
+                    .all(|(a, b)| a.ptr_eq(b))
+            })
+        {
+            output.buffers.extend_from_slice(self.buffers);
+        }
+        (output.buffers.len() - self.buffers.len()) as u32
+    }
+}
+
 impl ByteViewArrayDecoderDictionary {
     fn new(data: Bytes, num_levels: usize, num_values: Option<usize>) -> Result<Self> {
         Ok(Self {
@@ -919,36 +1030,17 @@ impl ByteViewArrayDecoderDictionary {
     /// reuses the dictionary page buffers directly without copying data
     ///
     /// If the dictionary is empty, the buffer contains empty view.
-    fn read(&mut self, output: &mut ViewBuffer, dict: &ViewBuffer, len: usize) -> Result<usize> {
-        if dict.is_empty() || len == 0 {
+    fn read(
+        &mut self,
+        output: &mut ViewBuffer,
+        dict: DictionaryViews<'_>,
+        len: usize,
+    ) -> Result<usize> {
+        if dict.views.is_empty() || len == 0 {
             return Ok(0);
         }
 
-        // Check if the last few buffer of `output`` are the same as the `dict` buffer
-        // This is to avoid creating a new buffers if the same dictionary is used for multiple `read`
-        let need_to_create_new_buffer = {
-            if output.buffers.len() >= dict.buffers.len() {
-                let offset = output.buffers.len() - dict.buffers.len();
-                output.buffers[offset..]
-                    .iter()
-                    .zip(dict.buffers.iter())
-                    .any(|(a, b)| !a.ptr_eq(b))
-            } else {
-                true
-            }
-        };
-
-        if need_to_create_new_buffer {
-            for b in &dict.buffers {
-                output.buffers.push(b.clone());
-            }
-        }
-
-        // Calculate the offset of the dictionary buffers in the output buffers
-        // For example if the 2nd buffer in the dictionary is the 5th buffer in the output buffers,
-        // then the base_buffer_idx is 5 - 2 = 3
-        let base_buffer_idx = output.buffers.len() as u32 - dict.buffers.len() as u32;
-
+        let base_buffer_idx = dict.append_buffers(output);
         // Pre-reserve output capacity to avoid per-chunk reallocation in extend
         output.views.reserve(len);
 
@@ -997,8 +1089,8 @@ impl ByteViewArrayDecoderDictionary {
         Ok(read)
     }
 
-    fn skip(&mut self, dict: &ViewBuffer, to_skip: usize) -> Result<usize> {
-        if dict.is_empty() {
+    fn skip(&mut self, dict: DictionaryViews<'_>, to_skip: usize) -> Result<usize> {
+        if dict.views.is_empty() {
             return Ok(0);
         }
         self.decoder.skip(to_skip)

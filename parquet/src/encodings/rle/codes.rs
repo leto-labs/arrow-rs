@@ -44,13 +44,26 @@ pub enum CodeRun<'a> {
         /// Number of logical entries, excluding padding.
         len: usize,
     },
+    /// Light frame of reference, with 32 interleaved u32 lanes.
+    Interleaved {
+        /// Reference code added to every decoded offset.
+        base: u32,
+        /// Bits per offset, from 1 to 32.
+        width: u8,
+        /// Word groups of 32 lanes.
+        words: &'a [u32],
+        /// Number of logical slots, including NULL placeholders.
+        len: usize,
+    },
 }
 
 impl CodeRun<'_> {
     /// Logical entries in the run, excluding packed padding.
     pub fn len(&self) -> usize {
         match *self {
-            Self::Repeated { len, .. } | Self::Packed { len, .. } => len,
+            Self::Repeated { len, .. }
+            | Self::Packed { len, .. }
+            | Self::Interleaved { len, .. } => len,
         }
     }
 
@@ -73,7 +86,20 @@ impl CodeRun<'_> {
                 let bytes = bytes.get(group..group.checked_add(width)?)?;
                 Some(packed_code(bytes, width, offset % 8) as u32)
             }
-            Self::Packed { .. } => None,
+            Self::Interleaved {
+                base, width, words, ..
+            } if (1..=32).contains(&width) => {
+                let width = usize::from(width);
+                let bit = (offset / 32).checked_mul(width)?;
+                let word = (bit / 32).checked_mul(32)?.checked_add(offset % 32)?;
+                let shift = bit % 32;
+                let mut code = *words.get(word)? >> shift;
+                if shift + width > 32 {
+                    code |= *words.get(word + 32)? << (32 - shift);
+                }
+                base.checked_add(code & (u32::MAX >> (32 - width)))
+            }
+            Self::Packed { .. } | Self::Interleaved { .. } => None,
         }
     }
 
@@ -104,6 +130,9 @@ impl CodeRun<'_> {
                     + (bytes[last] & last_mask).count_ones() as usize
             }
             Self::Packed { .. } => unreachable!("flat definition levels use width 1"),
+            Self::Interleaved { .. } => {
+                (start..end).filter(|&i| self.code_at(i) == Some(1)).count()
+            }
         }
     }
 }
@@ -241,6 +270,7 @@ impl<'a> CodeCursor<'a> {
             match self.read_run::<CHECK_PACKED>() {
                 Ok(CodeRun::Repeated { code, len }) => sink.repeated(code, len),
                 Ok(CodeRun::Packed { width, bytes, len }) => sink.packed(width, bytes, len),
+                Ok(CodeRun::Interleaved { .. }) => unreachable!("Parquet hybrid stream"),
                 Err(error) => {
                     self.failed = true;
                     return Err(error);
@@ -493,6 +523,7 @@ impl<'a> CodeCursor<'a> {
         while let Some(run) = self.next_run()? {
             let len = match run {
                 CodeRun::Repeated { len, .. } | CodeRun::Packed { len, .. } => len,
+                CodeRun::Interleaved { .. } => unreachable!("Parquet hybrid stream"),
             };
             let mut next = start;
             while let Some(offset) = offsets.next_if(|&offset| offset < start + len) {
@@ -504,6 +535,7 @@ impl<'a> CodeCursor<'a> {
                     CodeRun::Packed { width, bytes, .. } => {
                         packed_code(bytes, usize::from(width), offset - start) as u32
                     }
+                    CodeRun::Interleaved { .. } => unreachable!("Parquet hybrid stream"),
                 };
                 keys.push(code);
                 next = offset + 1;

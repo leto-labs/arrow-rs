@@ -97,6 +97,7 @@ impl LightCodeBlock {
     ) -> Result<Self, LightError> {
         check_input(codes.len(), validity)?;
         let mut widened = [0; BLOCK_LEN];
+        let mut min_code = u32::MAX;
         let mut max_code: Option<u32> = None;
         for (index, &code) in codes.iter().enumerate() {
             if valid(validity, index) {
@@ -104,16 +105,24 @@ impl LightCodeBlock {
                     return Err(LightError::DictionaryIndex);
                 }
                 widened[index] = i64::from(code);
+                min_code = min_code.min(code);
                 max_code = Some(max_code.map_or(code, |max| max.max(code)));
             }
         }
         Ok(Self {
-            block: LightBlock::pack_impl(
-                &widened[..codes.len()],
-                validity,
-                Frame::pack,
-                dense_stats,
-            ),
+            block: LightBlock {
+                len: codes.len(),
+                values: match max_code {
+                    None => Values::Constant(0),
+                    Some(code) if min_code == code => Values::Constant(i64::from(code)),
+                    Some(code) => Values::Packed(Frame::pack(
+                        &widened[..codes.len()],
+                        validity,
+                        0,
+                        Frame::width(0, i64::from(code)),
+                    )),
+                },
+            },
             max_code,
         })
     }
@@ -233,8 +242,8 @@ mod avx512 {
         // is stored once. A crossing value seeds the next group's low bits.
         macro_rules! pack_rows {
             ($ty:ty, $bits:expr, $lanes:expr, $shl:ident, $shr:ident, $load:expr) => {{
-                let mut packed =
-                    vec![0 as $ty; Frame::word_count(input.len(), width_bits, $lanes, $bits)];
+                let mut packed: Vec<$ty> =
+                    vec![0; Frame::word_count(input.len(), width_bits, $lanes, $bits)];
                 for lane in [0, $lanes / 2] {
                     let mut acc = _mm512_setzero_si512();
                     let mut word = 0;
