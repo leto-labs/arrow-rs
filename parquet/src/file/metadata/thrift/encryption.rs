@@ -326,7 +326,7 @@ pub(crate) fn parquet_metadata_with_encryption(
     }
 
     // decrypt column chunk info
-    let row_groups = row_groups
+    let row_groups = Arc::unwrap_or_clone(row_groups)
         .into_iter()
         .map(|rg| row_group_from_encrypted_thrift(rg, file_decryptor.as_ref(), options))
         .collect::<Result<Vec<_>>>()?;

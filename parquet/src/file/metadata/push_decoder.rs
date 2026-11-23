@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -232,6 +234,8 @@ pub struct ParquetMetaDataPushDecoder {
     column_index_mask: ColumnChunkMask,
     /// which rows and columns of the offset index should be read
     offset_index_mask: ColumnChunkMask,
+    /// Request disjoint page-index entries instead of their enclosing range.
+    sparse_page_index: bool,
     /// Underlying buffers
     buffers: crate::util::push_buffers::PushBuffers,
     /// Encryption API
@@ -258,6 +262,7 @@ impl ParquetMetaDataPushDecoder {
             offset_index_policy: PageIndexPolicy::Optional,
             column_index_mask: ColumnChunkMask::all(),
             offset_index_mask: ColumnChunkMask::all(),
+            sparse_page_index: false,
             buffers: crate::util::push_buffers::PushBuffers::new(file_len),
             metadata_parser: MetadataParser::new(),
         })
@@ -480,6 +485,14 @@ impl ParquetMetaDataPushDecoder {
         }
     }
 
+    /// Request only the selected page-index ranges. The caller can coalesce
+    /// them according to its I/O costs before fetching them. By default the
+    /// decoder asks for a single enclosing range.
+    pub fn with_sparse_page_index(mut self, enabled: bool) -> Self {
+        self.sparse_page_index = enabled;
+        self
+    }
+
     /// Try to decode the page indexes from the pushed data, returning the stored
     /// [`ParquetMetaData`] together with the decoded [`PageIndex`].
     ///
@@ -547,40 +560,48 @@ impl ParquetMetaDataPushDecoder {
         &mut self,
         metadata: Box<ParquetMetaData>,
     ) -> Result<DecodeResult<(Box<ParquetMetaData>, Option<PageIndex>)>> {
-        let range = range_for_page_index(
-            &metadata,
-            self.column_index_policy,
-            self.offset_index_policy,
-            &self.column_index_mask,
-            &self.offset_index_mask,
-        );
-
-        let Some(page_index_range) = range else {
-            self.state = DecodeState::Finished;
-            return Ok(DecodeResult::Data((metadata, None)));
+        let index_ranges = || {
+            page_index_ranges(
+                &metadata,
+                self.column_index_policy,
+                self.offset_index_policy,
+                &self.column_index_mask,
+                &self.offset_index_mask,
+            )
         };
-
-        if !self.buffers.has_range(&page_index_range) {
-            self.state = DecodeState::ReadingPageIndex(metadata);
-            return Ok(DecodeResult::NeedsData(vec![page_index_range]));
-        }
-
-        let buffer = match self.get_bytes(&page_index_range) {
-            Ok(buffer) => buffer,
-            Err(error) => {
-                self.state = DecodeState::ReadingPageIndex(metadata);
-                return Err(error);
+        let parsed = if self.sparse_page_index {
+            if index_ranges().next().is_none() {
+                self.state = DecodeState::Finished;
+                return Ok(DecodeResult::Data((metadata, None)));
             }
+            let mut missing: Vec<_> = index_ranges()
+                .filter(|range| !self.buffers.has_range(range))
+                .collect();
+            if !missing.is_empty() {
+                missing.sort_unstable_by_key(|range| (range.start, range.end));
+                missing.dedup();
+                self.state = DecodeState::ReadingPageIndex(metadata);
+                return Ok(DecodeResult::NeedsData(missing));
+            }
+            self.parse_index(&metadata, |range| self.get_bytes(&range))
+        } else {
+            let Some(range) = enclosing_range(index_ranges()) else {
+                self.state = DecodeState::Finished;
+                return Ok(DecodeResult::Data((metadata, None)));
+            };
+            if !self.buffers.has_range(&range) {
+                self.state = DecodeState::ReadingPageIndex(metadata);
+                return Ok(DecodeResult::NeedsData(vec![range]));
+            }
+            self.get_bytes(&range).and_then(|buffer| {
+                self.parse_index(&metadata, |entry| {
+                    let start = usize::try_from(entry.start - range.start)?;
+                    let end = usize::try_from(entry.end - range.start)?;
+                    Ok(&buffer[start..end])
+                })
+            })
         };
-        let page_index = match parse_page_index(
-            &metadata,
-            self.column_index_policy,
-            self.offset_index_policy,
-            &self.column_index_mask,
-            &self.offset_index_mask,
-            &buffer,
-            page_index_range.start,
-        ) {
+        let page_index = match parsed {
             Ok(page_index) => page_index,
             Err(error) => {
                 self.state = DecodeState::ReadingPageIndex(metadata);
@@ -590,6 +611,22 @@ impl ParquetMetaDataPushDecoder {
 
         self.state = DecodeState::Finished;
         Ok(DecodeResult::Data((metadata, page_index)))
+    }
+
+    fn parse_index<B: AsRef<[u8]>>(
+        &self,
+        metadata: &ParquetMetaData,
+        get_bytes: impl FnMut(Range<u64>) -> Result<B>,
+    ) -> Result<Option<PageIndex>> {
+        parse_page_index(
+            metadata,
+            self.column_index_policy,
+            self.offset_index_policy,
+            &self.column_index_mask,
+            &self.offset_index_mask,
+            self.sparse_page_index,
+            get_bytes,
+        )
     }
 
     /// Returns the bytes for the given range from the internal buffer
@@ -630,39 +667,55 @@ enum DecodeState {
 /// specified policies and masks
 ///
 /// Returns None if no page indexes are needed
-pub(crate) fn range_for_page_index(
+#[cfg(test)]
+fn range_for_page_index(
     metadata: &ParquetMetaData,
     column_index_policy: PageIndexPolicy,
     offset_index_policy: PageIndexPolicy,
     column_index_mask: &ColumnChunkMask,
     offset_index_mask: &ColumnChunkMask,
 ) -> Option<Range<u64>> {
-    let mut range: Option<Range<u64>> = None;
-    for (policy, mask, column_index) in [
+    enclosing_range(page_index_ranges(
+        metadata,
+        column_index_policy,
+        offset_index_policy,
+        column_index_mask,
+        offset_index_mask,
+    ))
+}
+
+fn enclosing_range(ranges: impl Iterator<Item = Range<u64>>) -> Option<Range<u64>> {
+    ranges.reduce(|a, b| a.start.min(b.start)..a.end.max(b.end))
+}
+
+fn page_index_ranges<'a>(
+    metadata: &'a ParquetMetaData,
+    column_index_policy: PageIndexPolicy,
+    offset_index_policy: PageIndexPolicy,
+    column_index_mask: &'a ColumnChunkMask,
+    offset_index_mask: &'a ColumnChunkMask,
+) -> impl Iterator<Item = Range<u64>> + 'a {
+    [
         (column_index_policy, column_index_mask, true),
         (offset_index_policy, offset_index_mask, false),
-    ] {
-        if policy == PageIndexPolicy::Skip {
-            continue;
-        }
-        for row_group in mask.row_group_indices(metadata.num_row_groups()) {
-            for column in mask.column_indices(metadata.row_group(row_group).num_columns()) {
-                let column = metadata.row_group(row_group).column(column);
-                let index = if column_index {
-                    column.column_index_range()
-                } else {
-                    column.offset_index_range()
-                };
-                if let Some(index) = index {
-                    range = Some(match range {
-                        Some(range) => range.start.min(index.start)..range.end.max(index.end),
-                        None => index,
-                    });
-                }
-            }
-        }
-    }
-    range
+    ]
+    .into_iter()
+    .filter(|(policy, _, _)| *policy != PageIndexPolicy::Skip)
+    .flat_map(move |(_, mask, column_index)| {
+        mask.row_group_indices(metadata.num_row_groups())
+            .flat_map(move |group| {
+                let group = metadata.row_group(group);
+                mask.column_indices(group.num_columns())
+                    .filter_map(move |leaf| {
+                        let column = group.column(leaf);
+                        if column_index {
+                            column.column_index_range()
+                        } else {
+                            column.offset_index_range()
+                        }
+                    })
+            })
+    })
 }
 
 // These tests use the arrow writer to create a parquet file in memory
@@ -743,19 +796,26 @@ mod tests {
 
     #[test]
     fn test_decode_page_index_after_metadata() {
+        let full_buffer = check_decode_page_index_after_metadata(false);
+        let sparse = check_decode_page_index_after_metadata(true);
+        assert!(sparse < full_buffer);
+    }
+
+    fn check_decode_page_index_after_metadata(sparse: bool) -> usize {
         let metadata = test_metadata_without_page_index();
         assert!(metadata.page_index().is_none());
 
         let mut decoder =
             ParquetMetaDataPushDecoder::try_new_with_metadata(test_file_len(), metadata)
                 .unwrap()
+                .with_sparse_page_index(sparse)
                 .with_column_index_policy(PageIndexPolicy::Required)
                 .with_offset_index_policy(PageIndexPolicy::Required)
                 .with_column_index_mask(ColumnChunkMask::row_groups_and_columns([1], [0, 2]))
                 .with_offset_index_mask(ColumnChunkMask::row_groups_and_columns([0], [1]));
 
         let ranges = expect_needs_data(decoder.try_decode_page_index());
-        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges.len(), if sparse { 3 } else { 1 });
         push_ranges_to_metadata_decoder(&mut decoder, ranges);
 
         let (metadata, page_index) = expect_data(decoder.try_decode_page_index());
@@ -773,6 +833,156 @@ mod tests {
                     page_index.offset_index(row_group_idx, column_idx).is_some(),
                     row_group_idx == 0 && column_idx == 1
                 );
+            }
+        }
+        page_index.memory_size()
+    }
+
+    #[test]
+    fn sparse_page_index_matches_full_decode_entry_by_entry() {
+        check_sparse_page_index_entries(
+            crate::file::properties::WriterProperties::builder(),
+            |decoder| decoder,
+        );
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn sparse_encrypted_page_index_matches_full_decode_entry_by_entry() {
+        use crate::encryption::decrypt::FileDecryptionProperties;
+        use crate::encryption::encrypt::FileEncryptionProperties;
+
+        let footer_key = b"0123456789012345".to_vec();
+        let a_key = b"1234567890123450".to_vec();
+        let c_key = b"1234567890123451".to_vec();
+        let encryption = FileEncryptionProperties::builder(footer_key.clone())
+            .with_column_key("a", a_key.clone())
+            .with_column_key("c", c_key.clone())
+            .build()
+            .unwrap();
+        let decryption = FileDecryptionProperties::builder(footer_key)
+            .with_column_key("a", a_key)
+            .with_column_key("c", c_key)
+            .build()
+            .unwrap();
+        check_sparse_page_index_entries(
+            WriterProperties::builder().with_file_encryption_properties(encryption),
+            |decoder| decoder.with_file_decryption_properties(Some(Arc::clone(&decryption))),
+        );
+    }
+
+    fn check_sparse_page_index_entries(
+        props: crate::file::properties::WriterPropertiesBuilder,
+        configure_decoder: impl Fn(ParquetMetaDataPushDecoder) -> ParquetMetaDataPushDecoder,
+    ) {
+        use crate::file::properties::EnabledStatistics;
+        use crate::schema::types::ColumnPath;
+
+        let masks = [
+            ColumnChunkMask::row_groups_and_columns([1], [0, 2]),
+            ColumnChunkMask::row_groups_and_columns([0, 2], [1]),
+            ColumnChunkMask::row_groups_and_columns([2], [0, 1, 2]),
+            ColumnChunkMask::row_groups_and_columns([0, 1, 2], [2]),
+            ColumnChunkMask::columns([1, 2]),
+            ColumnChunkMask::none(),
+        ];
+        let policies = [PageIndexPolicy::Skip, PageIndexPolicy::Optional];
+        for c_stats in [EnabledStatistics::Page, EnabledStatistics::None] {
+            let props = props
+                .clone()
+                .set_max_row_group_row_count(Some(140))
+                .set_data_page_row_count_limit(20)
+                .set_write_batch_size(20)
+                .set_statistics_enabled(EnabledStatistics::Page)
+                .set_column_statistics_enabled(ColumnPath::from("b"), EnabledStatistics::Chunk)
+                .set_column_statistics_enabled(ColumnPath::from("c"), c_stats)
+                .build();
+            let mut writer =
+                ArrowWriter::try_new(Vec::new(), TEST_BATCH.schema(), Some(props)).unwrap();
+            writer.write(&TEST_BATCH).unwrap();
+            let bytes = Bytes::from(writer.into_inner().unwrap());
+            let len = bytes.len() as u64;
+            let mut decoder = configure_decoder(ParquetMetaDataPushDecoder::try_new(len).unwrap())
+                .with_page_index_policy(PageIndexPolicy::Skip);
+            decoder.push_range(0..len, bytes.clone()).unwrap();
+            let footer = expect_data(decoder.try_decode());
+            assert_eq!(footer.num_row_groups(), 3);
+
+            let decode = |sparse,
+                          (cp, cm): (_, &ColumnChunkMask),
+                          (op, om): (_, &ColumnChunkMask)| {
+                let decoder =
+                    ParquetMetaDataPushDecoder::try_new_with_metadata(len, footer.clone()).unwrap();
+                let mut decoder = configure_decoder(decoder)
+                    .with_sparse_page_index(sparse)
+                    .with_column_index_policy(cp)
+                    .with_column_index_mask(cm.clone())
+                    .with_offset_index_policy(op)
+                    .with_offset_index_mask(om.clone());
+                loop {
+                    match decoder.try_decode_page_index().unwrap() {
+                        DecodeResult::Data((_, index)) => break index,
+                        DecodeResult::NeedsData(ranges) => {
+                            let buffers = ranges
+                                .iter()
+                                .map(|r| bytes.slice(r.start as usize..r.end as usize))
+                                .collect();
+                            decoder.push_ranges(ranges, buffers).unwrap();
+                        }
+                        DecodeResult::Finished => {
+                            panic!("decoder finished before yielding an index")
+                        }
+                    }
+                }
+            };
+            let all = (PageIndexPolicy::Optional, &ColumnChunkMask::all());
+            let full = decode(false, all, all).unwrap();
+            assert!(full.column_index(0, 0).is_some());
+            assert!(full.column_index(0, 1).is_none());
+            assert!(full.offset_index(0, 1).is_some());
+            assert_eq!(
+                full.column_index(0, 2).is_some(),
+                c_stats == EnabledStatistics::Page
+            );
+            assert!(full.offset_index(0, 2).is_some());
+
+            let selected = |policy, mask: &ColumnChunkMask, group, column| {
+                policy != PageIndexPolicy::Skip
+                    && mask.row_group_indices(3).any(|g| g == group)
+                    && mask.column_indices(3).any(|c| c == column)
+            };
+            for cm in &masks {
+                for om in &masks {
+                    for cp in policies {
+                        for op in policies {
+                            for sparse in [false, true] {
+                                let got = decode(sparse, (cp, cm), (op, om));
+                                for group in 0..3 {
+                                    for column in 0..3 {
+                                        let expected_column = selected(cp, cm, group, column)
+                                            .then(|| full.column_index(group, column))
+                                            .flatten();
+                                        let expected_offset = selected(op, om, group, column)
+                                            .then(|| full.offset_index(group, column))
+                                            .flatten();
+                                        assert_eq!(
+                                            got.as_ref()
+                                                .and_then(|p| p.column_index(group, column)),
+                                            expected_column,
+                                            "column index: {c_stats:?}, sparse={sparse}, {cp:?}, {cm:?}, group={group}, column={column}"
+                                        );
+                                        assert_eq!(
+                                            got.as_ref()
+                                                .and_then(|p| p.offset_index(group, column)),
+                                            expected_offset,
+                                            "offset index: {c_stats:?}, sparse={sparse}, {op:?}, {om:?}, group={group}, column={column}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }

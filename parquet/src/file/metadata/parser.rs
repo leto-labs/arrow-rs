@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -21,8 +23,6 @@
 //! into the corresponding Rust structures
 
 use std::ops::Range;
-
-use bytes::Bytes;
 
 use crate::errors::{ParquetError, Result};
 use crate::file::metadata::page_index::{PageIndex, PageIndexBuilder, PageIndexProvider};
@@ -247,41 +247,47 @@ pub(crate) fn decode_metadata(
 ///   Ignored when `column_index_policy` is [`PageIndexPolicy::Skip`].
 /// * `offset_index_mask` - The row groups and leaf columns whose offset indexes are parsed.
 ///   Ignored when `offset_index_policy` is [`PageIndexPolicy::Skip`].
-/// * `bytes` - The byte slice containing the page index data.
-/// * `start_offset` - The offset where `bytes` begin in the file.
-pub(crate) fn parse_page_index(
+/// * `get_bytes` - Supplies the bytes for each selected index range.
+pub(crate) fn parse_page_index<B: AsRef<[u8]>>(
     metadata: &ParquetMetaData,
     column_index_policy: PageIndexPolicy,
     offset_index_policy: PageIndexPolicy,
     column_index_mask: &ColumnChunkMask,
     offset_index_mask: &ColumnChunkMask,
-    bytes: &Bytes,
-    start_offset: u64,
+    sparse: bool,
+    mut get_bytes: impl FnMut(Range<u64>) -> Result<B>,
 ) -> Result<Option<PageIndex>> {
     let num_row_groups = metadata.num_row_groups();
     let num_columns = metadata.file_metadata().schema_descr().num_columns();
-    let mut builder = PageIndexBuilder::default();
+    let all = ColumnChunkMask::all();
+    let (allocated_columns, allocated_offsets) = if sparse {
+        (column_index_mask, offset_index_mask)
+    } else {
+        (&all, &all)
+    };
+    let mut builder = PageIndexBuilder::new_masked(
+        num_row_groups,
+        num_columns,
+        (column_index_policy != PageIndexPolicy::Skip).then_some(allocated_columns),
+        (offset_index_policy != PageIndexPolicy::Skip).then_some(allocated_offsets),
+    );
 
     if column_index_policy != PageIndexPolicy::Skip {
-        builder.allocate_column_indexes(num_row_groups, num_columns);
         parse_column_index(
             metadata,
             column_index_policy,
             column_index_mask,
             &mut builder,
-            bytes,
-            start_offset,
+            &mut get_bytes,
         )?;
     }
     if offset_index_policy != PageIndexPolicy::Skip {
-        builder.allocate_offset_indexes(num_row_groups, num_columns);
         parse_offset_index(
             metadata,
             offset_index_policy,
             offset_index_mask,
             &mut builder,
-            bytes,
-            start_offset,
+            &mut get_bytes,
         )?;
     }
 
@@ -293,13 +299,12 @@ pub(crate) fn parse_page_index(
     }
 }
 
-fn parse_column_index(
+fn parse_column_index<B: AsRef<[u8]>>(
     metadata: &ParquetMetaData,
     column_index_policy: PageIndexPolicy,
     mask: &ColumnChunkMask,
     page_index_builder: &mut PageIndexBuilder,
-    bytes: &Bytes,
-    start_offset: u64,
+    get_bytes: &mut impl FnMut(Range<u64>) -> Result<B>,
 ) -> Result<()> {
     if column_index_policy == PageIndexPolicy::Skip {
         return Ok(());
@@ -309,9 +314,14 @@ fn parse_column_index(
         for col_idx in mask.column_indices(rg.num_columns()) {
             let col = rg.column(col_idx);
             if let Some(r) = col.column_index_range() {
-                let idx_bytes = get_index_bytes(bytes, start_offset, r)?;
-                let idx =
-                    inner::parse_single_column_index(idx_bytes, metadata, col, rg_idx, col_idx)?;
+                let idx_bytes = get_bytes(r)?;
+                let idx = inner::parse_single_column_index(
+                    idx_bytes.as_ref(),
+                    metadata,
+                    col,
+                    rg_idx,
+                    col_idx,
+                )?;
                 page_index_builder.put_column_index(idx, rg_idx, col_idx);
             }
         }
@@ -320,13 +330,12 @@ fn parse_column_index(
     Ok(())
 }
 
-fn parse_offset_index(
+fn parse_offset_index<B: AsRef<[u8]>>(
     metadata: &ParquetMetaData,
     offset_index_policy: PageIndexPolicy,
     mask: &ColumnChunkMask,
     page_index_builder: &mut PageIndexBuilder,
-    bytes: &Bytes,
-    start_offset: u64,
+    get_bytes: &mut impl FnMut(Range<u64>) -> Result<B>,
 ) -> Result<()> {
     if offset_index_policy == PageIndexPolicy::Skip {
         return Ok(());
@@ -336,9 +345,14 @@ fn parse_offset_index(
         for col_idx in mask.column_indices(rg.num_columns()) {
             let col = rg.column(col_idx);
             if let Some(r) = col.offset_index_range() {
-                let idx_bytes = get_index_bytes(bytes, start_offset, r)?;
-                let idx =
-                    inner::parse_single_offset_index(idx_bytes, metadata, col, rg_idx, col_idx)?;
+                let idx_bytes = get_bytes(r)?;
+                let idx = inner::parse_single_offset_index(
+                    idx_bytes.as_ref(),
+                    metadata,
+                    col,
+                    rg_idx,
+                    col_idx,
+                )?;
                 page_index_builder.put_offset_index(idx, rg_idx, col_idx);
             } else if offset_index_policy == PageIndexPolicy::Required {
                 return Err(general_err!("missing offset index"));
@@ -347,10 +361,4 @@ fn parse_offset_index(
     }
 
     Ok(())
-}
-
-fn get_index_bytes(bytes: &[u8], start_offset: u64, range: Range<u64>) -> Result<&[u8]> {
-    let start = usize::try_from(range.start - start_offset)?;
-    let end = usize::try_from(range.end - start_offset)?;
-    Ok(&bytes[start..end])
 }

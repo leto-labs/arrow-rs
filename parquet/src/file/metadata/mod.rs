@@ -127,7 +127,8 @@ pub struct ParquetMetaData {
     /// File level metadata
     file_metadata: FileMetaData,
     /// Row group metadata
-    row_groups: Vec<RowGroupMetaData>,
+    // Index loads attach independent page indexes to the same immutable footer.
+    row_groups: Arc<Vec<RowGroupMetaData>>,
     /// Page level index for each page in each column chunk
     page_index: Option<Arc<dyn PageIndexProvider>>,
     /// Optional file decryptor
@@ -144,7 +145,7 @@ impl ParquetMetaData {
     pub fn new(file_metadata: FileMetaData, row_groups: Vec<RowGroupMetaData>) -> Self {
         ParquetMetaData {
             file_metadata,
-            row_groups,
+            row_groups: Arc::new(row_groups),
             page_index: None,
             #[cfg(feature = "encryption")]
             file_decryptor: None,
@@ -211,6 +212,11 @@ impl ParquetMetaData {
         &self.row_groups
     }
 
+    /// Whether two metadata views share the same immutable row group allocation.
+    pub fn shares_row_groups(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.row_groups, &other.row_groups)
+    }
+
     /// Returns the number of rows in `row_group_idx`.
     ///
     /// Returns an error if the row group index is out of bounds or its row
@@ -272,8 +278,7 @@ impl ParquetMetaData {
             if let Some(page_index) = page_index.as_any().downcast_ref::<PageIndex>() {
                 // need to account for the `Arc` wrapper overhead
                 2 * std::mem::size_of::<usize>() // Arc stores weak and strong counts on the heap...
-                    + std::mem::size_of::<PageIndex>() // alongside an instance of PageIndex
-                    + page_index.heap_size()
+                    + page_index.memory_size() // alongside an instance of PageIndex
             } else {
                 0
             }
@@ -381,13 +386,13 @@ impl ParquetMetaDataBuilder {
 
     /// Adds a row group to the metadata
     pub fn add_row_group(mut self, row_group: RowGroupMetaData) -> Self {
-        self.0.row_groups.push(row_group);
+        Arc::make_mut(&mut self.0.row_groups).push(row_group);
         self
     }
 
     /// Sets all the row groups to the specified list
     pub fn set_row_groups(mut self, row_groups: Vec<RowGroupMetaData>) -> Self {
-        self.0.row_groups = row_groups;
+        self.0.row_groups = Arc::new(row_groups);
         self
     }
 
@@ -397,7 +402,7 @@ impl ParquetMetaDataBuilder {
     /// This can be used for more efficient creation of a new ParquetMetaData
     /// from an existing one.
     pub fn take_row_groups(&mut self) -> Vec<RowGroupMetaData> {
-        std::mem::take(&mut self.0.row_groups)
+        Arc::unwrap_or_clone(std::mem::take(&mut self.0.row_groups))
     }
 
     /// Return a reference to the current row groups
@@ -2116,11 +2121,11 @@ mod tests {
             .set_row_groups(row_group_meta_with_stats)
             .build();
 
-        // Base size without page index
+        // Base size without page index, including the shared row-group allocation
         #[cfg(not(feature = "encryption"))]
-        let base_expected_size = 2782;
+        let base_expected_size = 2806;
         #[cfg(feature = "encryption")]
-        let base_expected_size = 2950;
+        let base_expected_size = 2974;
 
         assert_eq!(parquet_meta.memory_size(), base_expected_size);
 
@@ -2155,9 +2160,9 @@ mod tests {
 
         // Size with page index (includes Arc overhead plus PageIndex heap size)
         #[cfg(not(feature = "encryption"))]
-        let bigger_expected_size = 3296;
+        let bigger_expected_size = 3320;
         #[cfg(feature = "encryption")]
-        let bigger_expected_size = 3464;
+        let bigger_expected_size = 3488;
 
         // more set fields means more memory usage
         assert!(bigger_expected_size > base_expected_size);
@@ -2204,7 +2209,7 @@ mod tests {
             .set_row_groups(row_group_meta.clone())
             .build();
 
-        let base_expected_size = 2058;
+        let base_expected_size = 2082;
         assert_eq!(parquet_meta_data.memory_size(), base_expected_size);
 
         let footer_key = b"0123456789012345";
@@ -2230,7 +2235,7 @@ mod tests {
             .set_file_decryptor(Some(decryptor))
             .build();
 
-        let expected_size_with_decryptor = 3072;
+        let expected_size_with_decryptor = 3096;
         assert!(expected_size_with_decryptor > base_expected_size);
 
         assert_eq!(

@@ -42,6 +42,20 @@ in `third_party/README.md` and `docs/UPSTREAM_MATRIX.toml`.
 | DOL | Use contiguous loads for ordered Parquet dictionary indices in the full primitive reader | NATIVE-PARQUET-DECODE | UPSTREAMABLE |
 | DRL | Decode dictionary runs and definition levels with register cursors, SIMD lookup and in-place NULL expansion | NATIVE-PARQUET-DECODE | UPSTREAMABLE |
 | NPI | Classify repeated-leaf null pages by value count to preserve valid column indexes | DATA-SKIPPING | UPSTREAMABLE |
+| CPI | Decode selected page-index spans and share row-group metadata across indexed views | DATA-SKIPPING | UPSTREAMABLE |
+
+CPI (leto-m7oo, leto-gk79) adds an opt-in to the metadata push decoder for requesting
+the selected column and offset index spans. Callers choose the range
+coalescing policy. The single-span default remains available for pull-based
+readers. Page-index variants share immutable row groups. The identity check
+lets Longbow reuse the validated footer's page-cache handle. Writers that
+modify row groups use copy-on-write. Memory-size estimates charge each view
+for its full reachable footer.
+
+Sparse decoding allocates entries only for each requested row group and its
+addressed column prefix. The decoded index exposes its owned allocation size
+for the consumer's metadata cache.
+
 
 NPI covers two cases in one `List<Int64>` row group. A page containing
 `[NULL, NULL]` retains its column index and records two null entries. A page

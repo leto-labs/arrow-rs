@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -17,6 +19,7 @@
 
 //! Page Index structures for efficient page-level skipping
 
+use crate::file::metadata::ColumnChunkMask;
 use crate::file::metadata::memory::HeapSize;
 use crate::file::page_index::{
     column_index::ColumnIndexMetaData,
@@ -460,6 +463,11 @@ impl PageIndex {
     pub fn into_builder(self) -> PageIndexBuilder {
         self.into()
     }
+
+    /// Estimate the bytes occupied by this index and its owned data.
+    pub fn memory_size(&self) -> usize {
+        std::mem::size_of::<Self>() + self.heap_size()
+    }
 }
 
 impl PageIndexProvider for PageIndex {
@@ -542,6 +550,40 @@ impl PageIndexBuilder {
             column_indexes: Self::empty_index(num_row_groups, num_columns),
             offset_indexes: Self::empty_index(num_row_groups, num_columns),
         }
+    }
+
+    /// Allocate only the rows and column prefixes addressed by the masks.
+    /// Empty slots retain the same group and leaf numbering as a full index.
+    pub(crate) fn new_masked(
+        num_row_groups: usize,
+        num_columns: usize,
+        column_mask: Option<&ColumnChunkMask>,
+        offset_mask: Option<&ColumnChunkMask>,
+    ) -> Self {
+        Self {
+            column_indexes: column_mask
+                .and_then(|mask| Self::masked_index(num_row_groups, num_columns, mask)),
+            offset_indexes: offset_mask
+                .and_then(|mask| Self::masked_index(num_row_groups, num_columns, mask)),
+        }
+    }
+
+    fn masked_index<T>(
+        num_row_groups: usize,
+        num_columns: usize,
+        mask: &ColumnChunkMask,
+    ) -> Option<Vec<Vec<Option<T>>>> {
+        if mask.is_all() {
+            return Self::empty_index(num_row_groups, num_columns);
+        }
+        let column_count = mask.column_indices(num_columns).last()? + 1;
+        let mut groups = mask.row_group_indices(num_row_groups).peekable();
+        groups.peek()?;
+        let mut rows: Vec<_> = (0..num_row_groups).map(|_| Vec::new()).collect();
+        for group in groups {
+            rows[group].resize_with(column_count, || None);
+        }
+        Some(rows)
     }
 
     /// Creates a new [`PageIndexBuilder`] from an existing [`PageIndex`]

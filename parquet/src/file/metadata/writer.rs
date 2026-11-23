@@ -1,3 +1,5 @@
+// Modified by the Longbow authors; see third_party/README.md.
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -439,7 +441,7 @@ impl<'a, W: Write> ParquetMetaDataWriter<'a, W> {
         let schema_descr = Arc::new(SchemaDescriptor::new(schema.clone()));
         let created_by = file_metadata.created_by().map(str::to_string);
 
-        let row_groups = self.metadata.row_groups.clone();
+        let row_groups = self.metadata.row_groups.as_ref().clone();
 
         let key_value_metadata = file_metadata.key_value_metadata().cloned();
 
