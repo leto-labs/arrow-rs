@@ -43,6 +43,7 @@ in `third_party/README.md` and `docs/UPSTREAM_MATRIX.toml`.
 | DRL | Decode dictionary runs and definition levels with register cursors, SIMD lookup and in-place NULL expansion | NATIVE-PARQUET-DECODE | UPSTREAMABLE |
 | NPI | Classify repeated-leaf null pages by value count to preserve valid column indexes | DATA-SKIPPING | UPSTREAMABLE |
 | CPI | Decode selected page-index spans and share row-group metadata across indexed views | DATA-SKIPPING | UPSTREAMABLE |
+| BFE | Reject Bloom filters for encrypted columns at writer construction (backport of upstream `4213ecfee`, RUSTSEC-2026-0595) | DEPENDENCY-ADVISORIES | BACKPORT |
 
 CPI (leto-m7oo, leto-gk79) adds an opt-in to the metadata push decoder for requesting
 the selected column and offset index spans. Callers choose the range
@@ -55,6 +56,14 @@ for its full reachable footer.
 Sparse decoding allocates entries only for each requested row group and its
 addressed column prefix. The decoded index exposes its owned allocation size
 for the consumer's metadata cache.
+
+BFE (leto-m86b) backports apache/arrow-rs#12165 from parquet 60.2.0. The 60.1.0
+writer wrote the Bloom filters of encrypted columns in plaintext. The file
+writer now returns `NYI` when an encrypted column has Bloom filter properties;
+plaintext columns of a partly encrypted file keep their filters. The check runs
+at construction, so a `ColumnCloseResult` with a Bloom filter that is spliced in
+through `append_column` still bypasses it, as upstream. `BACKPORT` marks an
+accepted upstream fix carried until the Arrow base contains it; drop BFE then.
 
 
 NPI covers two cases in one `List<Int64>` row group. A page containing
