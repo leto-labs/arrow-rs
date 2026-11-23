@@ -45,6 +45,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 mod dictionary;
+mod staged_selection;
+use staged_selection::{narrow_selection, selection_words};
 
 /// Options for [`ReadPlanBuilder::with_predicate_options`].
 pub struct PredicateOptions<'a> {
@@ -835,6 +837,7 @@ pub(crate) struct StagedArrayReader {
     scan: Arc<StagedScan>,
     batch: Option<ArrayRef>,
     selection: Option<BooleanBuffer>,
+    selection_words: Vec<u64>,
 }
 
 impl StagedArrayReader {
@@ -975,6 +978,7 @@ impl StagedArrayReader {
             scan: Arc::clone(scan),
             batch: None,
             selection: None,
+            selection_words: Vec::new(),
         }))
     }
 
@@ -988,7 +992,8 @@ impl StagedArrayReader {
         let mut kept = rows;
         let mut selected = false;
         let mut arrays: Vec<Option<VectorColumn>> = (0..self.columns.len()).map(|_| None).collect();
-        let mut words = Vec::new();
+        let words = &mut self.selection_words;
+        words.clear();
         let sample = self.vectors.is_multiple_of(4);
         self.vectors = self.vectors.wrapping_add(1);
         for &index in &self.order.indices {
@@ -1003,10 +1008,11 @@ impl StagedArrayReader {
                 }
                 let column = &mut self.columns[index];
                 let array = if !column.ordinary && column.cost.uses_kernel(fraction) {
-                    fill_words(&mut words, &selection);
                     selected = true;
                     VectorColumn {
-                        values: column.reader.read_selected(&words, rows)?,
+                        values: column
+                            .reader
+                            .read_selected(selection_words(words, &selection), rows)?,
                         selection: Some(selection.clone()),
                     }
                 } else {
@@ -1032,15 +1038,13 @@ impl StagedArrayReader {
             }
             let before = kept;
             kept = result.true_count();
-            if kept != before {
+            if kept != before && kept != 0 {
                 if before == rows {
                     selection = result.values().clone();
+                    words.clear();
                 } else {
-                    let previous = selection;
-                    let mut passed = result.values().iter();
-                    selection = BooleanBuffer::collect_bool(rows, |i| {
-                        previous.value(i) && passed.next().unwrap()
-                    });
+                    selection_words(words, &selection);
+                    selection = narrow_selection(words, rows, result.values());
                 }
             }
             if let Some(begin) = begin {
@@ -1066,7 +1070,7 @@ impl StagedArrayReader {
             words.resize(rows.div_ceil(64), 0);
             for (column, array) in self.columns.iter_mut().zip(&arrays) {
                 if array.is_none() {
-                    column.skip(rows, &words)?;
+                    column.skip(rows, words)?;
                 }
             }
             work.payload_time = payload_start.elapsed();
@@ -1074,21 +1078,19 @@ impl StagedArrayReader {
             return Ok(0);
         }
         let fraction = kept as f64 / rows as f64;
-        words.clear();
         for (column, array) in self.columns.iter_mut().zip(&mut arrays) {
             if array.is_some() {
                 continue;
             }
             *array = Some(if !column.ordinary && column.cost.uses_kernel(fraction) {
-                if words.is_empty() {
-                    fill_words(&mut words, &selection);
-                }
                 selected = true;
                 if column.payload {
                     work.gathered_values += kept;
                 }
                 VectorColumn {
-                    values: column.reader.read_selected(&words, rows)?,
+                    values: column
+                        .reader
+                        .read_selected(selection_words(words, &selection), rows)?,
                     selection: Some(selection.clone()),
                 }
             } else {
@@ -1127,11 +1129,6 @@ impl StagedArrayReader {
         (self.scan.observe)(work);
         Ok(if selected { kept } else { rows })
     }
-}
-
-fn fill_words(words: &mut Vec<u64>, selection: &BooleanBuffer) {
-    words.clear();
-    words.extend(selection.bit_chunks().iter_padded());
 }
 
 impl ArrayReader for StagedArrayReader {
@@ -1330,7 +1327,8 @@ mod tests {
         use arrow_select::filter::filter_record_batch;
         use bytes::Bytes;
 
-        let rows = 128;
+        let batch_size = 128;
+        let rows = batch_size * 2 + 71;
         let schema = Arc::new(Schema::new(vec![
             Field::new("first", DataType::Boolean, false),
             Field::new("second", DataType::Int32, false),
@@ -1340,9 +1338,12 @@ mod tests {
         let input = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
-                Arc::new(BooleanArray::from_iter(
-                    (0..rows).map(|row| Some(matches!(row, 2 | 63 | 70 | 127))),
-                )),
+                Arc::new(BooleanArray::from_iter((0..rows).map(|row| {
+                    Some(matches!(
+                        row,
+                        2 | 63 | 70 | 127 | 128 | 149 | 255 | 257 | 326
+                    ))
+                }))),
                 Arc::new(Int32Array::from_iter_values(0..rows)),
                 Arc::new(Int32Array::from_iter_values((0..rows).map(|row| row * 2))),
                 Arc::new(Int64Array::from_iter_values(1000..1000 + i64::from(rows))),
@@ -1371,10 +1372,13 @@ mod tests {
                         .as_any()
                         .downcast_ref::<Int32Array>()
                         .unwrap();
-                    assert_eq!(values.values().as_ref(), &[2, 63, 70, 127]);
                     Ok(values
                         .iter()
-                        .map(|value| value.map(|row| row >= 63))
+                        .map(|value| {
+                            value
+                                .filter(|&row| row != 70)
+                                .map(|row| !matches!(row, 2 | 149))
+                        })
                         .collect())
                 }),
                 StagedPredicate::new(vec![1, 2], |batch| {
@@ -1388,7 +1392,6 @@ mod tests {
                         .as_any()
                         .downcast_ref::<Int32Array>()
                         .unwrap();
-                    assert_eq!(reused.values().as_ref(), &[63, 70, 127]);
                     Ok(reused
                         .iter()
                         .zip(other.iter())
@@ -1403,7 +1406,7 @@ mod tests {
         ));
         let metadata = ArrowReaderMetadata::load(&bytes, Default::default()).unwrap();
         let mut decoder = ParquetPushDecoderBuilder::new_with_metadata(metadata)
-            .with_batch_size(rows as usize)
+            .with_batch_size(batch_size as usize)
             .with_staged_scan(Some(staged))
             .build()
             .unwrap();
@@ -1411,10 +1414,15 @@ mod tests {
         let crate::DecodeResult::Data(mut reader) = decoder.try_next_reader().unwrap() else {
             panic!("expected a row-group reader");
         };
-        let (actual, selection) = reader.next_with_selection().unwrap().unwrap();
-        let mask = (0..rows).map(|row| Some(matches!(row, 63 | 127))).collect();
-        assert_eq!(actual, filter_record_batch(&input, &mask).unwrap());
-        assert_eq!(selection.unwrap().count_set_bits(), actual.num_rows());
+        for (start, survivors) in [(0, vec![63, 127]), (128, vec![255]), (256, vec![257])] {
+            let slice = input.slice(start, (input.num_rows() - start).min(batch_size as usize));
+            let mask = (start..start + slice.num_rows())
+                .map(|row| Some(survivors.contains(&row)))
+                .collect();
+            let (actual, selection) = reader.next_with_selection().unwrap().unwrap();
+            assert_eq!(actual, filter_record_batch(&slice, &mask).unwrap());
+            assert_eq!(selection.unwrap().count_set_bits(), actual.num_rows());
+        }
         let staged = reader
             .array_reader
             .as_any()

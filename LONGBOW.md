@@ -513,3 +513,21 @@ work separately from selected gathers.
 The staged reader regression exercises three conjuncts. The second gathers
 only rows selected by the first. The third reuses and compacts the gathered
 column against the narrower selection before a dense output comparison.
+
+## LMS staged predicate bitmap reuse (leto-0lr9)
+
+Purpose: reduce staged predicate remap work per vector. Dependent feature:
+LATE-MATERIALIZED-SCAN. Audit classification: UPSTREAMABLE.
+
+The row-group reader keeps one scratch buffer of decoder words. After a
+predicate runs on already compacted rows, each word of the preceding mask
+scatters the corresponding dense verdict bits back into physical row
+positions. This updates the decoder words in place. Predicate and payload
+columns reuse them until the next narrowing. Cached arrays retain immutable
+snapshots of their own selection for subsequent compaction.
+
+The scatter uses BMI2 and POPCNT on x86 CPUs with the same AVX-512 guard
+as the code-page decoder. Other builds use Arrow's portable bit deposit.
+The differential covers sliced masks, word and tail boundaries, and
+successive narrowings. The staged-reader regression covers disjoint vectors
+and a shorter final vector in the same row group.
