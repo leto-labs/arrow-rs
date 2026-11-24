@@ -44,6 +44,7 @@ in `third_party/README.md` and `docs/UPSTREAM_MATRIX.toml`.
 | NPI | Classify repeated-leaf null pages by value count to preserve valid column indexes | DATA-SKIPPING | UPSTREAMABLE |
 | CPI | Decode selected page-index spans and share row-group metadata across indexed views | DATA-SKIPPING | UPSTREAMABLE |
 | BFE | Reject Bloom filters for encrypted columns at writer construction (backport of upstream `4213ecfee`, RUSTSEC-2026-0595) | DEPENDENCY-ADVISORIES | BACKPORT |
+| RRC | Reserve the value buffers of flat columns for the rows a reader can still return, not for a whole batch | NATIVE-PARQUET-SCAN | UPSTREAMABLE |
 
 CPI (leto-m7oo, leto-gk79) adds an opt-in to the metadata push decoder for requesting
 the selected column and offset index spans. Callers choose the range
@@ -64,6 +65,20 @@ plaintext columns of a partly encrypted file keep their filters. The check runs
 at construction, so a `ColumnCloseResult` with a Bloom filter that is spliced in
 through `append_column` still bypasses it, as upstream. `BACKPORT` marks an
 accepted upstream fix carried until the Arrow base contains it; drop BFE then.
+
+RRC (leto-kidb) bounds the up-front reservation of a record reader. Before it,
+a flat column reserved its value buffer (values, offsets or views) for the
+batch size, so a 7-row row group returned 64 KiB for each 64-bit column. The
+reservation is now the smaller of the batch size and the rows the reader can
+still return. `ArrayReaderBuilder` sets that bound on each leaf from the row
+count of its row groups (`ArrayReader::set_remaining_rows`), and a record
+batch reader with a selector cursor lowers it to its selected rows. Mask
+cursors read unselected rows before they filter, and cached readers read whole
+cache batches, so both keep the row-group bound. Repeated columns keep the
+batch-size hint. The bound is a hint: a reader asked for more rows returns
+them and grows its buffers. Full batches still make one batch-size allocation
+per column. Variable-width data buffers and validity bitmaps were already
+sized by their contents.
 
 
 NPI covers two cases in one `List<Int64>` row group. A page containing
