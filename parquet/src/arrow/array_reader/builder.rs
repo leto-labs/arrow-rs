@@ -484,16 +484,17 @@ impl<'a> ArrayReaderBuilder<'a> {
         // used for the NullArrayReader should be irrelevant. It's just needed to read the
         // repetition and definition level data.
         if matches!(arrow_type, Some(DataType::Null)) {
-            let reader = Box::new(NullArrayReader::<Int32Type>::new(
+            let mut reader: Box<dyn ArrayReader> = Box::new(NullArrayReader::<Int32Type>::new(
                 page_iterator,
                 column_desc,
                 self.batch_size,
                 padding_threshold,
-            )?) as _;
+            )?);
+            reader.set_remaining_rows(self.row_groups.num_rows());
             return Ok(Some(reader));
         }
 
-        let reader = match physical_type {
+        let mut reader: Box<dyn ArrayReader> = match physical_type {
             PhysicalType::BOOLEAN => Box::new(PrimitiveArrayReader::<BoolType>::new(
                 page_iterator,
                 column_desc,
@@ -576,6 +577,9 @@ impl<'a> ArrayReaderBuilder<'a> {
                 )?,
             },
         };
+        // The column chunks hold no more records than their row groups have
+        // rows: a flat reader reserves no more slots than that.
+        reader.set_remaining_rows(self.row_groups.num_rows());
         Ok(Some(reader))
     }
 

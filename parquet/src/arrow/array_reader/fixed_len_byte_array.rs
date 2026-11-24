@@ -265,6 +265,10 @@ impl ArrayReader for FixedLenByteArrayReader {
         Ok(array)
     }
 
+    fn set_remaining_rows(&mut self, rows: usize) {
+        self.record_reader.set_remaining_rows(rows);
+    }
+
     fn skip_records(&mut self, num_records: usize) -> Result<usize> {
         skip_records(&mut self.record_reader, self.pages.as_mut(), num_records)
     }

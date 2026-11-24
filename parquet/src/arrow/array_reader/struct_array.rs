@@ -155,6 +155,13 @@ impl ArrayReader for StructArrayReader {
         }
     }
 
+    fn set_remaining_rows(&mut self, rows: usize) {
+        // A struct has one record for each record of every child.
+        for child in &mut self.children {
+            child.set_remaining_rows(rows);
+        }
+    }
+
     fn skip_records(&mut self, num_records: usize) -> Result<usize> {
         let mut skipped = None;
         for child in &mut self.children {

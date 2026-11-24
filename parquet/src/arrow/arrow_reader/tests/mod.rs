@@ -21,6 +21,7 @@
 
 mod column_reader;
 mod options;
+mod row_capacity;
 mod row_selection;
 mod schema;
 mod virtual_columns;

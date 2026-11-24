@@ -141,6 +141,15 @@ pub trait ArrayReader: Send {
     /// a filter to the resulting array.
     fn skip_records(&mut self, num_records: usize) -> Result<usize>;
 
+    /// Hints that later [`Self::read_records`] calls return at most `rows`
+    /// more records in total.
+    ///
+    /// Readers of flat columns use it to reserve value buffers for the rows
+    /// that are left instead of for a whole batch. The default ignores it;
+    /// a reader that is asked for more records than `rows` must still
+    /// return them.
+    fn set_remaining_rows(&mut self, _rows: usize) {}
+
     /// If this array has a non-zero definition level, i.e. has a nullable parent
     /// array, returns the definition levels of data from the last call of `next_batch`
     ///

@@ -64,6 +64,10 @@ pub struct GenericRecordReader<V, CV> {
     num_records: usize,
     /// Capacity hint for pre-allocating buffers based on batch size
     capacity_hint: usize,
+    /// The most records that later reads can still return, when the owner
+    /// knows it (see [`Self::set_remaining_rows`]). It bounds the up-front
+    /// reservation of a flat column, which holds one slot per record.
+    rows_left: usize,
     /// Number of values in the values buffer (may differ from num_values when
     /// padding_threshold is set, since parent-level padding is excluded).
     values_written: usize,
@@ -113,10 +117,22 @@ where
             num_values: 0,
             num_records: 0,
             capacity_hint: capacity,
+            rows_left: usize::MAX,
             values_written: 0,
             padding_threshold: None,
             compact_bitmap: None,
         }
+    }
+
+    /// Tell the reader that later reads return at most `rows` more records.
+    ///
+    /// A flat column then reserves room for the smaller of the batch size
+    /// and the records that are left, instead of a whole batch for the few
+    /// rows of a small row group, of a short selection or of a row group's
+    /// last batch. Reading more records than `rows` stays correct: the
+    /// buffers grow as they do without a capacity hint.
+    pub fn set_remaining_rows(&mut self, rows: usize) {
+        self.rows_left = rows;
     }
 
     /// Set the current page reader.
@@ -299,7 +315,15 @@ where
         let compact_bitmap = &mut self.compact_bitmap;
 
         if padding_threshold.is_none() {
-            values.reserve_exact(self.capacity_hint.saturating_sub(self.num_values));
+            // A flat column has one slot for each record. `num_values` of
+            // them are buffered, and at most `rows_left` more can follow.
+            let capacity = if self.column_desc.max_rep_level() == 0 {
+                self.capacity_hint
+                    .min(self.num_values.saturating_add(self.rows_left))
+            } else {
+                self.capacity_hint
+            };
+            values.reserve_exact(capacity.saturating_sub(self.num_values));
         }
 
         let (records_read, values_read, levels_read) =
@@ -416,6 +440,7 @@ where
 
         self.num_records += records_read;
         self.num_values += levels_read;
+        self.rows_left = self.rows_left.saturating_sub(records_read);
         Ok(records_read)
     }
 }

@@ -1868,11 +1868,17 @@ impl ParquetRecordBatchReader {
     /// Create a new [`ParquetRecordBatchReader`] that will read at most `batch_size` rows at
     /// a time from [`ArrayReader`] based on the configured `selection`. If `selection` is `None`
     /// all rows will be returned
-    pub(crate) fn new(array_reader: Box<dyn ArrayReader>, read_plan: ReadPlan) -> Self {
+    pub(crate) fn new(mut array_reader: Box<dyn ArrayReader>, read_plan: ReadPlan) -> Self {
         let schema = match array_reader.get_data_type() {
             ArrowType::Struct(fields) => Schema::new(fields.clone()),
             _ => unreachable!("Struct array reader's data type is not struct!"),
         };
+        // A selector cursor reads exactly its selected rows. A mask cursor
+        // also reads the unselected rows between them, and a plan without a
+        // selection reads every row: both keep the bound of their row groups.
+        if let Some(rows) = read_plan.selected_rows() {
+            array_reader.set_remaining_rows(rows);
+        }
 
         Self {
             array_reader,

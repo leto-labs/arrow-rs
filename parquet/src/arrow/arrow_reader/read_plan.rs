@@ -440,6 +440,16 @@ impl ReadPlan {
     pub fn batch_size(&self) -> usize {
         self.batch_size
     }
+
+    /// The rows that the plan still reads, when it reads only selected rows
+    /// (a selector cursor). `None` for a plan that reads every row or that
+    /// filters a mask after reading.
+    pub(crate) fn selected_rows(&self) -> Option<usize> {
+        match &self.row_selection_cursor {
+            RowSelectionCursor::Selectors(cursor) => Some(cursor.selected_rows()),
+            RowSelectionCursor::All | RowSelectionCursor::Mask(_) => None,
+        }
+    }
 }
 
 /// One total Boolean expression and the Parquet leaves it reads in file order.

@@ -226,6 +226,20 @@ impl SelectorsCursor {
         }
     }
 
+    /// The selected rows from the current position to the end.
+    pub(crate) fn selected_rows(&self) -> usize {
+        match &self.selectors {
+            SelectorSource::Mask(mask) => mask
+                .slice(self.position, mask.len().saturating_sub(self.position))
+                .count_set_bits(),
+            SelectorSource::Queue(queue) => queue
+                .iter()
+                .filter(|selector| !selector.skip)
+                .map(|selector| selector.row_count)
+                .sum(),
+        }
+    }
+
     /// Return the next [`RowSelector`]
     pub(crate) fn next_selector(&mut self) -> RowSelector {
         let selector = match &mut self.selectors {
